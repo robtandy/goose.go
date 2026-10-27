@@ -324,7 +324,8 @@ inline string CodeGenGo::GoIntLit(int64_t v, bool uns, TypeExpr *t, Line ln) {
 // the shortest digits that read back), from which Go rounds to the type as
 // a C compiler does. Go constants have no infinities, NaNs or negative zero,
 // and math gives those; an f32 constant from halfway past its largest value
-// up is an infinity (CodeGen::FltStr).
+// up is an infinity (CodeGen::FltStr), and a negative one too small for an
+// f32 is its negative zero, where Go's would round to zero.
 inline string CodeGenGo::GoFltLit(double v, TypeExpr *t, Line ln) {
     auto gt = GoT(t, ln);
     auto f32 = t->kind == TY_FLT && t->fltstorage == FS_F32;
@@ -333,7 +334,7 @@ inline string CodeGenGo::GoFltLit(double v, TypeExpr *t, Line ln) {
     if (v != v) return wrap("math.NaN()");
     if (std::isinf(v) || (f32 && std::fabs(v) >= std::ldexp(2.0 - std::ldexp(1.0, -24), 127)))
         return wrap(v > 0 ? "math.Inf(1)" : "math.Inf(-1)");
-    if (v == 0 && std::signbit(v)) return wrap("math.Copysign(0, -1)");
+    if ((f32 ? (float)v == 0 : v == 0) && std::signbit(v)) return wrap("math.Copysign(0, -1)");
     string s;
     CatOne(s, v);
     return cat(gt, "(", s, ")");
