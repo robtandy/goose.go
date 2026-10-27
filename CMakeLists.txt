@@ -69,6 +69,12 @@ add_executable(goose
     src/codegen_emit.h
     src/codegen_stacks.h
     src/codegen_nodes.h
+    src/codegen_go.h
+    src/codegen_go_runtime.h
+    src/codegen_go_values.h
+    src/codegen_go_stmts.h
+    src/codegen_go_calls.h
+    src/codegen_go_emit.h
     src/runtime_inline.h
     src/jit.h
     src/runtime/runtime.h
