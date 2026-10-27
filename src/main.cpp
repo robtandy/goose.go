@@ -1631,8 +1631,9 @@ int Main(int argc, char **argv) {
     // The compile's diagnostics as data (--diagnostics json): the warnings
     // as they come, then the error's.
     vector<Diagnostic> found;
-    // Whether the Go the compile writes is a library (set by the compile).
-    auto golib = false;
+    // Whether the Go the compile writes is a library, and whether it wrote
+    // the file (set by the compile).
+    auto golib = false, gowrote = false;
     auto compile = [&]() -> int {
         if (tokens) {
             DumpTokens(filename);
@@ -1759,6 +1760,7 @@ int Main(int argc, char **argv) {
                 if (!WriteFileMakingDirs(outfile, out))
                     throw CompileError { cat("cannot write output file: ", outfile) };
                 if (stats) fprintf(msgs, "wrote %s (%d bytes)\n", outfile.c_str(), (int)out.size());
+                gowrote = true;
             }
             return 0;
         }
@@ -1879,6 +1881,7 @@ int Main(int argc, char **argv) {
                 if (FileExists(inc)) inc = AbsolutePath(inc);
         }
         program.clear();
+        gowrote = false;
         astp.reset();
         nativepkgs.clear();
         found.clear();
@@ -1891,7 +1894,9 @@ int Main(int argc, char **argv) {
             auto code = RunOnCompilerStack(compile);
             if (code) return code;
             if (gotarget && (verb == "build" || gorun)) {
-                if (nocgen || (gorun && multitest)) return 0;
+                // Nothing to build where the compile stopped short of the Go
+                // (--check, --parse, --dump, ...).
+                if (!gowrote || multitest) return 0;
                 if (golib) {
                     fprintf(stderr, "%s is a library, with no main to %s: --target=go writes it "
                                     "with -o file.go\n", filename.c_str(),
@@ -1911,11 +1916,11 @@ int Main(int argc, char **argv) {
                 #endif
                 if (!GoBuild(outfile, goexe, goopts, msgs, cat(builddir, "/go-build.log")))
                     return 1;
-                vector<string> argv = { goexe };
-                argv.insert(argv.end(), progargs.begin(), progargs.end());
+                vector<string> runargv = { goexe };
+                runargv.insert(runargv.end(), progargs.begin(), progargs.end());
                 fflush(msgs);
                 string err;
-                auto rc = RunInheritingStdio(argv, err);
+                auto rc = RunInheritingStdio(runargv, err);
                 if (rc < 0) {
                     fprintf(stderr, "%s\n", err.c_str());
                     return 1;
