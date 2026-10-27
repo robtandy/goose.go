@@ -639,10 +639,12 @@ def overflow_program(name):
 
 def go_env():
     """The Go tool's environment: the module and build flags of whoever runs
-    the suite play no part in building one generated file."""
+    the suite play no part in building one generated file, which builds,
+    and is vetted, without cgo, as it must (AGENTS.md)."""
     env = dict(os.environ)
     env["GOFLAGS"] = ""
     env["GO111MODULE"] = "auto"
+    env["CGO_ENABLED"] = "0"
     return env
 
 
