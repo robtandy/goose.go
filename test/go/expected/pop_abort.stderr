@@ -1,0 +1,1 @@
+goose runtime error: pop on empty array (test/go/programs/pop_abort.goose:9)

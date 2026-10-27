@@ -58,10 +58,108 @@ static string FirstResult(const string &t, size_t n) {
     return s;
 }
 
+// A case-function call (§8.2): every argument evaluated once, in order,
+// then the scrutinee's tag picking the case, which takes its variant's
+// payload as its own type; every case's results land in the same
+// temporaries, which are returned. A fixed-mode ADT, also behind a
+// reference, dispatches only to cases taking the payload by value (§3.5).
+inline vector<string> CodeGenGo::GenDispatch(Call *c) {
+    auto ln = c->line;
+    auto sp0 = c->dispatch[0];
+    auto an = CallArgNodes(c, sp0->params.size());
+    auto pos = c->dispatcharg;
+    auto sn = an[pos];
+    auto enumtype = sn->exprtype;
+    auto isref = enumtype->kind == TY_REF;
+    if (isref) enumtype = enumtype->ref->sub;
+    if (enumtype->kind != TY_ENUM || enumtype->enu->varmode)
+        Unsupported(ln, cat("a case-function dispatch over ", TypeText(enumtype)));
+    auto ei = EIOf(enumtype);
+    auto &ti = TI(enumtype, ln);
+    GoLoc e;
+    vector<string> args(an.size());
+    for (size_t i = 0; i < an.size(); i++) {
+        if ((int)i == pos) {
+            if (isref) {
+                e = AtTyped(GenPure(sn), enumtype);
+            } else {
+                // A copy, taken before the later arguments run.
+                e = AtVar(Snapshot(enumtype, CoerceVal(GenX(sn), sn->exprtype, enumtype, ln)), enumtype);
+            }
+            continue;
+        }
+        auto pt = sp0->argtypes[i];
+        auto x = Coerce(GenX(an[i]), an[i]->exprtype, pt, an[i]->line);
+        if (!IsGoConst(x) && x != "nil") x = Snapshot(pt, x);
+        args[i] = x;
+    }
+    vector<string> res;
+    for (auto rt : sp0->rets) {
+        auto t = T();
+        Decl(t, LocalT(rt, ln));
+        res.push_back(t);
+    }
+    auto chain = [&] {
+        auto tag = T();
+        Decl(tag, ti.rep == GR_TAG ? ti.name : IntGoT(TagStore(ei->en)), TagOf(e, ln));
+        auto nv = ei->en->variants.size();
+        for (size_t vi = 0; vi < nv; vi++) {
+            auto sp = c->dispatch[vi];
+            auto &ki = sinfo[sp];
+            auto last = vi + 1 == nv;
+            auto open = !vi ? cat("if ", tag, " == 0 {")
+                            : last && !debug ? string("} else {") : cat("} else if ", tag, " == ", vi, " {");
+            if (!vi) L(open);
+            else LS(open);
+            ind++;
+            PushSc(SC_PLAIN);
+            auto vt = VariantType(enumtype, (int)vi);
+            auto pt = sp->argtypes[pos];
+            if (pt->kind == TY_REF) Fail(ln, "internal: a fixed-mode payload dispatched by reference");
+            auto varg = ti.voffs.empty() || ti.voffs[vi] < 0 ? ZeroOf(vt, ln) : PayloadLoc(e, (int)vi, ln).lv;
+            string list;
+            if (ki.needssp) {
+                NoStackAcrossCycleCall(sp, ln);
+                NoteStackCall(sp, ln);
+                list = cat("gs, ", SpTop());
+            }
+            for (size_t i = 0; i < an.size(); i++)
+                Append(list, list.empty() ? "" : ", ", (int)i == pos ? Coerce(varg, vt, pt, ln) : args[i]);
+            for (auto fv : ki.freevars) Append(list, list.empty() ? "" : ", ", FreeVarArg(c->FreeVarArg(fv)));
+            auto call = cat(ki.name, "(", list, ")");
+            if (res.empty()) {
+                L(call);
+            } else {
+                string names;
+                for (size_t i = 0; i < res.size(); i++) Append(names, i ? ", " : "", res[i]);
+                L(names, " = ", call);
+            }
+            PopSc();
+            ind--;
+        }
+        if (debug) {
+            // A debug build's check of a tag no variant has (GS_UNREACHABLE).
+            LS("} else {");
+            ind++;
+            LS("panic(GsTagError(", LocArgs(ln), "))");
+            ind--;
+        }
+        LS("}");
+        dead = false;
+    };
+    if (Unreached()) GenUnreached(chain);
+    else chain();
+    return res;
+}
+
 // A call as a value: made at this point, its first result in a temporary.
 inline string CodeGenGo::GenCall(Call *c) {
     if (c->builtin >= 0 || c->fvbody) return CtlValX(c);
-    if (!c->dispatch.empty()) Unsupported(c->line, "a case-function dispatch");
+    if (!c->dispatch.empty()) {
+        auto res = GenDispatch(c);
+        if (res.empty()) Fail(c->line, "internal: a call without results as a value");
+        return Coerce(res[0], c->dispatch[0]->rets[0], c->exprtype, c->line);
+    }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
     auto sp = c->spec;
     if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");
@@ -73,7 +171,7 @@ inline string CodeGenGo::GenCall(Call *c) {
         GoT(sp->rets[0], c->line);
         L(FirstResult(t, sp->rets.size()), " := ", call, DECLMARK, t);
     } else {
-        Decl(t, GoT(sp->rets[0], c->line), call);
+        Decl(t, LocalT(sp->rets[0], c->line), call);
     }
     return Coerce(t, sp->rets[0], c->exprtype, c->line);
 }
@@ -81,7 +179,20 @@ inline string CodeGenGo::GenCall(Call *c) {
 inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
     if (c->builtin >= 0) { GenBuiltin(c, d); return; }
     if (c->fvbody) { GenFvCall(c, d); return; }
-    if (!c->dispatch.empty()) Unsupported(c->line, "a case-function dispatch");
+    if (!c->dispatch.empty()) {
+        auto res = GenDispatch(c);
+        if (d.k == GD_DISCARD || res.empty()) return;
+        auto want = d.t ? d.t : c->exprtype;
+        auto rt = c->dispatch[0]->rets[0];
+        if (IsRelRef(want)) {
+            auto pt = ast.RefTo(want->ref->sub, c->line, want->ref->optional);
+            auto v = Snapshot(pt, Coerce(res[0], rt, pt, c->line));
+            EmitRelStore(AtVar(d.s, want), v, NonNullRef(c), false, c->line);
+            return;
+        }
+        L(d.s, " = ", Coerce(res[0], rt, want, c->line));
+        return;
+    }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
     auto sp = c->spec;
     if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");
@@ -92,20 +203,35 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
         return;
     }
     auto want = d.t ? d.t : c->exprtype;
+    string r = call;
     if (sp->rets.size() > 1) {
-        auto t = T();
-        L(FirstResult(t, sp->rets.size()), " := ", call, DECLMARK, t);
-        L(d.s, " = ", Coerce(t, sp->rets[0], want, c->line));
+        r = T();
+        L(FirstResult(r, sp->rets.size()), " := ", call, DECLMARK, r);
+    }
+    if (IsRelRef(want)) {
+        // A reference into a relative slot: the plain one, encoded there.
+        auto pt = ast.RefTo(want->ref->sub, c->line, want->ref->optional);
+        auto v = Snapshot(pt, Coerce(r, sp->rets[0], pt, c->line));
+        EmitRelStore(AtVar(d.s, want), v, NonNullRef(c), false, c->line);
         return;
     }
-    L(d.s, " = ", Coerce(call, sp->rets[0], want, c->line));
+    L(d.s, " = ", Coerce(r, sp->rets[0], want, c->line));
 }
 
 // A multi-name binding from one call (`let a, b = f();`): each result into
 // its variable, through temporaries of the callee's types where those are
 // not the variables'.
 inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
-    if (c->builtin >= 0 || c->fvbody || !c->dispatch.empty() || !c->spec)
+    if (!c->dispatch.empty()) {
+        auto rets = c->dispatch[0]->rets;
+        if (rets.size() != defs.size()) Fail(c->line, "internal: result count of a binding");
+        auto res = GenDispatch(c);
+        for (size_t i = 0; i < defs.size(); i++)
+            Decl(LocalName(defs[i]), LocalT(defs[i]->type, defs[i]->line),
+                 Coerce(res[i], rets[i], defs[i]->type, c->line));
+        return;
+    }
+    if (c->builtin >= 0 || c->fvbody || !c->spec)
         Unsupported(c->line, "a multiple binding from this call");
     auto sp = c->spec;
     if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");
@@ -127,7 +253,7 @@ inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
     L(names, " := ", call, DECLMARK, marks);
     if (same) return;
     for (size_t i = 0; i < defs.size(); i++)
-        Decl(LocalName(defs[i]), GoT(defs[i]->type, defs[i]->line),
+        Decl(LocalName(defs[i]), LocalT(defs[i]->type, defs[i]->line),
              Coerce(temps[i], sp->rets[i], defs[i]->type, c->line));
 }
 
@@ -192,19 +318,80 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             return;
         }
         case B_DEFAULT: {
-            // All-zero bytes are every scalar's default (§4.2).
+            // All-zero bytes are every fixed type's default (§4.2), which is
+            // Go's zero value of its representation, but where a field
+            // declares a default of its own: the checker built that as a
+            // literal (Call::defaultinit).
             auto t = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
-            if (!IsScalarT(t)) Unsupported(ln, cat("default<", TypeText(t), ">()"));
-            if (d.k == GD_DISCARD) return;
-            string zero = t->kind == TY_BOOL ? "false"
-                        : t->kind == TY_FLT ? GoFltLit(0, t, ln) : GoIntLit(0, false, t, ln);
-            L(d.s, " = ", Coerce(zero, t, d.t ? d.t : c->exprtype, ln));
+            GoT(t, ln);
+            auto want = d.t ? d.t : c->exprtype;
+            if (!c->defaultinit) {
+                if (d.k == GD_DISCARD) return;
+                if (IsRelRef(want)) {
+                    L(d.s, " = 0");
+                    return;
+                }
+                L(d.s, " = ", Coerce(ZeroOf(t, ln), t, want, ln));
+                return;
+            }
+            auto v = T();
+            Decl(v, LocalT(t, ln));
+            if (t->kind == TY_ARRAY) {
+                auto av = ArrayView(AtVar(v, t), ln);
+                auto i = T();
+                L("for ", i, " := int64(0); ", i, " < ", ArrSize(t->arr), "; ", i, "++ {");
+                ind++;
+                PushSc(SC_PLAIN);
+                GenAny(c->defaultinit, GoDst { GD_LVALUE, ElemAt(av, i, ln).lv, t->arr->sub });
+                PopSc();
+                ind--;
+                LS("}");
+            } else {
+                GenAny(c->defaultinit, GoDst { GD_LVALUE, v, t });
+            }
+            if (d.k != GD_DISCARD) L(d.s, " = ", Coerce(v, t, want, ln));
             return;
         }
         case B_COPY: {
-            // A scalar's copy is its value.
-            if (!IsScalarT(an[0]->exprtype)) Unsupported(ln, cat("copy of ", TypeText(an[0]->exprtype)));
-            GenAny(an[0], GoDst { d.k, d.s, d.t ? d.t : c->exprtype });
+            // A copy is the value the place holds (§4.1).
+            auto want = d.t ? d.t : c->exprtype;
+            if (IsScalarT(an[0]->exprtype)) {
+                GenAny(an[0], GoDst { d.k, d.s, want });
+                return;
+            }
+            auto rt = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
+            auto x = LoadLoc(GenLoc(an[0]), rt, ln);
+            if (want && want->kind == TY_SLICE && rt->kind != TY_SLICE) {
+                // A slice destination views the copy, not its source.
+                auto v = Snapshot(rt, x);
+                x = LoadLoc(AtVar(v, rt), want, ln);
+            } else {
+                x = Coerce(x, rt, want, ln);
+            }
+            if (d.k == GD_DISCARD) {
+                if (!IsGoName(x)) L("_ = ", x);
+                return;
+            }
+            if (x != d.s) L(d.s, " = ", x);
+            return;
+        }
+        case B_LEN: case B_CAP: case B_INDEX_OF: case B_PUSH: case B_APPEND: case B_POP:
+        case B_POP_N: case B_CLEAR: case B_RESIZE: {
+            auto x = GenArrayBuiltin(c);
+            if (x.empty() || Unreached()) return;
+            auto want = d.t ? d.t : c->exprtype;
+            auto rt = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
+            if (d.k == GD_DISCARD) {
+                if (!IsGoName(x) && !IsGoConst(x)) L("_ = ", x);
+                return;
+            }
+            if (want && IsRelRef(want)) {
+                auto v = Snapshot(rt, x);
+                EmitRelStore(AtVar(d.s, want), v, NonNullRef(c), false, ln);
+                return;
+            }
+            x = Coerce(x, rt, want, ln);
+            if (x != d.s) L(d.s, " = ", x);
             return;
         }
         default:
@@ -248,7 +435,14 @@ inline void CodeGenGo::RenderInto(const string &cur, const string &end, Node *a,
         L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(s->val), ")");
         return;
     }
-    if (!IsScalarT(t)) Unsupported(a->line, cat("printing a value of type ", TypeText(t)));
+    if (!IsScalarT(t)) {
+        if (t->kind == TY_REF && !t->ref->optional) t = t->ref->sub;
+        GoT(t, a->line);
+        auto l = GenLoc(a);
+        if (Unreached()) return;
+        RenderLoc(cur, end, l, t, false, a->line);
+        return;
+    }
     auto x = GenX(a);
     switch (t->kind) {
         case TY_INT:

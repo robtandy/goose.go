@@ -1,0 +1,10 @@
+10 true 3 0
+30 false
+true null Node { 30, Node { 4, null } }
+Pt { 5, 42 } true false true
+Pt { 101, 2 } Pt { 10, 42 } Pt { 10, 42 } true
+[10, 7, 108]
+-1 Holder { Pt { 101, 2 }, null }
+42 Holder { Pt { 101, -7 }, Pt { 10, 42 } } Pt { 101, -7 }
+null true false
+Node { 20, Node { 10, null } }

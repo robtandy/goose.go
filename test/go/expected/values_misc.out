@@ -1,0 +1,10 @@
+14 [[1, 2], [3, 14]]
+Acc { 12, 3 } [5, -2, 9]
+-2 9 Acc { 7, 2 }
+[Row { "a", 10, 1 }, Row { "bb", 25, 3 }] Tagged { 1, Row { "bb", 25, 3 }, -3 }
+Row { "a", 10, 1 } Row { "a", 0, 1 } false
+Cfg { 3, "cfg", false } Row { "", 0, 0 } [0, 0, 0] List.Nil 
+2 0 Cons { 3, Cons { 2, List.Nil } }
+false
+true Row { "bb", 25, 3 }
+deferred [7, 7]

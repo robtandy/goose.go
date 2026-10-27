@@ -251,6 +251,74 @@ func GsUnreachable(file string, line int) *GsError {
 // is a call out of the comparisons.
 func GsBool(b bool) bool { return b }
 
+)GSGO",
+R"GSGO(// GsTagError is a debug build's failed check of an ADT's tag, which no
+// variant has (GS_E_TAG): a compiler bug if it ever fails.
+func GsTagError(file string, line int) *GsError {
+	return &GsError{Msg: gsErrMsgs[GsETag], File: file, Line: line}
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-size values (§3). A slice is the address of its first element and
+// their count; Data is a Go pointer, so that the collector sees a slice of
+// a Go variable as it sees a reference to one.
+
+// GsSlice is a slice T[:] of any element type (§3.10).
+type GsSlice struct {
+	Data unsafe.Pointer
+	Len  int64
+}
+
+// GsStr is the slice of a string literal's bytes, which are read-only.
+func GsStr(s string) GsSlice { return GsSlice{unsafe.Pointer(unsafe.StringData(s)), int64(len(s))} }
+
+// GsSub is the slice of the elements lo up to hi of the n at p, each es
+// bytes. One that is empty at the end of the run starts at p, which keeps
+// its address inside the storage it slices.
+func GsSub(p unsafe.Pointer, lo, hi, n, es int64) GsSlice {
+	if lo < n {
+		return GsSlice{unsafe.Add(p, lo*es), hi - lo}
+	}
+	return GsSlice{p, 0}
+}
+
+// GsIdx is i, checked to be an index of an array of n elements (GS_IDX).
+func GsIdx(i, n int64, file string, line int) int64 {
+	if uint64(i) >= uint64(n) {
+		gsIdxFail(i, n, file, line)
+	}
+	return i
+}
+
+func gsIdxFail(i, n int64, file string, line int) {
+	panic(&GsError{Msg: "index " + strconv.FormatInt(i, 10) + " out of bounds (length " +
+		strconv.FormatInt(n, 10) + ")", File: file, Line: line})
+}
+
+// GsMemEq says whether the n bytes at a and b are the same.
+func GsMemEq(a, b unsafe.Pointer, n int64) bool {
+	return n == 0 || a == b ||
+		string(unsafe.Slice((*byte)(a), n)) == string(unsafe.Slice((*byte)(b), n))
+}
+
+// GsRelLoad is the address an optional relative reference at slot holding
+// off encodes: null where off is 0 (§3.9).
+func GsRelLoad(slot unsafe.Pointer, off int64) unsafe.Pointer {
+	if off == 0 {
+		return nil
+	}
+	return unsafe.Add(slot, off)
+}
+
+// GsRelOff is the offset from slot the address p stores as in an optional
+// relative reference: 0 for null.
+func GsRelOff(p, slot unsafe.Pointer) int64 {
+	if p == nil {
+		return 0
+	}
+	return int64(uintptr(p) - uintptr(slot))
+}
+
 func GsDivFail(file string, line int) {
 	panic(&GsError{Msg: "division by zero", File: file, Line: line})
 }
@@ -714,6 +782,43 @@ func gsPutBytes(p, end unsafe.Pointer, b []byte) unsafe.Pointer {
 	}
 	copy(unsafe.Slice((*byte)(p), len(b)), b)
 	return unsafe.Add(p, len(b))
+}
+
+// gsPutQuoted writes the n bytes at s quoted, as a u8 array inside an
+// aggregate renders (gs_fmt_quoted): `"`, `\` and the line breaks and tabs
+// escaped.
+func gsPutQuoted(p, end unsafe.Pointer, s unsafe.Pointer, n int64) unsafe.Pointer {
+	b := unsafe.Slice((*byte)(s), n)
+	size := 2
+	for _, c := range b {
+		switch c {
+		case '"', '\\', '\n', '\r', '\t':
+			size += 2
+		default:
+			size++
+		}
+	}
+	if uintptr(size) > uintptr(end)-uintptr(p) {
+		gsOverflow(end)
+	}
+	d := unsafe.Slice((*byte)(p), size)[:0]
+	d = append(d, '"')
+	for _, c := range b {
+		switch c {
+		case '"', '\\':
+			d = append(d, '\\', c)
+		case '\n':
+			d = append(d, '\\', 'n')
+		case '\r':
+			d = append(d, '\\', 'r')
+		case '\t':
+			d = append(d, '\\', 't')
+		default:
+			d = append(d, c)
+		}
+	}
+	d = append(d, '"')
+	return unsafe.Add(p, len(d))
 }
 
 // gsOut writes the bytes from base up to end to stdout, in one write.

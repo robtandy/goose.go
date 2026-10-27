@@ -57,12 +57,16 @@ Unlike C threads (`__thread`), Go goroutines multiplex across OS threads and a p
 - In debug mode (`--debug`), arithmetic and narrowing `as` casts call checked helpers (`gs_add_i32`, `gs_range_*`, etc.) that report the `.goose` file and line on overflow.
 
 ### 3.2 Fixed-Size Types (`Fixed` Class)
-Goose specifies exact byte layouts (`FixedSize`, `LayoutFields` in `src/codegen_types.h`) with `#pragma pack(1)` semantics:
+Goose specifies exact byte layouts (`FixedSize`, `LayoutFields` in `src/codegen_types.h`) with `#pragma pack(1)` semantics. `src/codegen_go_types.h` ports them and keeps every value in its C layout wherever Go can hold it there:
 1. **Naturally Aligned Structs** (where every field offset in `LayoutFields` already matches Go's natural alignment and total size matches `FixedSize`, such as `struct YyVal { tag: u64, uni: u64 }`):
-   - Emitted as a native Go `struct` so field reads/writes are direct `s.tag_g` / `s.uni_g` with zero padding.
+   - Emitted as a native Go `struct` so field reads/writes are direct `s.tag_g` / `s.uni_g`; `pad` and `pad n` become blank `_ [n]byte` fields, which Go's `==` ignores as Goose's does.
 2. **Unaligned / Packed Fixed Structs & Fixed-Mode ADTs** (where `LayoutFields` has unaligned offsets or no tail padding):
-   - Emitted as `type Name_g [FixedSize]byte` with inline `unsafe.Add` getter/setter helpers reading/writing each field at its exact byte offset from `LayoutFields`.
-   - On `arm64` and `amd64`, Go's SSA compiler lowers `*(*uint32)(unsafe.Add(unsafe.Pointer(&s[0]), off))` to a single unaligned load/store instruction (`LDR`/`STR` or `MOV`).
+   - Emitted as `type Name_g [FixedSize]byte`, each field read and written in place at its exact byte offset from `LayoutFields`: `*(*uint32)(unsafe.Add(unsafe.Pointer(&s), off))`.
+   - On `arm64` and `amd64`, Go's SSA compiler lowers that to a single unaligned load/store instruction (`LDR`/`STR` or `MOV`).
+   - A payload-less ADT is its tag, a named `uint8`/`uint16`; any other fixed-mode ADT the bytes of its tag (`TagStore`) and its largest payload, the payload behind the tag. A static-capacity limited array `T[..k]` is its length (`LenStore`) and its `k` slots, as a native struct where Go aligns the slots and as bytes otherwise; a fixed array `T[k]` is a Go array.
+3. **References and slices are Go pointers.** A plain or optional reference is a typed Go pointer (`*T`, `nil` for null) and a slice a `GsSlice { Data unsafe.Pointer, Len int64 }`, so that the Go collector sees every address the program holds into memory it manages: a Goose local is a Go local, which Go may move with its goroutine's stack or put on its heap. A value holding them where C packs them unaligned (a reference at byte 1), or an ADT whose payloads hold them (a union of bytes would hide them from the collector), cannot keep its C layout: it is a native Go struct of Go's own layout, an ADT one with each payload in a field of its own beside the tag. Nothing a program can observe depends on that layout. A self-relative reference is the signed offset C stores, at its width.
+4. **Equality** (`==`, §4.5) is Go's own `==` wherever that is the structural one (native structs of scalars, references and slices, arrays of them, tags), and a generated `gsEq_<T>` elsewhere, which compares a limited array's live elements and an ADT's live payload only, and floats by value.
+5. **Large values.** A fixed-size value of more than 4096 bytes is one the C backend holds on a data stack wherever it is a local or a temporary (`FixedLocal`). Those stacks are counted in the `--stacks` report both backends share, so this version supports such values in globals (built in place, counting the one stack C's initializer takes, or none where C makes the global static data) and leaves locals and temporaries to the data-stack work of the resizable values.
 
 ### 3.3 Variable-Size Byte Images (`Bytes` Class)
 - Represented as `unsafe.Pointer` pointing to the start of the self-describing byte image on a Data Stack.

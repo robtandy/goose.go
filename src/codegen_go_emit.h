@@ -79,6 +79,17 @@ inline void CodeGenGo::CollectSpecs() {
     }
 }
 
+// The Go type of a parameter or a result: one of a fixed-size value of more
+// than NATIVE_VALUE_LIMIT bytes the C backend passes through a copy on a data
+// stack (codegen_calls.h), which this version does not hold.
+inline string CodeGenGo::ParamT(TypeExpr *t, Line ln) {
+    if (IsLargeFixed(t))
+        Unsupported(ln, cat("a parameter or result of ", TypeText(t), " (", FixedSize(t),
+                            " bytes: C passes one of more than ", NATIVE_VALUE_LIMIT,
+                            " through a copy on a data stack)"));
+    return GoT(t, ln);
+}
+
 // A specialization's Go signature; names its parameters and free variables.
 inline string CodeGenGo::Signature(FnSpec *sp) {
     auto &si = sinfo[sp];
@@ -87,15 +98,28 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
     if (si.needssp) add("gs *GsStackBlock, gs_sp int64");
     if (sp->params.size() != sp->argtypes.size())
         Fail(sp->sf->line, "internal: parameter types");
-    for (size_t i = 0; i < sp->params.size(); i++)
-        add(cat(LocalName(sp->params[i]), " ", GoT(sp->argtypes[i], sp->sf->line)));
+    for (size_t i = 0; i < sp->params.size(); i++) {
+        if (IsRelRef(sp->argtypes[i]))
+            Unsupported(sp->sf->line, cat("a parameter of the relative reference type ",
+                                          TypeText(sp->argtypes[i])));
+        add(cat(LocalName(sp->params[i]), " ", ParamT(sp->argtypes[i], sp->sf->line)));
+    }
     for (auto fv : si.freevars) {
         add(cat(LocalName(fv), " *", GoT(fv->type, fv->line)));
         fvptr.insert(fv);
     }
     string rets;
-    for (size_t i = 0; i < sp->rets.size(); i++)
-        Append(rets, i ? ", " : "", GoT(sp->rets[i], sp->sf->line));
+    for (size_t i = 0; i < sp->rets.size(); i++) {
+        // A result holding relative references is built where it is
+        // received, so that a link from it to the receiver's storage is
+        // measured from there (C's result location, NeedsResultLocation):
+        // a Go result is a copy.
+        auto rt = sp->rets[i];
+        if (rt->kind != TY_REF && IsFix(rt) && HasRelRef(rt))
+            Unsupported(sp->sf->line, cat("a function result holding relative references (",
+                                          TypeText(rt), ")"));
+        Append(rets, i ? ", " : "", ParamT(rt, sp->sf->line));
+    }
     if (sp->rets.size() > 1) rets = cat("(", rets, ")");
     return cat("func ", si.name, "(", params, ")", rets.empty() ? "" : " ", rets);
 }
@@ -150,7 +174,8 @@ static void GoLineUses(string_view s, unordered_map<string, int> &uses) {
         } else if (isalpha((unsigned char)c) || c == '_') {
             auto b = p;
             while (p < s.size() && isid(s[p])) p++;
-            uses[string(s.substr(b, p - b))]++;
+            // A field selector (`x.f_g`) names no local.
+            if (b == 0 || s[b - 1] != '.') uses[string(s.substr(b, p - b))]++;
         } else if (isdigit((unsigned char)c)) {
             while (p < s.size() && isid(s[p])) p++;
         } else {
@@ -302,6 +327,10 @@ inline void CodeGenGo::FindUsedGlobals() {
     for (auto g : ast.globals) {
         auto pure = true;
         for (auto i : g->inits) pure = pure && PureInit(i);
+        // A large value the C backend builds on a data stack takes one
+        // there whether or not anything reads it, which both backends count
+        // (--stacks).
+        for (auto d : g->defs) pure = pure && (!IsLargeFixed(d->type) || cstatic.count(d));
         if (pure) continue;
         for (auto d : g->defs) usedglobals.insert(d);
         for (auto i : g->inits) mark(i);
@@ -309,6 +338,15 @@ inline void CodeGenGo::FindUsedGlobals() {
 }
 
 inline void CodeGenGo::EmitGlobalDecls() {
+    // The globals the C backend makes static data, in declaration order, as
+    // it finds them (a static one's initializer may name an earlier one).
+    for (auto g : ast.globals)
+        for (size_t di = 0; di < g->defs.size(); di++) {
+            auto d = g->defs[di];
+            if (!d->isvar && d->type && d->type->cq && di < g->inits.size() &&
+                g->inits.size() == g->defs.size() && CStaticInit(g->inits[di], d->type))
+                cstatic[d] = g->inits[di];
+        }
     FindUsedGlobals();
     for (auto g : ast.globals) {
         for (size_t di = 0; di < g->defs.size(); di++) {
@@ -344,7 +382,17 @@ inline void CodeGenGo::EmitGlobalInit() {
             auto d = g->defs[i];
             // Initialized at its declaration, or not there at all.
             if (gstatic.count(d) || !usedglobals.count(d)) continue;
-            GenAny(g->inits[i], GoDst { GD_LVALUE, gnames[d], d->type });
+            auto init = g->inits[i];
+            if (IsLargeFixed(d->type) && (Is<ArrayLit>(init) || Is<StructLit>(init) || Is<StrLit>(init))) {
+                // Built where it stays. Where the C backend's initializer
+                // builds it, it takes a data stack for the value first.
+                if (!cstatic.count(d)) AllocStk();
+                auto dst = AtVar(gnames[d], d->type);
+                if (auto sl = Is<StrLit>(init)) StrLitInto(sl, dst);
+                else LitInto(init, dst, true);
+                continue;
+            }
+            GenAny(init, GoDst { GD_LVALUE, gnames[d], d->type });
         }
         // An initializer that never completes (a `loop {}`) leaves the ones
         // after it unreached, for Go as for the program.
@@ -399,8 +447,8 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "const (\n\tgsStackReserve = ", opts.stacks.reserve,
                    "\n\tgsStackGap     = ", opts.stacks.gap, "\n)\n\n");
     for (auto part : go_runtime_prologue) s += part;
-    Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", gdecls,
-           gdecls.empty() ? "" : "\n", code);
+    Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, gdecls,
+           gdecls.empty() ? "" : "\n", code, eqcode);
     return s;
 }
 

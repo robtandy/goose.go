@@ -35,15 +35,31 @@
 //   value nothing reads is marked used (FinishBody), and code is emitted only
 //   where Go's own flow analysis can reach it (`dead`).
 //
-// This first version covers the scalar core of the language: scalars and
-// their operators and conversions, globals, locals, control flow, defer,
-// direct and recursive calls (tail-recursion-eliminated loops included),
-// nested functions and function values, and print, assert, abort and exit.
-// Anything else stops the compile with an error naming the construct
-// (Unsupported) rather than emitting Go that would be wrong.
+// * Fixed-size values (§3.2-§3.10) keep their C layout wherever Go can hold
+//   them there (codegen_go_types.h): a struct whose fields Go aligns where C
+//   packs them is a native Go struct, one that is packed tighter is the
+//   bytes of its layout, `[FixedSize]byte`, its fields reached through
+//   unsafe.Add; a payload-less ADT is its tag, any other the bytes of its tag
+//   and its largest payload; fixed arrays are Go arrays, a static-capacity
+//   limited array its length and slots. A reference is a Go pointer and a
+//   slice a GsSlice, so that the Go collector sees every address into memory
+//   it manages. A place -- a variable, field, element or pointee -- is a Go
+//   lvalue (GoLoc, codegen_go_places.h).
+//
+// This version covers the scalar core of the language and its fixed-size
+// values: scalars and their operators and conversions, structs, fixed and
+// static-capacity limited arrays, fixed-mode ADTs and match, slices and
+// string literals, plain, optional and self-relative references, globals,
+// locals, control flow, defer, direct and recursive calls
+// (tail-recursion-eliminated loops included), nested functions and function
+// values, and print, assert, abort and exit. Anything else -- the values on
+// data stacks (resizable and variable-size ones), `in pool` references,
+// threads, extern and export fns -- stops the compile with an error naming
+// the construct (Unsupported) rather than emitting Go that would be wrong.
 //
 // The members are declared here in the order they are defined across
-// codegen_go_values.h, codegen_go_stmts.h, codegen_go_calls.h and
+// codegen_go_values.h, codegen_go_types.h, codegen_go_places.h,
+// codegen_go_aggr.h, codegen_go_stmts.h, codegen_go_calls.h and
 // codegen_go_emit.h.
 #pragma once
 
@@ -74,10 +90,16 @@ struct CodeGenGo {
     // Output sections, which Source() assembles after the header and the
     // runtime prologue.
     string filedecls;   // The source file names the aborts report.
+    string tdecls;      // The named types of fixed-size values.
     string gdecls;      // Package-level globals.
+    string eqcode;      // Equality functions.
     string code;        // Functions, gsInitGlobals and main.
 
+    // The line of the node being generated, which a message about code with
+    // no line of its own (a temporary's type) names.
+    Line curline;
     [[noreturn]] void Fail(Line l, const string &msg) {
+        if (l.line <= 0) l = curline;
         auto s = cat("codegen: ", msg);
         if (l.fileidx >= 0 && l.fileidx < (int)ast.sources.size() && l.line > 0)
             s = cat(ast.sources[l.fileidx].first, ":", l.line, ": ", s);
@@ -113,8 +135,194 @@ struct CodeGenGo {
     }
     static const char *IntGoT(IntStorage s);
     string TypeText(TypeExpr *t);
-    string GoT(TypeExpr *t, Line ln);
     bool SameGoT(TypeExpr *a, TypeExpr *b);
+
+    // ------------------------------------------------------------------
+    // Fixed-size types (codegen_go_types.h): the C layout, and the Go
+    // representation of it.
+
+    static int64_t ArrSize(TypeArray *a) { return a->size; }
+    static int64_t IntSize(IntStorage s) { return IntBits(s) / 8; }
+    bool TEq(TypeExpr *a, TypeExpr *b);
+    StructInst *SI(TypeExpr *t);
+    EnumInst *EIOf(TypeExpr *t);
+    EnumInst *EIVar(TypeExpr *t) { return EIOf(t->var->adt); }
+    span<const FieldRun> FieldRuns(TypeExpr *t);
+    SizeClass Cls(TypeExpr *t);
+    bool IsFix(TypeExpr *t) { return Cls(t) == SC_FIXED; }
+    bool IsStaticLimited(TypeExpr *t) {
+        return t && t->kind == TY_ARRAY && t->arr->akind == A_LIMITED && ArrSize(t->arr) >= 0;
+    }
+    IntStorage LenStore(TypeArray *a);
+    static IntStorage TagStore(SEnum *en) { return en->variants.size() <= 256 ? IS_U8 : IS_U16; }
+    static int64_t TagSize(SEnum *en) { return IntSize(TagStore(en)); }
+    struct Layout {
+        vector<int64_t> offs;
+        int64_t size = 0;
+    };
+    map<pair<const void *, int>, Layout> layouts;
+    int64_t PadAlign(TypeExpr *t);
+    Layout LayoutFields(const vector<Field> &fields, const vector<TypeExpr *> &ftypes);
+    const Layout &StructLayout(StructInst *si);
+    const Layout &VariantLayout(EnumInst *ei, int vi);
+    int64_t FixedSize(TypeExpr *t);
+    map<pair<EnumInst *, int>, TypeExpr *> varianttypes;
+    TypeExpr *VariantType(TypeExpr *enumtype, int vi);
+    bool HasRelRef(TypeExpr *t);
+    bool BitwiseEq(TypeExpr *t);
+    static constexpr int64_t NATIVE_VALUE_LIMIT = 4096;
+    bool IsLargeFixed(TypeExpr *t);
+    string LocalT(TypeExpr *t, Line ln);
+    // The globals the C backend makes static data, with their initializers.
+    unordered_map<const VarDef *, Node *> cstatic;
+    bool CStaticInit(Node *n, TypeExpr *t);
+    unordered_map<string, vector<pair<TypeExpr *, string>>> mangleowners;
+    unordered_set<string> mangles;
+    string Mangle(TypeExpr *t);
+    bool SameMangle(TypeExpr *a, TypeExpr *b);
+    string RawMangle(TypeExpr *t);
+    static bool NamedGoT(TypeExpr *t);
+    void CheckRepresentable(TypeExpr *t, Line ln);
+    string GoT(TypeExpr *t, Line ln);
+    static const char *RelGoT(TypeExpr *rt);
+    // How a fixed-size type is held: as Go holds a scalar, a pointer, a
+    // GsSlice or an array of those (GR_PLAIN); as a native Go struct
+    // (GR_NATIVE); as the bytes of its C layout (GR_BYTES); or, a
+    // payload-less ADT, as its tag (GR_TAG).
+    enum GoRep { GR_PLAIN, GR_NATIVE, GR_BYTES, GR_TAG };
+    struct GoTypeInfo {
+        string name;            // Its Go type.
+        GoRep rep = GR_PLAIN;
+        int64_t size = 0, align = 1;   // In Go's memory.
+        bool ptrs = false;      // It holds Go pointers: references or slices.
+        bool exact = true;      // Its Go layout is its C layout.
+        bool goeq = true;       // Go's == is its structural equality (§4.5).
+        vector<int64_t> offs;   // A struct or variant: each field's offset.
+        vector<int64_t> voffs;  // An ADT: each variant's payload's offset, -1 for none.
+        int64_t elemoff = 0;    // A limited array: its first slot's offset.
+        bool building = false;
+    };
+    unordered_map<string, GoTypeInfo> typeinfo;   // By mangle.
+    unordered_map<string, string> gonames;        // Mangle -> named Go type.
+    vector<pair<TypeExpr *, Line>> pendingtypes;  // Named, to be declared.
+    const GoTypeInfo &TI(TypeExpr *t, Line ln);
+    void BuildStructLike(GoTypeInfo &ti, string &decl, const vector<Field> &fields,
+                         const vector<TypeExpr *> &ftypes, const Layout &lo, int64_t csize,
+                         bool bitwise, Line ln);
+    void BuildEnum(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
+    void BuildLimited(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
+    static string VariantField(EnumInst *ei, int vi);
+    void EmitTypeDecls();
+    unordered_map<string, string> eqfns;
+
+    // ------------------------------------------------------------------
+    // Places (codegen_go_places.h): a value's storage as a Go lvalue of its
+    // Go type, with its address where that is known without `&`.
+
+    struct GoLoc {
+        string lv;              // The Go lvalue, of the Go type of t.
+        string addr;            // An unsafe.Pointer to it, where it is one.
+        string ptr;             // A Go pointer to it, where it is one.
+        TypeExpr *t = nullptr;  // The type it holds (a relative reference: the slot's).
+        // A reference on the way here can be rebound, so evaluating lv later
+        // may reach other storage.
+        bool viaref = false;
+    };
+    // An array's or a slice's elements.
+    struct GoView {
+        string data;            // An unsafe.Pointer to the first.
+        string len;             // Their count, an int64.
+        string lenlv;           // A limited array's stored length.
+        IntStorage lenst = IS_U8;
+        string arr;             // The Go array they are, where they are one.
+        TypeExpr *elem = nullptr;
+        int64_t esize = 0;      // One's size in Go's memory.
+        int64_t fixed = -1;     // A fixed array's length.
+        int64_t cap = -1;       // A limited array's capacity.
+    };
+    string EqX(TypeExpr *t, const GoLoc &a, const GoLoc &b, Line ln);
+    string EqFn(TypeExpr *t, Line ln);
+    static string AddOff(const string &p, int64_t off);
+    GoLoc AtAddr(const string &p, TypeExpr *t);
+    static GoLoc AtTyped(const string &x, TypeExpr *t);
+    static GoLoc AtVar(const string &x, TypeExpr *t);
+    static string AddrOf(const GoLoc &l);
+    string PtrOf(const GoLoc &l);
+    GoLoc PinLoc(const GoLoc &l);
+    GoLoc FieldLocAt(const GoLoc &base, int fi, Line ln);
+    string TagOf(const GoLoc &e, Line ln);
+    GoLoc PayloadLoc(const GoLoc &e, int vi, Line ln);
+    GoView ArrayView(const GoLoc &l, Line ln);
+    GoLoc ElemAt(const GoView &v, const string &i, Line ln);
+    string IndexValue(Node *idx);
+    GoLoc IndexLoc(GoLoc l, Node *idxnode, Line ln, bool nobc);
+    GoLoc VarLoc(const VarDef *vd, Line ln);
+    void DerefLoc(GoLoc &l);
+    string RelLoad(const GoLoc &slot);
+    // A fill's value, evaluated once for all its repetitions (FreezeFill).
+    unordered_map<Node *, GoLoc> fillvalues;
+    GoLoc GenLoc(Node *n);
+    string LoadLoc(GoLoc l, TypeExpr *et, Line ln);
+    string AdaptToEnum(const GoLoc &l, TypeExpr *et, Line ln);
+    string AdaptToLimited(const GoLoc &l, TypeExpr *et, Line ln);
+    void CopyIntoLimited(const GoLoc &l, TypeExpr *et, Line ln, const GoLoc &dst);
+    string GenRefVal(Node *child, Line ln);
+    string CoerceVal(const string &x, TypeExpr *from, TypeExpr *to, Line ln);
+    // The widest fixed-size value holding relative references (§3.9).
+    int64_t relrootmax = 0;
+    void EmitRelRangeCheck(TypeExpr *rt, const string &off, Line ln);
+    void EmitRelStore(const GoLoc &slot, const string &rv, bool nonnull, bool apart, Line ln);
+    void EmitRelSelf(const GoLoc &slot, int64_t fieldoff, Line ln);
+    static bool NonNullRef(Node *v);
+    bool RelSlotApart(TypeExpr *rt, TypeExpr *holder, int64_t off);
+    void GenRelStore(const GoLoc &slot, Node *val, bool apart);
+    void ComputeRelRootMax();
+
+    // ------------------------------------------------------------------
+    // Aggregate values (codegen_go_aggr.h).
+
+    string ZeroOf(TypeExpr *t, Line ln);
+    void LitInto(Node *n, const GoLoc &dst, bool fresh);
+    void StructLitInto(StructLit *sl, const GoLoc &dst, bool fresh);
+    void ArrayLitInto(ArrayLit *al, const GoLoc &dst, bool fresh);
+    void FreezeFill(Node *n, TypeExpr *t, vector<Node *> &added);
+    string GenLitVal(Node *n);
+    string GenStrLit(StrLit *s);
+    void StrLitInto(StrLit *s, const GoLoc &dst);
+    string GenSlice(SliceExpr *se);
+    string GenDot(Dot *d);
+    string GenEquality(Binary *b);
+    string RangeEq(TypeExpr *elem, const string &ad, const string &an, const string &bd,
+                   const string &bn, Line ln);
+    void ElemwiseInto(TypeExpr *t, TType op, Line ln, const string &l, bool lscalar,
+                      const string &r, bool rscalar, const GoLoc &dst);
+    void ElemwiseNegInto(TypeExpr *t, Line ln, const string &x, const GoLoc &dst);
+    void ElemwiseOperands(Binary *b, string &l, bool &ls, string &r, bool &rs);
+    void GenForArray(ForLoop *f);
+    void GenEnumMatch(MatchExpr *m, TypeExpr *enumtype, bool isref, const GoDst &d);
+    GoLoc RecvLoc(Node *n);
+    void CheckLimited(const GoLoc &l, Line ln);
+    string ElemValue(Node *n, TypeExpr *elem);
+    void StoreElem(Node *n, const GoLoc &slot, const string &ev);
+    string NewElemResult(const GoLoc &slot, Line ln);
+    string GenArrayBuiltin(Call *c);
+    static string ElemAddr(const GoView &v, const string &i);
+    // The nominal types the rendering being emitted is inside of, and the
+    // render functions of the types that reach themselves through
+    // references (RenderFn).
+    vector<TypeExpr *> rendering;
+    unordered_map<string, string> renderfns;
+    struct RenderReq {
+        TypeExpr *t;
+        Line ln;
+        string name;
+    };
+    vector<RenderReq> renderqueue;
+    void RenderLoc(const string &cur, const string &end, GoLoc l, TypeExpr *t, bool nested, Line ln);
+    void RenderVariant(const string &cur, const string &end, const GoLoc &l, TypeExpr *t, Line ln);
+    void RenderScalar(const string &cur, const string &end, const string &x, TypeExpr *t, Line ln);
+    string RenderFn(TypeExpr *t, Line ln);
+    void EmitRenderFns();
 
     // ------------------------------------------------------------------
     // Per-specialization interface. A function's Go parameters are the data
@@ -212,6 +420,26 @@ struct CodeGenGo {
     };
     vector<GoScope> scopes;
 
+    // The emission state of a function, which one generated on the side (an
+    // equality, a render function) sets aside meanwhile.
+    struct FnState {
+        string body;
+        int ind = 1, tmpn = 0, stknext = 0, stkmax = 0;
+        string spexpr;
+        set<string> fnused;
+        unordered_map<string, int> fnnextsuffix;
+        unordered_map<const VarDef *, string> vnames;
+        set<const VarDef *> fvptr;
+        vector<GoScope> scopes;
+        bool dead = false;
+        int dry = 0;
+        FnSpec *curspec = nullptr;
+        SpecInfo *curinfo = nullptr;
+        vector<TypeExpr *> rendering;
+    };
+    FnState SaveFnState();
+    void RestoreFnState(FnState &s);
+
     // Statement lines: none where control cannot reach them. LS is for the
     // lines that close or continue a construct whose opening line was
     // emitted, which have to be there either way.
@@ -253,6 +481,7 @@ struct CodeGenGo {
                Is<LoopExpr>(n) || Is<InlineBlock>(n);
     }
     static bool HasStmts(Node *n);
+    bool TryPure(const function<string()> &gen, string &x);
     static bool IsGoName(const string &x);
     static bool GoConstInt(const string &x, int64_t &v, bool &uns);
     static bool IsGoConst(const string &x);
@@ -277,7 +506,8 @@ struct CodeGenGo {
     string GenUnary(Unary *u);
     string GenBinary(Binary *b);
     string GenCast(AsCast *c);
-    string GenTruth(Node *n) { return GenX(n); }
+    string NullTestOperand(Node *n);
+    string GenTruth(Node *n);
     string CtlValX(Node *n);
     void GenAny(Node *n, const GoDst &d);
     void LeafAny(Node *n, const GoDst &d);
@@ -318,8 +548,10 @@ struct CodeGenGo {
     string LocalName(VarDef *vd);
     string Unique2(const string &base);
     void BindLocal(VarDef *d, Node *init);
-    string GenLvalue(Node *n, TypeExpr *&t);
+    bool StableDest(Node *n);
+    GoLoc AssignLoc(Node *lval, bool pointee);
     void GenAssign(Assign *a);
+    bool RelApartOf(Node *lval, TypeExpr *rt);
     void GenIncDec(IncDec *a);
 
     // ------------------------------------------------------------------
@@ -328,6 +560,7 @@ struct CodeGenGo {
     vector<Node *> CallArgNodes(Call *c, size_t nparams);
     string FreeVarArg(const VarDef *fv);
     string SpecCallX(Call *c, FnSpec *sp);
+    vector<string> GenDispatch(Call *c);
     string GenCall(Call *c);
     void GenCallAny(Call *c, const GoDst &d);
     void GenCallInto(Call *c, const vector<VarDef *> &defs);
@@ -340,6 +573,7 @@ struct CodeGenGo {
     // Functions, globals and the program (codegen_go_emit.h).
 
     void CollectSpecs();
+    string ParamT(TypeExpr *t, Line ln);
     string Signature(FnSpec *sp);
     void ResetFnState();
     string FinishBody(const string &b);
@@ -360,10 +594,13 @@ struct CodeGenGo {
         debug = opts.debug;
         maxstacks = opts.stacks.maxstacks;
         CollectSpecs();
+        ComputeRelRootMax();
         EmitGlobalDecls();
         for (auto sp : livespecs) EmitSpec(sp);
         EmitGlobalInit();
         EmitProgram();
+        EmitRenderFns();
+        EmitTypeDecls();
     }
 };
 
