@@ -536,13 +536,24 @@ supported, 64-bit only. The design is in [DESIGN.md](../DESIGN.md).
 
 The Go toolchain is `go` on `PATH`, or the one `GOOSE_GO` names.
 
-This version compiles the scalar core of the language: integers, floats and
-`bool` with their operators and conversions, globals, locals, every control
+This version compiles the scalar core of the language and its fixed-size
+values: integers, floats and `bool` with their operators and conversions,
+structs (with `pad` and `pad n`), fixed arrays `T[k]` and static-capacity
+limited arrays `T[..k]` with `push`, `pop`, `pop_n`, `resize`, `clear`,
+`append` and `index_of`, fixed-mode ADTs with `match` and case functions,
+slices `T[:]` and string literals, plain, optional and self-relative
+references, elementwise arithmetic, globals, locals, every control
 construct, `defer`, calls (recursive ones and tail recursion turned into
 loops included), nested functions and function values, and `print`,
-`assert`, `abort` and `exit`. A program using anything else -- arrays,
-slices and strings held in variables, structs, enums, references, `return
-... from` across a call, threads, `extern fn` and `export fn` -- stops with
-an error at the first such construct, naming it: `... is not supported by
---target=go yet`. `test/run_go_tests.py` checks what it compiles against
-the C backend ([testing.md](testing.md)).
+`assert`, `abort` and `exit`. A value keeps its C layout wherever Go can
+hold it there: a struct Go aligns as C packs it is a Go struct, a packed one
+the bytes of its layout, read and written at each field's offset; a
+reference is a Go pointer and a slice holds one, so that the Go collector
+sees them. A program using anything else -- values on data stacks
+(resizable arrays `T[>..]` and `T[>..<]`, variable-size values such as `T[]`,
+`T[..]` and variable-mode ADTs, and fixed-size locals and temporaries of more
+than 4096 bytes, which C holds on a data stack; such globals are supported),
+`in pool` references, `return ... from` across a call, threads, `extern fn`
+and `export fn` -- stops with an error at the first such construct, naming
+it: `... is not supported by --target=go yet`. `test/run_go_tests.py` checks
+what it compiles against the C backend ([testing.md](testing.md)).

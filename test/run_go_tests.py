@@ -20,7 +20,10 @@ import are in programs/modules/), is
    writes to stderr or does not exit with 0);
 6. reported on with `goose --check --stacks` for both targets, at both
    levels, which must agree: both backends count data stacks with the same
-   analysis (BoundStacks, src/codegen_stacks.h).
+   analysis (BoundStacks, src/codegen_stacks.h);
+7. built again at -O2 with -gcflags=all=-d=checkptr, Go's checks of every
+   unsafe.Pointer conversion and of the arithmetic on one (which `go test
+   -race` turns on), and run, which must match the C run as well.
 
 The programs of test/go/build_only/ never end (a loop that only stopping
 them leaves): each is compiled to Go at both levels, vetted and built, and
@@ -41,7 +44,8 @@ run --target=go` and `goose build --target=go`, --go-package and --library.
 --sweep also runs the C suite's own programs (test/<category>/*.goose)
 through the Go backend: the ones it compiles must vet, build, and print what
 test/expected/ holds for them, as run_tests.py judges a C run; one it
-refuses as not supported yet is counted, not failed. --fuzz N generates N
+refuses as not supported yet is counted, not failed, and so is one that
+differs by design (SWEEP_KNOWN, with the reason). --fuzz N generates N
 programs of random scalar arithmetic, conversions and comparisons (from
 --fuzz-seed on, every other one built with --debug), which both backends
 must run alike. --fuzz-flow N generates N programs of random control flow,
