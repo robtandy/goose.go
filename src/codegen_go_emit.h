@@ -253,13 +253,24 @@ inline bool CodeGenGo::StaticInit(Node *n, TypeExpr *t, string &out) {
 }
 
 // Whether evaluating n has no effect but its value, and cannot fail: a
-// literal, a literal of literals, or a variable read.
+// literal, a literal of literals, or a variable read. A negated literal is
+// one too, but where --debug checks the negation of the least value of a
+// signed type, which is left to run, and fails.
 inline bool CodeGenGo::PureInit(Node *n) {
     if (!n) return true;
     if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) || Is<NullLit>(n))
         return true;
     if (auto id = Is<Ident>(n)) return id->vdef != nullptr;
-    if (auto u = Is<Unary>(n)) return u->op == T_MINUS && (Is<IntLit>(u->child) || Is<FltLit>(u->child));
+    if (auto u = Is<Unary>(n)) {
+        if (u->op != T_MINUS) return false;
+        if (Is<FltLit>(u->child)) return true;
+        auto i = Is<IntLit>(u->child);
+        auto ct = u->child->exprtype;
+        if (!i || !ct || ct->kind != TY_INT) return false;
+        auto s = ct->intstorage;
+        return !debug || IsUnsigned(s) ||
+               WrapStorage(i->val, s) != WrapStorage((int64_t)(1ull << (IntBits(s) - 1)), s);
+    }
     if (Is<ArrayLit>(n) || Is<StructLit>(n)) {
         auto pure = true;
         RunChildren(n, [&](Node *c) { pure = pure && PureInit(c); });

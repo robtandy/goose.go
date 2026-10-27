@@ -348,7 +348,7 @@ struct CodeGenGo {
     // and those the program can tell are there (FindUsedGlobals).
     set<const VarDef *> gstatic;
     set<const VarDef *> usedglobals;
-    static bool PureInit(Node *n);
+    bool PureInit(Node *n);
     void FindUsedGlobals();
     void EmitGlobalDecls();
     bool StaticInit(Node *n, TypeExpr *t, string &out);
