@@ -573,4 +573,9 @@ the Go backend. The ones it compiles must vet, build and print what
 supported yet are counted, not failed. `--fuzz N` generates `N` programs of
 random arithmetic, shifts, conversions and comparisons at every scalar type
 (from `--fuzz-seed` on, every other one built with `--debug`), each of which
-both backends must run alike.
+both backends must run alike. `--fuzz-flow N` generates `N` programs of
+random control flow: returns, breaks, continues and guards that end it in
+every position Go's flow analysis follows (conditions, scrutinees, arguments,
+loop bounds, values), with code after them that is never reached, among
+defers and bounded loops. Each must vet, build and run as its C does at both
+levels, with the same `--stacks` report.

@@ -38,11 +38,15 @@ test/expected/ holds for them, as run_tests.py judges a C run; one it
 refuses as not supported yet is counted, not failed. --fuzz N generates N
 programs of random scalar arithmetic, conversions and comparisons (from
 --fuzz-seed on, every other one built with --debug), which both backends
-must run alike. --bless writes test/go/expected/ from the C backend's runs
+must run alike. --fuzz-flow N generates N programs of random control flow,
+whose returns, breaks, continues and guards end it in every position Go's
+flow analysis follows (conditions, arguments, loop bounds, values), with
+code after them that is never reached: their Go must vet and build, and run
+as their C does at both levels, with the same --stacks report. --bless writes test/go/expected/ from the C backend's runs
 instead of comparing with it.
 
-  python3 test/run_go_tests.py [--exe build/goose] [-j N] [--sweep] [--fuzz N] [--bless] [-v]
-                               [name...]
+  python3 test/run_go_tests.py [--exe build/goose] [-j N] [--sweep] [--fuzz N]
+                               [--fuzz-flow N] [--bless] [-v] [name...]
 """
 
 import argparse
@@ -62,6 +66,19 @@ sys.path.insert(0, str(REPO / "scripts"))
 import toolchain as tc
 
 UNSUPPORTED = "is not supported by --target=go yet"
+FLOW_TIMEOUT = 60   # Seconds a --fuzz-flow program may run.
+
+
+def run_capture(argv, cwd=None, timeout=None):
+    """tc.run_capture, or with a limit on the time it takes: what runs on
+    past it is stopped, and the result is (None, "", "")."""
+    if timeout is None:
+        return tc.run_capture(argv, cwd=cwd)
+    try:
+        r = subprocess.run([str(a) for a in argv], cwd=cwd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "", ""
+    return r.returncode, tc.decode(r.stdout), tc.decode(r.stderr)
 
 
 def first_line(path):
@@ -151,6 +168,187 @@ def fuzz_program(seed):
     return "\n".join(lines) + "\n"
 
 
+# --- random control flow (--fuzz-flow) ------------------------------------------
+
+
+class FlowProgram:
+    """A random program whose control flow ends in every position Go's flow
+    analysis follows: returns, breaks, continues and guards in conditions,
+    scrutinees, arguments, loop bounds, print arguments and values, with
+    code after them that is never reached, and defers, labels and loops
+    around them. Every loop is bounded; `trail` records the calls made."""
+
+    def __init__(self, seed):
+        self.r = random.Random(seed)
+        self.n = 0
+        self.fns = []
+
+    def fresh(self, prefix):
+        self.n += 1
+        return f"{prefix}{self.n}"
+
+    @staticmethod
+    def sub(ctx, **kw):
+        # ctx: vars [(name, type, mutable)]; brk, the innermost break target
+        # (None, "plain" or "valued"); cont, whether a continue may be made
+        # (never in a while's own condition, which it would run again);
+        # noexit, for a value's statements: none may always leave, which
+        # would make the value void; depth, of the constructs left to nest.
+        c = dict(ctx)
+        c["vars"] = list(ctx["vars"])
+        c.update(kw)
+        return c
+
+    def block(self, ctx, lo=0, hi=3, noexit=False):
+        c = self.sub(ctx, depth=ctx["depth"] - 1, noexit=noexit)
+        return " ".join(self.stmt(c) for _ in range(self.r.randint(lo, hi)))
+
+    def exit(self, ctx):
+        k = self.r.choice(["return"] + ["break"] * bool(ctx["brk"]) + ["continue"] * ctx["cont"])
+        if k == "return":
+            return f"return {self.expr(ctx, 1)};"
+        if k == "break":
+            return f"break {self.expr(ctx, 1)};" if ctx["brk"] == "valued" else "break;"
+        return "continue;"
+
+    def stmt(self, ctx):
+        r, d, ne = self.r, ctx["depth"], ctx.get("noexit", False)
+        kinds = ["let", "let", "var", "note", "print", "defer", "assert"]
+        kinds += [] if ne else ["exit", "exit"]
+        if any(m for _, t, m in ctx["vars"] if t == "i64"):
+            kinds += ["assign"]
+        if d > 0:
+            kinds += ["if", "if", "guard", "while", "while", "loop", "for", "block", "scope",
+                      "match", "letb"]
+        k = r.choice(kinds)
+        if k in ("let", "var", "letb"):
+            v = self.fresh({"let": "x", "var": "m", "letb": "b"}[k])
+            init = self.cond(ctx, 2) if k == "letb" else self.expr(ctx, 2)
+            ctx["vars"].append((v, "bool" if k == "letb" else "i64", k == "var"))
+            return f"{'var' if k == 'var' else 'let'} {v} = {init};"
+        if k == "assign":
+            v = r.choice([n for n, t, m in ctx["vars"] if t == "i64" and m])
+            return f"{v} = ({self.expr(ctx, 2)}) % 1000;"
+        if k == "note":
+            return f"note({self.expr(ctx, 2)});"
+        if k == "print":
+            return f'print("p ", {self.expr(ctx, 2)}, " ", {self.cond(ctx, 1)});'
+        if k == "exit":
+            return self.exit(ctx)
+        if k == "defer":
+            return f"defer note({r.randint(1, 9)});"
+        if k == "assert":
+            return f"assert({self.cond(ctx, 2)} || true);"
+        if k == "if":
+            s = f"if {self.cond(ctx, 2)} {{ {self.block(ctx)} }}"
+            # Under noexit, the else may not always leave: the if would.
+            return s + (f" else {{ {self.block(ctx, noexit=ne)} }}" if r.random() < 0.5 else "")
+        if k == "guard":
+            return f"guard {self.cond(ctx, 2)} else {{ {self.block(ctx, 0, 2)} {self.exit(ctx)} }}"
+        if k in ("while", "loop"):
+            kv, m = self.fresh("k"), r.randint(0, 3)
+            body = self.sub(ctx, brk="plain", cont=True, noexit=False)
+            if k == "loop":
+                return (f"var {kv} = 0; loop {{ {kv} += 1; if {kv} > {m} {{ break; }} "
+                        f"{self.block(body)} }}")
+            cond = f"{kv} < {m}"
+            if r.random() < 0.5:
+                # A condition that runs statements: it may break the loop or
+                # return, as the statements in its ifs do.
+                cc = self.sub(ctx, brk="plain", cont=False, depth=d - 1, noexit=True)
+                cond = f"{{ {' '.join(self.stmt(cc) for _ in range(r.randint(0, 2)))} {cond} }}"
+            return f"var {kv} = 0; while {cond} {{ {kv} += 1; {self.block(body)} }}"
+        if k == "for":
+            iv = self.fresh("ix")
+            hi = self.expr(self.sub(ctx, depth=d - 1), 2)
+            body = self.sub(ctx, brk="plain", cont=True, noexit=False)
+            body["vars"].append((iv, "i64", False))
+            return f"for {iv} in 0..(({hi}) % 4) {{ {self.block(body)} }}"
+        if k == "block":
+            return f"block {{ {self.block(self.sub(ctx, brk='plain'), noexit=ne)} }}"
+        if k == "scope":
+            return f"{{ {self.block(ctx, noexit=ne)} }}"
+        arms = ", ".join(f"{p} => {{ {self.block(ctx, 0, 2, noexit=ne and p == '_')} }}"
+                         for p in ("0", "1", "_"))
+        return f"match ({self.expr(ctx, 2)}) % 3 {{ {arms} }}"
+
+    def expr(self, ctx, d):
+        r = self.r
+        names = [n for n, t, _ in ctx["vars"] if t == "i64"]
+        if d <= 0 or r.random() < 0.3:
+            return r.choice(names) if names and r.random() < 0.6 else str(r.randint(-3, 9))
+        kinds = ["note", "add", "block", "exits", "exits", "if", "match"]
+        kinds += ["loop", "early"] if ctx["depth"] > 0 else []
+        kinds += ["call"] if self.fns else []
+        kinds += ["apply"] if names else []
+        k = r.choice(kinds)
+        e = lambda c=ctx: self.expr(c, d - 1)
+        if k == "note":
+            return f"note({e()})"
+        if k == "add":
+            return f"({e()} + {e()})"
+        if k == "block":
+            b = self.sub(ctx, depth=ctx["depth"] - 1)
+            return f"({{ {self.block(b, 0, 2, noexit=True)} {e(b)} }})"
+        if k == "exits":
+            return f"({{ if {self.cond(ctx, d - 1)} {{ {self.exit(ctx)} }} {e()} }})"
+        if k == "if":
+            return f"(if {self.cond(ctx, d - 1)} {{ {e()} }} else {{ {e()} }})"
+        if k == "match":
+            return f"(match ({e()}) % 3 {{ 0 => {e()}, 1 => {e()}, _ => {e()} }})"
+        if k == "loop":
+            kv = self.fresh("k")
+            body = self.sub(ctx, brk="valued", cont=True, depth=ctx["depth"] - 1, noexit=False)
+            # The break's value may break the loop too, but a continue would
+            # skip the break on every iteration from then on.
+            value = e(self.sub(body, cont=False))
+            return (f"({{ var {kv} = 0; loop {{ {kv} += 1; if {kv} > {r.randint(0, 2)} "
+                    f"{{ break {value}; }} {self.block(body, 0, 2)} }} }})")
+        if k == "early":
+            b = self.sub(ctx, brk="valued", depth=ctx["depth"] - 1)
+            return f"(block {{ {self.block(b, 0, 2, noexit=True)} {e(b)} }})"
+        if k == "call":
+            return f"{r.choice(self.fns)}({e()}, {self.cond(ctx, d - 1)})"
+        return f"(apply({e()}) {{ it + {r.choice(names)} }})"
+
+    def cond(self, ctx, d):
+        r = self.r
+        names = [n for n, t, _ in ctx["vars"] if t == "bool"]
+        if d <= 0 or r.random() < 0.3:
+            return r.choice(names) if names and r.random() < 0.6 else r.choice(["true", "false"])
+        k = r.choice(["<", "==", "&&", "||", "!", "block", "exits"])
+        if k in ("<", "=="):
+            return f"({self.expr(ctx, d - 1)} {k} {self.expr(ctx, d - 1)})"
+        if k in ("&&", "||"):
+            return f"({self.cond(ctx, d - 1)} {k} {self.cond(ctx, d - 1)})"
+        if k == "!":
+            return f"!({self.cond(ctx, d - 1)})"
+        if k == "block":
+            b = self.sub(ctx, depth=ctx["depth"] - 1)
+            return f"({{ {self.block(b, 0, 2, noexit=True)} {self.cond(b, d - 1)} }})"
+        return f"({{ if {self.cond(ctx, d - 1)} {{ {self.exit(ctx)} }} {self.cond(ctx, d - 1)} }})"
+
+    def text(self, seed):
+        lines = [f"// Generated by run_go_tests.py --fuzz-flow, seed {seed}.",
+                 "var trail: i64 = 0;",
+                 "fn note(n: i64) -> i64 { trail = (trail * 7 + n) % 1000003; n }",
+                 "fn apply<F>(x: i64) -> i64 { F(x) }"]
+        for i in range(self.r.randint(2, 4)):
+            ctx = {"vars": [("a", "i64", False), ("c", "bool", False)], "brk": None,
+                   "cont": False, "noexit": False, "depth": 3}
+            body = " ".join(self.stmt(ctx) for _ in range(self.r.randint(1, 5)))
+            lines.append(f"fn f{i}(a: i64, c: bool) -> i64 {{ {body} {self.expr(ctx, 2)} }}")
+            self.fns.append(f"f{i}")
+        calls = [f'trail = 0; print({f}({a}, {c}), " ", trail);'
+                 for f in self.fns for a in (0, 1, 5) for c in ("true", "false")]
+        lines.append("fn main() { " + " ".join(calls) + " }")
+        return "\n".join(lines) + "\n"
+
+
+def flow_program(seed):
+    return FlowProgram(seed).text(seed)
+
+
 def go_env():
     """The Go tool's environment: the module and build flags of whoever runs
     the suite play no part in building one generated file."""
@@ -177,13 +375,13 @@ class Runner:
 
     # --- processes -----------------------------------------------------------
 
-    def goose(self, *args):
+    def goose(self, *args, timeout=None):
         """The compiler, run from the repository's root, where a source named
         relative to it is named as the messages of what it compiles say: the
         same on every machine."""
         args = [a.relative_to(REPO).as_posix() if isinstance(a, Path) and a.is_relative_to(REPO)
                 and a.suffix == ".goose" else str(a) for a in args]
-        return tc.run_capture([self.exe] + args, cwd=REPO)
+        return run_capture([self.exe] + args, cwd=REPO, timeout=timeout)
 
     def gotool(self, *args):
         r = subprocess.run([self.go] + [str(a) for a in args], cwd=self.work, env=go_env(),
@@ -233,19 +431,19 @@ class Runner:
             return None
         return exe
 
-    def c_run(self, src, name, flags, out):
+    def c_run(self, src, name, flags, out, timeout=None):
         """The C backend's run of src: (exit code, stdout, stderr), or None
-        after saying why."""
+        after saying why. The exit code is None where it ran past timeout."""
         if self.cc is None:
             # TinyCC in the compiler's process: what the compile itself
             # prints to stderr (its warnings) comes before the program's.
-            code, o, e = self.goose(*flags, "--jit", src)
+            code, o, e = self.goose(*flags, "--jit", src, timeout=timeout)
             _, _, warnings = self.goose(*flags, "--check", src)
             if warnings and e.startswith(warnings):
                 e = e[len(warnings):]
             return code, o, e
         exe = self.c_build(src, name, flags, out)
-        return None if exe is None else tc.run_capture([exe])
+        return None if exe is None else run_capture([exe], timeout=timeout)
 
     def c_build(self, src, name, flags, out):
         """The C backend's executable for src, built with the C compiler at
@@ -359,6 +557,34 @@ class Runner:
                         f"--- c (exit {ref[0]}):\n{ref[1][-2000:]}{ref[2]}"))
         else:
             out.append(("ok", f"fuzz seed {seed}", None))
+        return out
+
+    def fuzz_flow(self, seed):
+        """A random program of control flow (FlowProgram), which both
+        backends must run alike at both levels, with the same stacks."""
+        out = []
+        name = f"flow-{seed}"
+        src = self.work / f"{name}.goose"
+        tc.write_text(src, flow_program(seed))
+        ref = self.c_run(src, name, [], out, timeout=FLOW_TIMEOUT)
+        if ref is None:
+            return out
+        if ref[0] is None:
+            out.append(("fail", f"fuzz-flow seed {seed}: the C run did not end in {FLOW_TIMEOUT}s "
+                        f"({src})", None))
+            return out
+        for level in ("2", "0"):
+            exe = self.go_program(src, f"{name}-O{level}", [f"-O{level}"], out)
+            if exe is None:
+                continue
+            got = run_capture([exe], timeout=FLOW_TIMEOUT)
+            if got != ref:
+                out.append(("fail", f"fuzz-flow seed {seed} -O{level} ({src})",
+                            f"--- go (exit {got[0]}):\n{got[1][-2000:]}{got[2]}\n"
+                            f"--- c (exit {ref[0]}):\n{ref[1][-2000:]}{ref[2]}"))
+            else:
+                out.append(("ok", f"fuzz-flow seed {seed} -O{level}", None))
+        self.stacks(src, name, [], out)
         return out
 
     def unsupported(self, src):
@@ -480,7 +706,10 @@ def main():
                     help="also run the C suite's programs the Go backend compiles")
     ap.add_argument("--fuzz", type=int, default=0, metavar="N",
                     help="also run N random programs through both backends")
-    ap.add_argument("--fuzz-seed", type=int, default=0, help="the first --fuzz program's seed")
+    ap.add_argument("--fuzz-flow", type=int, default=0, metavar="N",
+                    help="also run N random programs of control flow through both backends")
+    ap.add_argument("--fuzz-seed", type=int, default=0,
+                    help="the first --fuzz and --fuzz-flow program's seed")
     ap.add_argument("--bless", action="store_true",
                     help="write test/go/expected/ from the C backend's runs")
     ap.add_argument("--jit-reference", action="store_true",
@@ -521,6 +750,8 @@ def main():
         futures += [pool.submit(r.sweep, p) for p in sweep]
         futures += [pool.submit(r.fuzz, seed)
                     for seed in range(args.fuzz_seed, args.fuzz_seed + args.fuzz)]
+        futures += [pool.submit(r.fuzz_flow, seed)
+                    for seed in range(args.fuzz_seed, args.fuzz_seed + args.fuzz_flow)]
         for f in futures:
             r.report(f.result())
     # The command line.
