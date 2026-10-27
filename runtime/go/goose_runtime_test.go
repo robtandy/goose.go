@@ -345,20 +345,28 @@ func TestRegionMappings(t *testing.T) {
 	}
 }
 
+// mappedBlockBase makes a block, checks its region is mapped while the
+// block is still reachable, and returns where the region starts. Once it
+// returns nothing references the block, which the collector may then
+// close at any time.
+//
 //go:noinline
-func droppedBlockBase() uintptr {
+func mappedBlockBase(t *testing.T) uintptr {
 	gs := NewStackBlock(1, 1<<20, 64<<10)
 	*(*byte)(gs.Base[0]) = 1
-	return uintptr(gs.Base[0])
+	base := uintptr(gs.Base[0])
+	if !regionMapped(procMaps(t), base, 1<<20) {
+		t.Fatal("the region is not mapped")
+	}
+	// Not closed before the check, whenever a collection comes.
+	runtime.KeepAlive(gs)
+	return base
 }
 
 // A block nothing references any more is closed by the collector, as the
 // pool drops blocks at collections.
 func TestUnreachableBlockIsClosed(t *testing.T) {
-	base := droppedBlockBase()
-	if !regionMapped(procMaps(t), base, 1<<20) {
-		t.Fatal("the region is not mapped")
-	}
+	base := mappedBlockBase(t)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		runtime.GC()
