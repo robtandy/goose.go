@@ -36,10 +36,11 @@ inline void CodeGenGo::PopSc() {
 // it in their scope, which is generated the same way; they are unique, and
 // no code that is kept is in that scope.
 inline void CodeGenGo::GenUnreached(const function<void()> &gen) {
-    struct Mark { bool usedlabel, usedbrk; size_t defers, saves; string top0; };
+    struct Mark { bool usedlabel, usedbrk; size_t defers, saves, locals; string top0; };
     vector<Mark> marks;
     for (auto &s : scopes)
-        marks.push_back({ s.usedlabel, s.usedbrk, s.defers.size(), s.saves.size(), s.top0 });
+        marks.push_back({ s.usedlabel, s.usedbrk, s.defers.size(), s.saves.size(), s.locals.size(),
+                          s.top0 });
     auto savedsttop0 = dsttop0;
     auto nscopes = scopes.size();
     auto text = std::move(body);
@@ -55,6 +56,7 @@ inline void CodeGenGo::GenUnreached(const function<void()> &gen) {
         scopes[i].usedbrk = marks[i].usedbrk;
         scopes[i].defers.resize(marks[i].defers);
         scopes[i].saves.resize(marks[i].saves);
+        scopes[i].locals.resize(marks[i].locals);
         scopes[i].top0 = marks[i].top0;
     }
     dsttop0 = savedsttop0;
@@ -99,11 +101,13 @@ inline void CodeGenGo::SaveBase(bool forlocal, const string &stk, const string &
 inline void CodeGenGo::EmitRestores(const GoScope &s) {
     auto saves = s.saves;
     auto defers = s.defers;
+    auto locals = s.locals;
     auto di = (int)defers.size() - 1;
     for (auto k = (int)saves.size(); k >= 0; k--) {
         for (; di >= 0 && (int)defers[di].first == k; di--) EmitDeferBody(defers[di].second);
         if (k > 0) L(Top(saves[k - 1].first), " = ", saves[k - 1].second);
     }
+    for (auto &n : locals) L(KEEPMARK, n);
 }
 
 // What an exit runs on its way out down to (and including) scope `to`.
@@ -267,6 +271,7 @@ inline void CodeGenGo::GenIf(IfExpr *fi, const GoDst &d) {
         else GenAny(fi->elseb, d);
         scopes.back().defers.clear();   // Its end is never reached.
         scopes.back().saves.clear();
+        scopes.back().locals.clear();
         PopSc();
         ind--;
         LS("}");
@@ -463,6 +468,7 @@ inline void CodeGenGo::GenLoopBody(Block *bodyb, size_t first) {
     // Restored by every path out of an iteration already.
     scopes.back().defers.clear();
     scopes.back().saves.clear();
+    scopes.back().locals.clear();
 }
 
 inline void CodeGenGo::GenWhile(While *w) {
@@ -757,7 +763,9 @@ inline void CodeGenGo::GenVarDecl(VarDecl *vd) {
 // A local's Go name, given afresh at each declaration: a `defer` body emitted
 // at several exits declares its locals again each time.
 inline string CodeGenGo::LocalName(VarDef *vd) {
-    return vnames[vd] = Unique2(Sanitize(vd->name));
+    auto name = Unique2(Sanitize(vd->name));
+    NoteLocal(name);
+    return vnames[vd] = name;
 }
 
 // A name unique within the function (and clear of package-level names).

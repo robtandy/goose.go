@@ -313,11 +313,33 @@ static void GoLineUses(string_view s, unordered_map<string, int> &uses) {
     }
 }
 
+// The identifiers whose address a line takes (`&x`, `&x.f`, `&x[i]`),
+// outside its string literals, into addressed.
+static void GoLineAddressed(string_view s, unordered_set<string> &addressed) {
+    auto isid = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
+    for (size_t p = 0; p < s.size(); p++) {
+        auto c = s[p];
+        if (c == '"') {
+            for (p++; p < s.size() && s[p] != '"'; p++)
+                if (s[p] == '\\') p++;
+        } else if (c == '&' && p + 1 < s.size() && (isalpha((unsigned char)s[p + 1]) || s[p + 1] == '_') &&
+                   (p == 0 || s[p - 1] != '&')) {
+            auto b = p + 1, e = b;
+            while (e < s.size() && isid(s[e])) e++;
+            addressed.insert(string(s.substr(b, e - b)));
+            p = e - 1;
+        }
+    }
+}
+
 // A finished body's declarations without their markers (Decl), each local
 // nothing reads followed by a use of its own: Go rejects a local it never
 // sees read, and an optimized body may well leave one, or only assign it.
+// A local is kept alive where its scope is left (KEEPMARK) only where the
+// function takes its address.
 inline string CodeGenGo::FinishBody(const string &b) {
     unordered_map<string, int> uses;
+    unordered_set<string> addressed;
     vector<string_view> lines;
     for (size_t pos = 0; pos < b.size();) {
         auto nl = b.find('\n', pos);
@@ -325,10 +347,19 @@ inline string CodeGenGo::FinishBody(const string &b) {
         lines.push_back(string_view(b).substr(pos, nl - pos));
         pos = nl + 1;
     }
-    for (auto line : lines) GoLineUses(line.substr(0, line.find(DECLMARK[0])), uses);
+    for (auto line : lines) {
+        if (line.find(KEEPMARK[0]) != string_view::npos) continue;
+        GoLineUses(line.substr(0, line.find(DECLMARK[0])), uses);
+        GoLineAddressed(line.substr(0, line.find(DECLMARK[0])), addressed);
+    }
     string out;
     out.reserve(b.size());
     for (auto line : lines) {
+        if (auto k = line.find(KEEPMARK[0]); k != string_view::npos) {
+            auto n = string(line.substr(k + 1));
+            if (addressed.count(n)) Append(out, line.substr(0, k), "runtime.KeepAlive(&", n, ")\n");
+            continue;
+        }
         auto m = line.find(DECLMARK[0]);
         if (m == string_view::npos) {
             Append(out, line, "\n");
@@ -646,7 +677,9 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "// keywords and of the runtime's gs and Gs names; a namespaced name ns::x is\n"
                    "// ns_x_g followed by the namespace's length.\n\n"
                    "package ", opts.package, "\n\n"
-                   "import (\n\t\"math\"\n\t\"os\"\n\t\"runtime/debug\"\n\t\"strconv\"\n\t\"syscall\"\n\t\"unsafe\"\n)\n\n"
+                   "import (\n\t\"math\"\n\t\"os\"\n",
+                   code.find("runtime.KeepAlive(") != string::npos ? "\t\"runtime\"\n" : "",
+                   "\t\"runtime/debug\"\n\t\"strconv\"\n\t\"syscall\"\n\t\"unsafe\"\n)\n\n"
                    "// The runtime configuration the program was compiled with (--stack-reserve,\n"
                    "// -D GS_STACK_RESERVE, -D GS_STACK_GAP).\n"
                    "const (\n\tgsStackReserve = ", opts.stacks.reserve,

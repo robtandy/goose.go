@@ -540,6 +540,9 @@ struct CodeGenGo {
         // an exit runs them among the restores, latest first (EmitRestores).
         vector<pair<string, string>> saves;
         vector<pair<size_t, Defer *>> defers;
+        // The Go locals declared in this scope's Go block: every exit keeps
+        // those whose address the function takes alive up to it (KEEPMARK).
+        vector<string> locals;
         SFunction *ibsf = nullptr;      // SC_IB: which returns exit here.
         // SC_LOOP, SC_BLOCK, SC_IB: the Go label a break, continue or
         // return names, written in front of the statement once one does
@@ -603,10 +606,27 @@ struct CodeGenGo {
     // The marker a local's declaration ends with: FinishBody gives the
     // locals nothing reads a use of their own, which Go requires.
     static constexpr const char *DECLMARK = "\x01";
+    // The marker of a line that keeps a local alive where its scope is left
+    // (runtime.KeepAlive), which FinishBody keeps for the locals whose
+    // address the function takes and drops for the rest. A data stack is
+    // memory the collector does not scan, so a reference into a Go local
+    // stored there is no reference it sees: one the local's scope holds
+    // keeps it, as the lifetime rules make that scope outlive the reference
+    // (§9.2, AGENTS.md).
+    static constexpr const char *KEEPMARK = "\x02";
+    void NoteLocal(const string &name) {
+        for (auto i = (int)scopes.size() - 1; i >= 0; i--) {
+            if (scopes[i].kind == SC_STMT) continue;
+            auto &ls = scopes[i].locals;
+            if (ls.empty() || ls.back() != name) ls.push_back(name);
+            return;
+        }
+    }
     // Declares a local of Go type gt, with an initial value where init is
     // not empty.
     void Decl(const string &name, const string &gt, const string &init = "") {
         L("var ", name, " ", gt, init.empty() ? "" : " = ", init, DECLMARK, name);
+        NoteLocal(name);
     }
 
     // The data stack index k of this function, and the first one free.

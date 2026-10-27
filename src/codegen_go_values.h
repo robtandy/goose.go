@@ -103,10 +103,13 @@ inline bool CodeGenGo::HasStmts(Node *n) {
 inline bool CodeGenGo::TryPure(const function<string()> &gen, string &x) {
     auto mark = body.size();
     auto savetmp = tmpn;
+    vector<size_t> nlocals;
+    for (auto &s : scopes) nlocals.push_back(s.locals.size());
     x = gen();
     if (body.size() == mark) return true;
     body.resize(mark);
     tmpn = savetmp;
+    for (size_t i = 0; i < nlocals.size() && i < scopes.size(); i++) scopes[i].locals.resize(nlocals[i]);
     return false;
 }
 
