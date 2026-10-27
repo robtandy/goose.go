@@ -99,39 +99,6 @@ inline string CodeGenGo::SpecCallX(Call *c, FnSpec *sp) {
     return names;
 }
 
-// A call of an extern fn (§7.10): the C functions std binds that the Go
-// runtime has an equivalent of, its arguments evaluated in order as for
-// any call (CodeGen::EmitExternCall). Any other is not supported yet.
-inline string CodeGenGo::ExternCallX(Call *c, FnSpec *sp) {
-    auto &name = sp->sf->cname;
-    auto an = CallArgNodes(c, sp->argtypes.size());
-    auto known = sp->sf->dylib.empty() &&
-                 (name == "gs_popcount" || name == "gs_clz" || name == "gs_ctz" || name == "gs_find_any" ||
-                  name == "gs_find_pair" || name == "frexp" || name == "ldexp");
-    if (!known) Unsupported(c->line, cat("a call to the extern fn ", sp->sf->name, " (C's ", name, ")"));
-    vector<bool> later(an.size() + 1, false);
-    for (size_t i = an.size(); i-- > 0;) later[i] = later[i + 1] || HasStmts(an[i]);
-    vector<string> a;
-    for (size_t i = 0; i < an.size(); i++) {
-        auto pt = sp->argtypes[i];
-        auto x = Coerce(GenX(an[i]), an[i]->exprtype, pt, an[i]->line);
-        if (later[i + 1] && !IsGoConst(x)) x = Snapshot(pt, x);
-        a.push_back(x);
-    }
-    // popcount, clz and ctz count 64 for zero, as Go's math/bits does.
-    if (name == "gs_popcount" || name == "gs_clz" || name == "gs_ctz") {
-        usesbits = true;
-        auto fn = name == "gs_popcount" ? "OnesCount64" : name == "gs_clz" ? "LeadingZeros64" : "TrailingZeros64";
-        return cat("int64(bits.", fn, "(", a[0], "))");
-    }
-    if (name == "gs_find_any") return cat("gsFindAny(", a[0], ", ", AddrOfRef(sp->argtypes[1], a[1]), ")");
-    if (name == "gs_find_pair")
-        return cat("gsFindPair(", a[0], ", ", AddrOfRef(sp->argtypes[1], a[1]), ", ", a[2], ", ",
-                   AddrOfRef(sp->argtypes[3], a[3]), ")");
-    if (name == "frexp") return cat("gsFrexp(", a[0], ", ", a[1], ")");
-    return cat("math.Ldexp(", a[0], ", int(", a[1], "))");
-}
-
 // A call of a specialization by the full calling convention (C.3,
 // CodeGen::EmitSpecCall), emitted here: a by-value resizable or bytes
 // argument is built on a stack of its own, a pool parameter takes a GsPref,
@@ -845,9 +812,15 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             return;
         }
         case B_ABORT: {
-            auto s = Is<StrLit>(an[0]);
-            if (!s) Unsupported(ln, "abort with a message that is not a string literal");
-            L("GsAbortMsg(", GoStr(s->val), ", ", LocArgs(ln), ")");
+            if (auto s = Is<StrLit>(an[0])) {
+                L("GsAbortMsg(", GoStr(s->val), ", ", LocArgs(ln), ")");
+                return;
+            }
+            // A message the program computes (a str(), say): the bytes of
+            // its slice, read as the abort is raised (gs_abort_msg).
+            auto x = GenX(an[0]);
+            if (Unreached()) return;
+            L("GsAbortSlice(", x, ", ", LocArgs(ln), ")");
             return;
         }
         case B_EXIT: {

@@ -46,22 +46,26 @@
 //   it manages. A place -- a variable, field, element or pointee -- is a Go
 //   lvalue (GoLoc, codegen_go_places.h).
 //
-// This version covers the scalar core of the language and its fixed-size
-// values: scalars and their operators and conversions, structs, fixed and
-// static-capacity limited arrays, fixed-mode ADTs and match, slices and
-// string literals, plain, optional and self-relative references, globals,
-// locals, control flow, defer, direct and recursive calls
-// (tail-recursion-eliminated loops included), nested functions and function
-// values, and print, assert, abort and exit. Anything else -- the values on
-// data stacks (resizable and variable-size ones), `in pool` references,
-// threads, extern and export fns -- stops the compile with an error naming
-// the construct (Unsupported) rather than emitting Go that would be wrong.
+// * The foreign boundary (codegen_go_export.h, DESIGN.md §3.5): an extern
+//   fn calls the Go runtime's function its C symbol names (std's, math's
+//   and os's), Go's math, or a Go function of the package that an
+//   --include file defines; an export fn gets two exported Go entry points,
+//   NameWithStack(gs, ...) and Name(...), the second on a block from the
+//   runtime's pool, both taking Go's own slices, strings and pointers.
+//
+// This version covers the single-threaded language: scalars and their
+// operators and conversions, fixed-size values, the values on data stacks
+// (codegen_go_rz.h, codegen_go_bytes.h), control flow, calls, extern and
+// export fns. Anything else -- threads, among them -- stops the compile
+// with an error naming the construct (Unsupported) rather than emitting Go
+// that would be wrong.
 //
 // The members are declared here in the order they are defined across
 // codegen_go_values.h, codegen_go_types.h, codegen_go_places.h,
 // codegen_go_aggr.h, codegen_go_rz.h, codegen_go_stmts.h,
-// codegen_go_calls.h and codegen_go_emit.h; codegen_go_rz.h is included
-// after codegen_go_calls.h, whose helpers it uses.
+// codegen_go_calls.h, codegen_go_export.h and codegen_go_emit.h;
+// codegen_go_rz.h is included after codegen_go_calls.h, whose helpers it
+// uses.
 #pragma once
 
 namespace goose {
@@ -80,6 +84,11 @@ struct GoDst {
     bool pool = false;
 };
 
+// An --include file's Go split into its imports and the rest
+// (codegen_go_export.h).
+static bool GoSplitInclude(const string &text, vector<pair<string, string>> &imports, string &body,
+                           string &why);
+
 // What the driver hands the Go backend.
 struct GoOptions {
     string package = "main";   // --go-package.
@@ -87,6 +96,15 @@ struct GoOptions {
     bool debug = false;        // --debug, or -DGS_DEBUG=1.
     bool stackstats = false;   // -DGS_STACK_STATS=1: report the stacks taken as main ends.
     CodeGen::StackConfig stacks { 0, 0, 0, 0 };   // As main.cpp's StackConfigOf reads them.
+    // The --include files, Go source spliced into the file (codegen_go_export.h):
+    // the name its //line directive gives each, and its text.
+    struct Include {
+        string name, text;
+    };
+    vector<Include> includes;
+    // os.resource_dir's answer where it is not the executable's directory: the
+    // entry source's, for goose run, as a JIT run has it.
+    string resourcedir;
 };
 
 struct CodeGenGo {
@@ -102,6 +120,10 @@ struct CodeGenGo {
     string eqcode;      // Equality functions.
     string bcode;       // Size walkers and verifiers of bytes values.
     string code;        // Functions, gsInitGlobals and main.
+    string xcode;       // The export fns' Go entry points (codegen_go_export.h).
+    // The --include files' imports, (name, path), and the rest of each,
+    // (name, Go), which follow the program (GoSplitInclude).
+    vector<pair<string, string>> incimports, incbodies;
 
     // The line of the node being generated, which a message about code with
     // no line of its own (a temporary's type) names.
@@ -799,6 +821,9 @@ struct CodeGenGo {
     unordered_map<FnSpec *, set<FnSpec *>> phcalls;
     set<FnSpec *> hasframe;
     string GsArgPh(FnSpec *sp);
+    // Which take the block, by specnum, once every body is emitted.
+    vector<char> gsneeds;
+    void ComputeGsNeeds();
     void ResolveGsArgs();
 
     // The data stack index k of this function, and the first one free.
@@ -914,6 +939,17 @@ struct CodeGenGo {
     unordered_map<FnSpec *, string> ernames;
     vector<FnSpec *> erqueue;
     string EnsureEr(FnSpec *sp);
+    // The foreign boundary (codegen_go_export.h): extern fns' calls, export
+    // fns' Go entry points.
+    bool usesos = false;   // A call needs the OS layer (go_runtime_os).
+    bool ExternTakesGs(FnSpec *sp);
+    bool GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a, string &x);
+    void EmitExports();
+    // The specializations whose code names a global's own data stack
+    // (gsGStk_), which an export's entry points cannot reach, and what each
+    // calls (CollectSpecs).
+    set<FnSpec *> gstkusers;
+    unordered_map<FnSpec *, vector<FnSpec *>> calleesof;
     vector<string> GenCallVals(Call *c, const GoDst &d0, vector<GoDst> *alldst = nullptr);
     string CallVal0(Call *c, const string &r0, TypeExpr *want);
     GoLoc CallResLoc(Call *c, const string &r0);
@@ -970,6 +1006,12 @@ struct CodeGenGo {
     CodeGenGo(Ast &_ast, const GoOptions &o) : ast(_ast), opts(o) {
         debug = opts.debug;
         maxstacks = opts.stacks.maxstacks;
+        for (auto &inc : opts.includes) {
+            string body, why;
+            if (!GoSplitInclude(inc.text, incimports, body, why))
+                throw CompileError { cat("--include ", inc.name, ": ", why) };
+            incbodies.push_back({ inc.name, std::move(body) });
+        }
         CollectSpecs();
         ComputeRelRootMax();
         EmitGlobalDecls();

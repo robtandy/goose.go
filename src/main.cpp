@@ -48,6 +48,7 @@
 #include "codegen_go_calls.h"
 #include "codegen_go_rz.h"
 #include "codegen_go_bytes.h"
+#include "codegen_go_export.h"
 #include "codegen_go_emit.h"
 #include "runtime_inline.h"
 #include "process.h"
@@ -1600,10 +1601,15 @@ int Main(int argc, char **argv) {
         fprintf(stderr, "--header writes a C host's header, and --target=go writes no C\n");
         return 1;
     }
-    if (gotarget && !includenames.empty()) {
-        fprintf(stderr, "--include is not supported by --target=go yet\n");
-        return 1;
-    }
+    // Go includes Go: the --include files of a Go compile are Go source,
+    // spliced into the file it writes (codegen_go_export.h).
+    if (gotarget)
+        for (auto &inc : includenames)
+            if (inc.size() < 4 || inc.compare(inc.size() - 3, 3, ".go") != 0) {
+                fprintf(stderr, "--include %s: with --target=go, an --include file is Go source, a .go file\n",
+                        inc.c_str());
+                return 1;
+            }
     if (gotarget && forcejit && !outname.empty()) {
         fprintf(stderr, "--jit runs the C backend's program in this process; with --target=go, "
                         "goose run builds the Go and runs it\n");
@@ -1786,6 +1792,22 @@ int Main(int argc, char **argv) {
                 (name == "GS_DEBUG" ? go.debug : go.stackstats) = v != 0;
             }
             go.stacks = stackcfg;
+            // Named relative to the Go, as the C names its headers, where -o
+            // writes it (or absolute, where a build or a run does).
+            for (auto &inc : includes) {
+                GoOptions::Include gi;
+                if (!LoadFile(inc, gi.text))
+                    throw CompileError { cat("cannot read the --include file ", inc) };
+                gi.name = !outfile.empty() && !filesystem::path(inc).is_absolute()
+                              ? ForwardSlashes(RelativeTo(inc, DirOf(outfile))) : ForwardSlashes(inc);
+                go.includes.push_back(std::move(gi));
+            }
+            // goose run: the entry source's directory is the resources', as
+            // a JIT run has it.
+            if (gorun) {
+                auto dir = ForwardSlashes(DirOf(AbsolutePath(filename)));
+                go.resourcedir = dir.empty() || dir.back() == '/' ? dir : dir + "/";
+            }
             CodeGenGo cg(ast, go);
             if (stacks) cg.StackReport(msgs, stackcfg);
             if (!outfile.empty() && !nocgen) {
