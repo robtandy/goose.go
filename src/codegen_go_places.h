@@ -159,6 +159,15 @@ inline CodeGenGo::GoView CodeGenGo::ArrayView(const GoLoc &l, Line ln) {
         v.len = cat("int64(", v.lenlv, ")");
         v.cap = ArrSize(t->arr);
         v.lenst = LenStore(t->arr);
+    } else if (t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK)) {
+        // A resizable's elements from its header's base; its count is the
+        // header's (C.2).
+        v.elem = t->arr->sub;
+        v.data = l.addr;
+        v.len = l.lenlv;
+        v.lenlv = l.lenlv;
+        v.lenst = IS_I64;
+        if (l.lenlv.empty()) Fail(ln, "internal: a resizable array without its header");
     } else {
         Fail(ln, cat("internal: the elements of a value of type ", TypeText(t)));
     }
@@ -227,7 +236,33 @@ inline CodeGenGo::GoLoc CodeGenGo::IndexLoc(GoLoc l, Node *idxnode, Line ln, boo
 // Paths.
 
 inline CodeGenGo::GoLoc CodeGenGo::VarLoc(const VarDef *vd, Line ln) {
+    if (vd->reusable && !vpool.count(vd) && !gpools.count(vd)) {
+        // A captured pool arrives as a GsPref.
+        auto l = FatRefLoc(VarRef(vd, ln), vd->type);
+        auto x = VarRef(vd, ln);
+        l.fl = cat("(*", x, ".FreeHdr)");
+        l.flstk = cat(x, ".FreeStk");
+        return l;
+    }
+    if (IsResz(vd->type)) {
+        auto it = vnames.find(vd);
+        auto name = it != vnames.end() ? it->second : VarRef(vd, ln);
+        return RzVarLoc(vd, name);
+    }
+    if (IsBytesT(vd->type)) {
+        GoLoc l;
+        l.t = vd->type;
+        l.addr = VarRef(vd, ln);
+        if (auto it = vstk.find(vd); it != vstk.end()) l.stk = it->second;
+        else if (auto git = gstks.find(vd); git != gstks.end()) l.stk = git->second;
+        return l;
+    }
     auto l = AtVar(VarRef(vd, ln), vd->type);
+    if (PrefVar(vd)) {
+        l.ispref = true;
+        l.fl = cat("(*", l.lv, ".FreeHdr)");
+        l.flstk = cat(l.lv, ".FreeStk");
+    }
     // A reference held in a `var` can be rebound, and what is reached
     // through it moves with it.
     l.viaref = vd->isvar && vd->type->kind == TY_REF;
@@ -241,6 +276,25 @@ inline void CodeGenGo::DerefLoc(GoLoc &l) {
     if (l.t->kind != TY_REF) Fail(Line {}, "internal: a dereference of no reference");
     auto sub = l.t->ref->sub;
     auto viaref = l.viaref;
+    if (!IsRelRef(l.t) && IsResz(sub)) {
+        auto ispref = l.ispref;
+        auto x = l.lv;
+        l = FatRefLoc(x, sub);
+        if (ispref) {
+            l.fl = cat("(*", x, ".FreeHdr)");
+            l.flstk = cat(x, ".FreeStk");
+        }
+        l.viaref = viaref;
+        return;
+    }
+    if (!IsRelRef(l.t) && IsBytesT(sub)) {
+        auto x = l.lv;
+        l = GoLoc {};
+        l.t = sub;
+        l.addr = x;
+        l.viaref = viaref;
+        return;
+    }
     if (IsRelRef(l.t)) {
         auto p = T();
         Decl(p, "unsafe.Pointer", RelLoad(l));
@@ -279,8 +333,17 @@ inline CodeGenGo::GoLoc CodeGenGo::GenLoc(Node *n) {
         (Is<Ident>(u->child) || Is<Dot>(u->child) || Is<Index>(u->child)) &&
         u->child->exprtype && u->child->exprtype->kind != TY_REF)
         return GenLoc(u->child);
-    // Anything else: a temporary holding its value.
+    // Anything else: a temporary holding its value, on a stack of its own
+    // where it is no fixed-size value (GenRzTmp, GenPtr).
     auto t = n->exprtype;
+    if (IsResz(t)) return GenRzTmp(n);
+    if (IsBytesT(t)) {
+        GoLoc l;
+        l.t = t;
+        l.addr = BytesTemp(l.stk);
+        GenAny(n, GoDst { GD_STACK, l.stk, t });
+        return l;
+    }
     if (IsRelRef(t)) t = ast.RefTo(t->ref->sub, n->line, t->ref->optional);
     auto x = GenX(n);
     if (IsGoName(x) && !IsGoConst(x) && (Is<Call>(n) || IsCtl(n) || Is<StructLit>(n) ||
@@ -300,6 +363,8 @@ inline CodeGenGo::GoLoc CodeGenGo::GenLoc(Node *n) {
 // as a static-capacity limited array.
 inline string CodeGenGo::LoadLoc(GoLoc l, TypeExpr *et, Line ln) {
     if (!et || et->kind == TY_VOID) et = l.t;
+    if (IsResz(l.t) && et->kind == TY_REF) return RefOfRz(l, ln);
+    if (l.t->kind != TY_REF && IsBytesT(l.t) && !IsResz(l.t) && et->kind == TY_REF) return l.addr;
     if (l.t->kind == TY_REF && et->kind != TY_REF) {
         DerefLoc(l);
         return LoadLoc(l, et, ln);
@@ -366,6 +431,10 @@ inline void CodeGenGo::CopyIntoLimited(const GoLoc &l, TypeExpr *et, Line ln, co
 inline string CodeGenGo::GenRefVal(Node *child, Line ln) {
     auto l = GenLoc(child);
     if (l.t->kind == TY_REF) return LoadLoc(l, l.t, ln);
+    // A reference to a resizable value is its header's address and its
+    // stack (C.2), one to a bytes value the value's address.
+    if (IsResz(l.t)) return RefOfRz(l, ln);
+    if (IsBytesT(l.t)) return l.addr;
     return PtrOf(l);
 }
 

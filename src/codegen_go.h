@@ -59,19 +59,25 @@
 //
 // The members are declared here in the order they are defined across
 // codegen_go_values.h, codegen_go_types.h, codegen_go_places.h,
-// codegen_go_aggr.h, codegen_go_stmts.h, codegen_go_calls.h and
-// codegen_go_emit.h.
+// codegen_go_aggr.h, codegen_go_rz.h, codegen_go_stmts.h,
+// codegen_go_calls.h and codegen_go_emit.h; codegen_go_rz.h is included
+// after codegen_go_calls.h, whose helpers it uses.
 #pragma once
 
 namespace goose {
 
-// Where a value goes: nowhere (evaluated for effect), or into the Go lvalue
-// `s`, whose type `t` is, where the receiver knows it.
-enum GoDstKind { GD_DISCARD, GD_LVALUE };
+// Where a value goes: nowhere (evaluated for effect), into the Go lvalue
+// `s`, whose type `t` is, where the receiver knows it, or built at the top of
+// the data stack `s` (an int64 index into gs.Stks), as the C backend's
+// DK_STACK (codegen.h): a resizable value's elements go there and its count
+// (or a frame object, whole) to `lenlv`. A `pool` lvalue is a GsPref.
+enum GoDstKind { GD_DISCARD, GD_LVALUE, GD_STACK };
 struct GoDst {
     GoDstKind k = GD_DISCARD;
     string s;
     TypeExpr *t = nullptr;
+    string lenlv;
+    bool pool = false;
 };
 
 // What the driver hands the Go backend.
@@ -227,6 +233,15 @@ struct CodeGenGo {
         // A reference on the way here can be rebound, so evaluating lv later
         // may reach other storage.
         bool viaref = false;
+        // A value on a data stack (codegen_go_rz.h), as the C backend's Loc
+        // has it: the stack it lives on (an int64 index into gs.Stks), and,
+        // for a resizable, its header's lvalue (a GsRhdr, or a frame
+        // object's Go struct) and the int64 lvalue of its count. A resizable
+        // array's addr is its elements' base and its lv is empty; a bytes
+        // value's addr is where its image starts. A reusable pool's freelist
+        // rides along (fl, a GsRhdr lvalue, and flstk).
+        string stk, lenlv, hdr, fl, flstk;
+        bool ispref = false;    // lv is a GsPref: a pool reference variable.
     };
     // An array's or a slice's elements.
     struct GoView {
@@ -325,15 +340,122 @@ struct CodeGenGo {
     void EmitRenderFns();
 
     // ------------------------------------------------------------------
+    // Values on data stacks (codegen_go_rz.h): resizable values and their
+    // fat references, frame objects, reusable pools, and the construction of
+    // a value at a stack's top (§4.2, §4.3), as the C backend builds them
+    // (codegen_construct.h, codegen_stmts.h, codegen_builtins.h): every stack
+    // it takes, it takes where C does, so that both report and reserve the
+    // same stacks (--stacks).
+
+    bool IsResz(TypeExpr *t) { return Cls(t) == SC_RESIZABLE; }
+    bool IsBytesT(TypeExpr *t) { return Cls(t) != SC_FIXED; }
+    bool NeedsStack(TypeExpr *t) { return IsBytesT(t) || IsLargeFixed(t); }
+    bool IsFrameObj(TypeExpr *t) { return t->kind == TY_STRUCT && SI(t)->frameobj; }
+    bool IsFatRef(TypeExpr *t) {
+        return t->kind == TY_REF && t->ref->lenstorage < 0 && IsResz(t->ref->sub);
+    }
+    bool PrefVar(const VarDef *vd) {
+        return vd->type && CarriesPool(vd->type) && vd->ref.reusable;
+    }
+    bool IsPoolParam(FnSpec *sp, size_t i) {
+        return sp->roots[i].reusable && CarriesPool(sp->argtypes[i]);
+    }
+    // The header type of a resizable: a frame object's own struct, a GsRhdr
+    // otherwise.
+    string RzGoT(TypeExpr *t, Line ln);
+    string FoTailHdr(TypeExpr *t, const string &obj);
+    TypeExpr *FoTailArr(TypeExpr *t);
+    string Top(const string &stk) { return cat("gs.Stks[", stk, "]"); }
+    void Bump(const string &stk, const string &n);
+    TypeExpr *growu8 = nullptr;
+    TypeExpr *GrowU8();
+    // A named result built at its destination (§7.3), as the C backend's
+    // NrvoDest: the local's elements are written where the value ends up.
+    struct NrvoDest {
+        string stk;               // Destination stack expression.
+        string lenlv;             // Receiving count.
+        bool inlined = false;     // Bound by an InlineBlock, not by DetectNrvo.
+        bool fo = false;          // A frame object: lenlv receives the whole object.
+        string hdr;               // The local's header name (DeclStackLocal).
+    };
+    unordered_map<const VarDef *, NrvoDest> nrvo;
+    // Constructions under way per stack, while their parts are emitted
+    // (GenConstruct, an inlined body's named result bound there): what they
+    // placed sits in front of the top an exit finds on that stack.
+    unordered_map<string, int> openat;
+    struct OpenAt {
+        CodeGenGo &cg;
+        string stk;
+        OpenAt(CodeGenGo &cg, const string &stk) : cg(cg), stk(stk) { cg.openat[stk]++; }
+        ~OpenAt() { cg.openat[stk]--; }
+    };
+    vector<string> dsttop0;       // gs_dst<i>'s top on entry, once needed.
+    vector<string> dstcounts;     // The count each resizable result returns.
+    GoDst DeclStackLocal(VarDef *d, bool forlocal);
+    string BytesTemp(string &stk);
+    string RzTemp(TypeExpr *t, string &stk);
+    string RzLenLv(TypeExpr *t, const string &h);
+    GoLoc RzTempLoc(TypeExpr *t, const string &h, const string &stk);
+    GoLoc GenRzTmp(Node *n);
+    GoLoc FatRefLoc(const string &x, TypeExpr *sub);
+    GoLoc RzVarLoc(const VarDef *vd, const string &name);
+    string RefOfRz(const GoLoc &l, Line ln);
+    string GenPrefVal(Node *n);
+    void EmitValStore(const string &stk, TypeExpr *t, const string &x);
+    void EmitCopyElems(const string &stk, TypeExpr *elem, const string &src, const string &n);
+    struct SrcElems {
+        string elems, n;
+    };
+    SrcElems GenSrcElems(Node *n);
+    void GenConstruct(Node *n, const string &stk, TypeExpr *want = nullptr,
+                      const string &lenlv = "");
+    void ConstructFromLoc(GoLoc l, TypeExpr *et, const string &stk, const string &lenlv, Line ln);
+    void ConstructCall(Call *c, TypeExpr *et, const string &stk, TypeExpr *want,
+                       const string &lenlv);
+    void GenArrayFromLoc(GoLoc l, TypeExpr *et, const string &stk, Line ln, const string &lenlv);
+    void EmitRzCopy(GoLoc l, TypeExpr *et, const string &stk, const string &lenlv, Line ln);
+    void GenArrayLitAt(ArrayLit *al, const string &stk, const string &lenlv, TypeExpr *as);
+    void EmitArrayCount(const string &stk, TypeExpr *at, const string &lenlv, const string &n);
+    void EnterDst(int si, const GoDst &d);
+    string ScopeTop0(int si);
+    string DstTop0(size_t i);
+    void DeclareTop0(size_t at, int indent, const string &name, const string &stk);
+    const NrvoDest *NrvoBoundAt(Node *val, const string &stk, const string &lenlv);
+    string ExitStart(Node *val, const string &stk, const string &lenlv, int open0);
+    void LandValue(const string &stk, const string &top0, const string &start, TypeExpr *t,
+                   const string &lenlv);
+    void EmitNrvoFinish(const NrvoDest &nd);
+    void DetectNrvo(FnSpec *sp);
+    const VarDef *OpenIbNrvo(InlineBlock *ib, const GoDst &d);
+    vector<string> GenRzBuiltin(Call *c, const GoDst &d0);
+    vector<string> EmitPush(vector<Node *> &an, Line ln);
+    void EmitAppend(vector<Node *> &an, Line ln);
+    string NewElemResultRz(const string &e, TypeExpr *elem, Line ln);
+    vector<string> EmitStr(Call *c, vector<Node *> &an, const GoDst &d0, Line ln);
+    void EmitFormatInto(GoLoc l, Node *a, Line ln, Call *c);
+    GoLoc TempBuilder();
+    void AppendBytes(const GoLoc &l, const string &src, const string &n, Line ln);
+    void RenderToBuilder(const GoLoc &b, Node *a, Call *c);
+    bool SimpleText(Call *c, TypeExpr *t);
+    GoLoc RzRecvLoc(Node *n);
+    GoLoc PinRz(GoLoc l);
+    string GenRzArrayBuiltin(Call *c);
+
+    // ------------------------------------------------------------------
     // Per-specialization interface. A function's Go parameters are the data
     // stack block and index where it needs them (needssp), its declared
     // parameters, then the free variables it or its callees reach (§7.5),
     // each a pointer to the variable; its results are Go's multiple results.
 
+    // needsgs: it takes the block without the index, where it touches a
+    // data stack only through what it is handed -- a reference to a
+    // resizable, a destination, a global's stack -- as a C function does
+    // through a gs_stack * without needing gs_sp.
     struct SpecInfo {
         string name;
         vector<VarDef *> freevars;
         bool needssp = false;
+        bool needsgs = false;
     };
     unordered_map<FnSpec *, SpecInfo> sinfo;
     vector<FnSpec *> livespecs;
@@ -346,8 +468,9 @@ struct CodeGenGo {
     unordered_map<FnSpec *, vector<StackCall>> stackcalls;
     unordered_map<FnSpec *, int> stackown;
     unordered_map<FnSpec *, int64_t> stackneed;
-    // Regions outside the indexed block: none yet, without resizable
-    // globals or threads.
+    // Regions outside the indexed block: the dedicated stacks of the
+    // resizable and variable-size globals (and a pool's freelist), which
+    // follow the main program's stacks in its block (gsGlobalStacks).
     int globalregions = 0;
     unordered_map<FnSpec *, int> thunkregions;
     int64_t maxstacks = 0;
@@ -384,6 +507,13 @@ struct CodeGenGo {
     unordered_map<const VarDef *, string> vnames;
     set<const VarDef *> fvptr;          // Free variables, which arrive as pointers.
     unordered_map<const VarDef *, string> gnames;
+    // The data stack of each local and global value that lives on one, and a
+    // reusable pool's freelist (its GsRhdr and its stack), as the C
+    // backend's vstk, vpool, gstks and gpools.
+    unordered_map<const VarDef *, string> vstk;
+    unordered_map<const VarDef *, pair<string, string>> vpool;
+    unordered_map<const VarDef *, string> gstks;
+    unordered_map<const VarDef *, pair<string, string>> gpools;
     // Control cannot reach the code being emitted: it follows a statement Go
     // takes to end the flow (a return, a break or continue, a panic, a `for`
     // without a condition or a break). Go's vet reports such code, so none
@@ -404,9 +534,12 @@ struct CodeGenGo {
     struct GoScope {
         int kind = SC_PLAIN;
         int stkbase = 0;
-        // The `defer` bodies registered in this scope (§6.6), which every
-        // exit through it runs, latest first.
-        vector<Defer *> defers;
+        // The data stack tops to restore at every exit through this scope,
+        // (stack, base) in declaration order, and the `defer` bodies
+        // registered in it (§6.6), each with how many saves came before it:
+        // an exit runs them among the restores, latest first (EmitRestores).
+        vector<pair<string, string>> saves;
+        vector<pair<size_t, Defer *>> defers;
         SFunction *ibsf = nullptr;      // SC_IB: which returns exit here.
         // SC_LOOP, SC_BLOCK, SC_IB: the Go label a break, continue or
         // return names, written in front of the statement once one does
@@ -417,6 +550,12 @@ struct CodeGenGo {
         int labelind = 0;
         bool usedlabel = false, usedbrk = false;
         GoDst dst;                      // Where a break's or a return's value goes.
+        // A stack dst: the constructions open there on entry, and where its
+        // top on entry is declared once an exit needs it (ScopeTop0).
+        int open0 = 0;
+        size_t topat = 0;
+        int topind = 0;
+        string top0;
     };
     vector<GoScope> scopes;
 
@@ -436,6 +575,11 @@ struct CodeGenGo {
         FnSpec *curspec = nullptr;
         SpecInfo *curinfo = nullptr;
         vector<TypeExpr *> rendering;
+        unordered_map<const VarDef *, string> vstk;
+        unordered_map<const VarDef *, pair<string, string>> vpool;
+        unordered_map<const VarDef *, NrvoDest> nrvo;
+        unordered_map<string, int> openat;
+        vector<string> dsttop0, dstcounts;
     };
     FnState SaveFnState();
     void RestoreFnState(FnState &s);
@@ -468,7 +612,8 @@ struct CodeGenGo {
     // The data stack index k of this function, and the first one free.
     string SpIdx(int k) { return spexpr == "0" ? cat(k) : k ? cat(spexpr, " + ", k) : spexpr; }
     string SpTop() { return SpIdx(stknext); }
-    string AllocStk();
+    string AllocStk(bool forlocal = false);
+    void SaveBase(bool forlocal, const string &stk, const string &basevar);
 
     // ------------------------------------------------------------------
     // Values (codegen_go_values.h). GenX gives a Go expression of the Go type
@@ -535,6 +680,7 @@ struct CodeGenGo {
     void GenMatch(MatchExpr *m, const GoDst &d);
     void GenEarlyBlock(EarlyBlock *eb, const GoDst &d);
     void GenInlineBlock(InlineBlock *ib, const GoDst &d);
+    void EmitIbBody(InlineBlock *ib, const GoDst &d);
     void GenWhile(While *w);
     void GenLoop(LoopExpr *lp, const GoDst &d);
     void GenFor(ForLoop *f);
@@ -547,7 +693,7 @@ struct CodeGenGo {
     void GenVarDecl(VarDecl *vd);
     string LocalName(VarDef *vd);
     string Unique2(const string &base);
-    void BindLocal(VarDef *d, Node *init);
+    void BindLocal(VarDef *d, Node *init, bool forlocal = true);
     bool StableDest(Node *n);
     GoLoc AssignLoc(Node *lval, bool pointee);
     void GenAssign(Assign *a);
@@ -559,7 +705,13 @@ struct CodeGenGo {
 
     vector<Node *> CallArgNodes(Call *c, size_t nparams);
     string FreeVarArg(const VarDef *fv);
+    bool PlainSig(FnSpec *sp);
+    string StackArgs(FnSpec *sp, Line ln);
     string SpecCallX(Call *c, FnSpec *sp);
+    vector<string> EmitSpecCall(Call *c, FnSpec *sp, const GoDst &d0, vector<GoDst> *alldst);
+    vector<string> GenCallVals(Call *c, const GoDst &d0, vector<GoDst> *alldst = nullptr);
+    string CallVal0(Call *c, const string &r0, TypeExpr *want);
+    GoLoc CallResLoc(Call *c, const string &r0);
     vector<string> GenDispatch(Call *c);
     string GenCall(Call *c);
     void GenCallAny(Call *c, const GoDst &d);
@@ -583,10 +735,15 @@ struct CodeGenGo {
     set<const VarDef *> gstatic;
     set<const VarDef *> usedglobals;
     bool PureInit(Node *n);
+    bool HoldsFatRef(TypeExpr *t);
     void FindUsedGlobals();
     void EmitGlobalDecls();
     bool StaticInit(Node *n, TypeExpr *t, string &out);
     void EmitGlobalInit();
+    // The dedicated stacks of the globals, in the order gsInitGlobals sets
+    // them up: each one's index follows the main program's stacks.
+    vector<string> gstkorder;
+    void InitGlobalStack(VarDef *d);
     void EmitProgram();
     string Source(const string &srcname);
 

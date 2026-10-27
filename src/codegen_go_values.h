@@ -510,7 +510,7 @@ inline string CodeGenGo::GenX(Node *n) {
         case NK_NullLit:
             GoT(n->exprtype, n->line);
             if (n->exprtype->kind != TY_REF) Fail(n->line, "internal: null of no reference type");
-            return "nil";
+            return IsFatRef(n->exprtype) ? "GsRref{}" : "nil";
         case NK_SelfRef: Fail(n->line, "internal: self outside a literal's field");
         case NK_Dot: return GenDot((Dot *)n);
         case NK_Index: return LoadLoc(GenLoc(n), n->exprtype, n->line);
@@ -722,9 +722,12 @@ inline string CodeGenGo::NullTestOperand(Node *n) {
     if (auto id = Is<Ident>(n); id && id->vdef && IsOptional(id->vdef->type)) {
         GoT(id->vdef->type, n->line);
         auto l = VarLoc(id->vdef, n->line);
-        return LoadLoc(l, l.t, n->line);
+        auto x = LoadLoc(l, l.t, n->line);
+        // A fat reference is null where its header is.
+        return IsFatRef(l.t) ? cat(x, ".Hdr") : x;
     }
-    return GenX(n);
+    auto x = GenX(n);
+    return n->exprtype && IsFatRef(n->exprtype) ? cat(x, ".Hdr") : x;
 }
 
 // A condition's Go bool: a reference's null test where it is one (§3.8).
@@ -773,6 +776,14 @@ inline void CodeGenGo::GenAny(Node *n, const GoDst &d) {
 // effect, given to Go's blank identifier, which is how Go evaluates an
 // expression that is no call.
 inline void CodeGenGo::LeafAny(Node *n, const GoDst &d) {
+    if (d.k == GD_STACK) {
+        GenConstruct(n, d.s, d.t, d.lenlv);
+        return;
+    }
+    if (d.k == GD_LVALUE && d.pool) {
+        L(d.s, " = ", GenPrefVal(n));
+        return;
+    }
     if (d.k == GD_LVALUE) {
         if (d.t && IsRelRef(d.t)) {
             GenRelStore(AtVar(d.s, d.t), n, false);
@@ -806,6 +817,13 @@ inline void CodeGenGo::LeafAny(Node *n, const GoDst &d) {
         return;
     }
     if (IsVoidT(n->exprtype)) Fail(n->line, "internal: valueless leaf");
+    // A resizable or bytes value is reached through its location, whose
+    // path's checks still run: a path's is where it is stored, anything
+    // else is built on a temporary stack the enclosing scope releases.
+    if (IsBytesT(n->exprtype)) {
+        GenLoc(n);
+        return;
+    }
     // A constant or a variable read has no effect to keep.
     if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) || Is<NullLit>(n))
         return;

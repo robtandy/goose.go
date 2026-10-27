@@ -430,6 +430,11 @@ inline void CodeGenGo::CheckRepresentable(TypeExpr *t, Line ln) {
             auto &r = *t->ref;
             if (r.lenstorage == IS_VARINT) Unsupported(ln, "a varint relative reference");
             if (r.pool) Unsupported(ln, cat("an `in pool` relative reference (", TypeText(t), ")"));
+            // A fat reference to a resizable value (GsRref).
+            if (r.lenstorage < 0 && IsResz(r.sub)) {
+                CheckRepresentable(r.sub, ln);
+                return;
+            }
             if (Cls(r.sub) != SC_FIXED) Unsupported(ln, cat("a value of type ", TypeText(t)));
             return;
         }
@@ -437,6 +442,14 @@ inline void CodeGenGo::CheckRepresentable(TypeExpr *t, Line ln) {
             if (Cls(t->sub) != SC_FIXED) Unsupported(ln, cat("a value of type ", TypeText(t)));
             return;
         case TY_ARRAY: case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
+            // A resizable array of fixed-size elements: its header (GsRhdr),
+            // the elements on a data stack.
+            if (t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK)) {
+                if (!IsFix(t->arr->sub))
+                    Unsupported(ln, cat("a value of type ", TypeText(t), " (variable-size elements)"));
+                CheckRepresentable(t->arr->sub, ln);
+                return;
+            }
             if (Cls(t) != SC_FIXED || (t->kind == TY_ENUM && t->enu->varmode))
                 Unsupported(ln, cat("a value of type ", TypeText(t)));
             if (t->kind == TY_ARRAY && t->arr->akind != A_FIXED && t->arr->akind != A_LIMITED)
@@ -458,10 +471,12 @@ inline string CodeGenGo::GoT(TypeExpr *t, Line ln) {
         case TY_BOOL: return "bool";
         case TY_REF:
             if (t->ref->lenstorage >= 0) return RelGoT(t);
+            if (IsResz(t->ref->sub)) return "GsRref";
             return cat("*", GoT(t->ref->sub, ln));
         case TY_SLICE: return "GsSlice";
         case TY_ARRAY:
             if (t->arr->akind == A_FIXED) return cat("[", ArrSize(t->arr), "]", GoT(t->arr->sub, ln));
+            if (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK) return "GsRhdr";
             break;
         default: break;
     }
@@ -508,6 +523,11 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
         case TY_REF:
             if (t->ref->lenstorage >= 0) {
                 ti.size = ti.align = IntSize((IntStorage)t->ref->lenstorage);
+            } else if (IsResz(t->ref->sub)) {
+                // A GsRref: the header's address and the stack.
+                ti.size = 16;
+                ti.align = 8;
+                ti.ptrs = true;
             } else {
                 ti.size = ti.align = 8;
                 ti.ptrs = true;
@@ -527,6 +547,14 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
                 ti.ptrs = k > 0 && e.ptrs;
                 ti.exact = e.exact;
                 ti.goeq = e.goeq;
+                return typeinfo[m] = ti;
+            }
+            if (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK) {
+                // Its header (GsRhdr).
+                ti.size = 16;
+                ti.align = 8;
+                ti.ptrs = true;
+                ti.goeq = false;
                 return typeinfo[m] = ti;
             }
             break;

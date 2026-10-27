@@ -1,10 +1,11 @@
 // Goose compiler — the runtime the Go backend writes into every file it
 // generates (CodeGenGo::Source, codegen_go.h), after the package clause, the
-// imports (math, os, strconv, syscall, unsafe, each of which it uses) and the
-// configuration constants gsStackReserve and gsStackGap. It is Go source as
-// it is written out, in pieces under the 16 KB a string literal may have in
-// MSVC; edit it here, and check the result with go vet on a generated file
-// (test/run_go_tests.py does, for every program it compiles).
+// imports (math, os, runtime/debug, strconv, syscall, unsafe, each of which
+// it uses) and the configuration constants gsStackReserve and gsStackGap. It
+// is Go source as it is written out, in pieces under the 16 KB a string
+// literal may have in MSVC; edit it here, and check the result with go vet
+// on a generated file (test/run_go_tests.py does, for every program it
+// compiles).
 #pragma once
 
 namespace goose {
@@ -98,14 +99,32 @@ func gsOverflow(end unsafe.Pointer) {
 			}
 		}
 	}
+	panic(&GsError{Msg: gsOverflowText(usable, reserve)})
+}
+
+func gsOverflowText(usable, reserve int64) string {
 	reserve -= reserve % int64(syscall.Getpagesize())
 	msg := "data stack overflow: a value on main's data stacks grew past the " + gsSize(usable) +
 		" reserved for it"
 	if usable < reserve {
 		msg += " (halved from " + gsSize(reserve) + " when the platform ran out of address space)"
 	}
-	panic(&GsError{Msg: msg + "; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, " +
-		"up to 256 TB"})
+	return msg + "; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, up to 256 TB"
+}
+
+// gsFault is the report of a fault at addr, where it lies in a region's
+// guard gap: a data stack grown past its region with no check on the way,
+// as a push grows it (gs_fault_handler). "" for any other address.
+func gsFault(addr uintptr) string {
+	for _, b := range gsBlocks {
+		for k, r := range b.regions {
+			base := uintptr(unsafe.Pointer(unsafe.SliceData(r)))
+			if addr-base < uintptr(len(r)) {
+				return "goose runtime error: " + gsOverflowText(b.Cap[k], b.reserve)
+			}
+		}
+	}
+	return ""
 }
 
 // gsSize is a size as the C runtime writes one (gs_size): a whole number of
@@ -212,12 +231,21 @@ func (e *GsError) Error() string {
 
 // GsExitOnAbort, deferred by the program's main, ends the process as the C
 // runtime does when a Goose runtime error panics: the message on stderr and
-// exit status 1. Any other panic goes on.
+// exit status 1. So does a fault in a data stack's guard gap, which the
+// program's main has the runtime panic with (debug.SetPanicOnFault): a stack
+// that grew past its region, as C's fault handler reports it. Any other
+// panic goes on.
 func GsExitOnAbort() {
 	if r := recover(); r != nil {
 		if e, ok := r.(*GsError); ok {
 			os.Stderr.WriteString(e.Error() + "\n")
 			os.Exit(1)
+		}
+		if f, ok := r.(interface{ Addr() uintptr }); ok {
+			if msg := gsFault(f.Addr()); msg != "" {
+				os.Stderr.WriteString(msg + "\n")
+				os.Exit(1)
+			}
 		}
 		panic(r)
 	}
@@ -267,6 +295,32 @@ func GsTagError(file string, line int) *GsError {
 type GsSlice struct {
 	Data unsafe.Pointer
 	Len  int64
+}
+
+// GsRhdr is the header of a resizable value (§5.1, §5.2, C.2): Len elements
+// from Base, which sit on top of the header's data stack, so that pushing an
+// element writes it at the stack's top, moves the top past it and counts
+// it. The base never moves.
+type GsRhdr struct {
+	Base unsafe.Pointer
+	Len  int64
+}
+
+// GsRref is a fat reference to a resizable value (C's gs_rref): its header,
+// and the index in the GsStackBlock of the data stack its elements top, so
+// that a callee can grow the value it was handed.
+type GsRref struct {
+	Hdr *GsRhdr
+	Stk int64
+}
+
+// GsPref is a reference to a reusable[] pool (C's gs_pref): the element
+// array as a GsRref, and the freelist's header and data stack.
+type GsPref struct {
+	Hdr     *GsRhdr
+	Stk     int64
+	FreeHdr *GsRhdr
+	FreeStk int64
 }
 
 // GsStr is the slice of a string literal's bytes, which are read-only.

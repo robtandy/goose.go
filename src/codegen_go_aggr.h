@@ -282,6 +282,22 @@ inline string CodeGenGo::GenDot(Dot *d) {
 inline string CodeGenGo::GenEquality(Binary *b) {
     auto lt = b->left->exprtype;
     if (lt && IsPlainRef(lt)) lt = lt->ref->sub;
+    if (lt && IsResz(lt)) {
+        // Resizable arrays compare as element ranges through their views,
+        // the left one read before the right operand runs.
+        if (lt->kind != TY_ARRAY) Unsupported(b->line, "comparing resizable structs");
+        auto la = GenLoc(b->left);
+        while (la.t->kind == TY_REF) DerefLoc(la);
+        auto lv = ArrayView(la, b->line);
+        auto ld = T(), ln = T();
+        Decl(ld, "unsafe.Pointer", lv.data);
+        Decl(ln, "int64", lv.len);
+        auto ra = GenLoc(b->right);
+        while (ra.t->kind == TY_REF) DerefLoc(ra);
+        auto rv = ArrayView(ra, b->line);
+        auto eq = RangeEq(lv.elem, ld, ln, rv.data, rv.fixed >= 0 ? cat(rv.fixed) : rv.len, b->line);
+        return b->op == T_EQ ? eq : cat("(!", eq, ")");
+    }
     auto later = HasStmts(b->right);
     auto l = CoerceVal(GenX(b->left), b->left->exprtype, lt, b->line);
     if (later || !IsGoName(l) || IsGoConst(l)) l = Snapshot(lt, l);
@@ -589,6 +605,11 @@ inline string CodeGenGo::GenArrayBuiltin(Call *c) {
     auto an = c->ArgNodes();
     auto ln = c->line;
     auto i64 = ast.inttypes[IS_I64];
+    // A resizable receiver grows and shrinks at its stack's top
+    // (codegen_go_rz.h).
+    auto recv = an[0]->exprtype;
+    while (recv && recv->kind == TY_REF) recv = recv->ref->sub;
+    if (recv && IsResz(recv) && c->builtin != B_LEN && c->builtin != B_CAP) return GenRzArrayBuiltin(c);
     switch ((BuiltinKind)c->builtin) {
         case B_LEN: case B_CAP: {
             auto l = GenLoc(an[0]);
@@ -984,6 +1005,18 @@ inline CodeGenGo::FnState CodeGenGo::SaveFnState() {
     s.curspec = curspec;
     s.curinfo = curinfo;
     s.rendering = std::move(rendering);
+    s.vstk = std::move(vstk);
+    s.vpool = std::move(vpool);
+    s.nrvo = std::move(nrvo);
+    s.openat = std::move(openat);
+    s.dsttop0 = std::move(dsttop0);
+    s.dstcounts = std::move(dstcounts);
+    vstk.clear();
+    vpool.clear();
+    nrvo.clear();
+    openat.clear();
+    dsttop0.clear();
+    dstcounts.clear();
     body.clear();
     fnused.clear();
     fnnextsuffix.clear();
@@ -1014,6 +1047,12 @@ inline void CodeGenGo::RestoreFnState(FnState &s) {
     curspec = s.curspec;
     curinfo = s.curinfo;
     rendering = std::move(s.rendering);
+    vstk = std::move(s.vstk);
+    vpool = std::move(s.vpool);
+    nrvo = std::move(s.nrvo);
+    openat = std::move(s.openat);
+    dsttop0 = std::move(s.dsttop0);
+    dstcounts = std::move(s.dstcounts);
 }
 
 }  // namespace goose

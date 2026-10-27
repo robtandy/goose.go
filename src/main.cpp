@@ -46,6 +46,7 @@
 #include "codegen_go_aggr.h"
 #include "codegen_go_stmts.h"
 #include "codegen_go_calls.h"
+#include "codegen_go_rz.h"
 #include "codegen_go_emit.h"
 #include "runtime_inline.h"
 #include "process.h"

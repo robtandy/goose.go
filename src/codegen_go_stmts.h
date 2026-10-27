@@ -36,9 +36,11 @@ inline void CodeGenGo::PopSc() {
 // it in their scope, which is generated the same way; they are unique, and
 // no code that is kept is in that scope.
 inline void CodeGenGo::GenUnreached(const function<void()> &gen) {
-    struct Mark { bool usedlabel, usedbrk; size_t defers; };
+    struct Mark { bool usedlabel, usedbrk; size_t defers, saves; string top0; };
     vector<Mark> marks;
-    for (auto &s : scopes) marks.push_back({ s.usedlabel, s.usedbrk, s.defers.size() });
+    for (auto &s : scopes)
+        marks.push_back({ s.usedlabel, s.usedbrk, s.defers.size(), s.saves.size(), s.top0 });
+    auto savedsttop0 = dsttop0;
     auto nscopes = scopes.size();
     auto text = std::move(body);
     body.clear();
@@ -52,29 +54,56 @@ inline void CodeGenGo::GenUnreached(const function<void()> &gen) {
         scopes[i].usedlabel = marks[i].usedlabel;
         scopes[i].usedbrk = marks[i].usedbrk;
         scopes[i].defers.resize(marks[i].defers);
+        scopes[i].saves.resize(marks[i].saves);
+        scopes[i].top0 = marks[i].top0;
     }
+    dsttop0 = savedsttop0;
     body = std::move(text);
     ind = saveind;
     stknext = savenext;
     dead = true;
 }
 
-// A data stack index for the innermost scope, free again once it ends.
-inline string CodeGenGo::AllocStk() {
+// A data stack index for the innermost scope, free again once it ends;
+// `forlocal` skips the statement scopes inside the surrounding block, so
+// that a local's value survives to that block's end, and no further
+// (CodeGen::AllocStk).
+inline string CodeGenGo::AllocStk(bool forlocal) {
     auto k = stknext++;
     stkmax = std::max(stkmax, stknext);
+    if (forlocal)
+        for (auto i = (int)scopes.size() - 1; i >= 0 && scopes[i].kind == SC_STMT; i--)
+            scopes[i].stkbase = std::max(scopes[i].stkbase, stknext);
     // Spaced as gofmt spaces an index.
     auto idx = SpIdx(k);
     idx.erase(std::remove(idx.begin(), idx.end(), ' '), idx.end());
     return idx;
 }
 
-// What an exit through scope s runs: its `defer` bodies, latest first. A
-// body opens scopes of its own, which may move the scope vector, so the
-// list is copied first.
+// The top of stk to restore, to basevar, at every exit of the innermost
+// scope (of the block, past the statement scopes, for a local).
+inline void CodeGenGo::SaveBase(bool forlocal, const string &stk, const string &basevar) {
+    for (auto i = (int)scopes.size() - 1; i >= 0; i--) {
+        if (forlocal && scopes[i].kind == SC_STMT) continue;
+        scopes[i].saves.push_back({ stk, basevar });
+        return;
+    }
+    Fail(Line {}, "internal: a data stack outside every scope");
+}
+
+// What an exit through scope s runs: the restores of its stacks' tops, in
+// reverse declaration order, and its `defer` bodies, each before the
+// release of the storage declared before it (CodeGen::EmitRestores). A body
+// opens scopes of its own, which may move the scope vector, so the lists
+// are copied first.
 inline void CodeGenGo::EmitRestores(const GoScope &s) {
+    auto saves = s.saves;
     auto defers = s.defers;
-    for (auto i = (int)defers.size() - 1; i >= 0; i--) EmitDeferBody(defers[i]);
+    auto di = (int)defers.size() - 1;
+    for (auto k = (int)saves.size(); k >= 0; k--) {
+        for (; di >= 0 && (int)defers[di].first == k; di--) EmitDeferBody(defers[di].second);
+        if (k > 0) L(Top(saves[k - 1].first), " = ", saves[k - 1].second);
+    }
 }
 
 // What an exit runs on its way out down to (and including) scope `to`.
@@ -87,7 +116,7 @@ inline void CodeGenGo::EmitExitRestores(int to) {
 inline void CodeGenGo::RegisterDefer(Defer *d) {
     for (auto i = (int)scopes.size() - 1; i >= 0; i--) {
         if (scopes[i].kind == SC_STMT) continue;
-        scopes[i].defers.push_back(d);
+        scopes[i].defers.push_back({ scopes[i].saves.size(), d });
         return;
     }
     Fail(d->line, "internal: defer outside every scope");
@@ -237,6 +266,7 @@ inline void CodeGenGo::GenIf(IfExpr *fi, const GoDst &d) {
         if (auto b = Is<Block>(fi->elseb)) GenBlockInner(b, d);
         else GenAny(fi->elseb, d);
         scopes.back().defers.clear();   // Its end is never reached.
+        scopes.back().saves.clear();
         PopSc();
         ind--;
         LS("}");
@@ -345,7 +375,7 @@ inline void CodeGenGo::GenMatch(MatchExpr *m, const GoDst &d) {
 inline void CodeGenGo::GenEarlyBlock(EarlyBlock *eb, const GoDst &d) {
     if (Unreached()) return GenUnreached([&] { GenEarlyBlock(eb, d); });
     OpenLabeled(SC_BLOCK);
-    scopes.back().dst = d;
+    EnterDst((int)scopes.size() - 1, d);
     LabelHere();
     L("switch {");
     L("default:");
@@ -361,12 +391,47 @@ inline void CodeGenGo::GenEarlyBlock(EarlyBlock *eb, const GoDst &d) {
 // An inlined call's body: a `return` to the callee leaves it with its value,
 // as a break leaves a block.
 inline void CodeGenGo::GenInlineBlock(InlineBlock *ib, const GoDst &d) {
-    auto first = GenInlineArgs(ib->body);
     if (Unreached()) return GenUnreached([&] { GenInlineBlock(ib, d); });
+    // A call passed where a slice is expected was checked as that slice
+    // (§3.10), while the body returns a resizable array: built where the
+    // call would have put its result, a temporary of the caller's scope, and
+    // sliced whole (InlineBlock::CgAny).
+    auto rt = ib->spec && ib->spec->rets.size() == 1 ? ib->spec->rets[0] : nullptr;
+    auto want = d.t ? d.t : ib->exprtype;
+    if (d.k != GD_DISCARD && rt && rt->kind == TY_ARRAY && IsResz(rt) && want &&
+        want->kind == TY_SLICE) {
+        string stk;
+        auto h = RzTemp(rt, stk);
+        EmitIbBody(ib, GoDst { GD_STACK, stk, rt, RzLenLv(rt, h) });
+        if (Unreached()) return;
+        auto x = LoadLoc(RzTempLoc(rt, h, stk), want, ib->line);
+        if (d.k == GD_LVALUE) L(d.s, " = ", x);
+        else EmitValStore(d.s, want, x);
+        return;
+    }
+    EmitIbBody(ib, d);
+}
+
+// The body itself (InlineBlock::EmitBody): its named result bound to a stack
+// destination (OpenIbNrvo), whose elements sit there from its declaration
+// on, and its arguments bound in the caller's scope.
+inline void CodeGenGo::EmitIbBody(InlineBlock *ib, const GoDst &d) {
+    auto named = OpenIbNrvo(ib, d);
+    if (named) openat[d.s]++;
+    auto first = GenInlineArgs(ib->body);
+    if (Unreached()) {
+        if (named) {
+            nrvo.erase(named);
+            openat[d.s]--;
+        }
+        return GenUnreached([&] { GenInlineBlock(ib, d); });
+    }
     OpenLabeled(SC_IB);
     auto si = (int)scopes.size() - 1;
     scopes[si].ibsf = ib->sf;
-    scopes[si].dst = d;
+    EnterDst(si, d);
+    // The named result is in front of the value any other return builds.
+    if (named) scopes[si].open0--;
     LabelHere();
     L("switch {");
     L("default:");
@@ -379,6 +444,10 @@ inline void CodeGenGo::GenInlineBlock(InlineBlock *ib, const GoDst &d) {
     auto s = PopLabeled();
     PlaceLabel(s);
     dead = dead && !s.usedbrk;
+    if (named) {
+        nrvo.erase(named);
+        openat[d.s]--;
+    }
 }
 
 // ------------------------------------------------------------------
@@ -393,6 +462,7 @@ inline void CodeGenGo::GenLoopBody(Block *bodyb, size_t first) {
     else EmitRestores(scopes.back());
     // Restored by every path out of an iteration already.
     scopes.back().defers.clear();
+    scopes.back().saves.clear();
 }
 
 inline void CodeGenGo::GenWhile(While *w) {
@@ -438,7 +508,7 @@ inline void CodeGenGo::GenWhile(While *w) {
 inline void CodeGenGo::GenLoop(LoopExpr *lp, const GoDst &d) {
     if (Unreached()) return GenUnreached([&] { GenLoop(lp, d); });
     OpenLabeled(SC_LOOP);
-    scopes.back().dst = d;
+    EnterDst((int)scopes.size() - 1, d);
     LabelHere();
     L("for {");
     ind++;
@@ -546,7 +616,13 @@ inline void CodeGenGo::GenReturn(Return *r) {
 // A break's value, or a return's leaving an inlined body, for scope si.
 inline void CodeGenGo::GenExitValue(Node *val, int si) {
     auto d = scopes[si].dst;
+    // A value built at a stack's top, where a construction opened since the
+    // scope was entered may have placed something in front of it, is moved
+    // down to where the receiver expects it (CodeGen::GenExitValue).
+    auto start = d.k == GD_STACK ? ExitStart(val, d.s, d.lenlv, scopes[si].open0) : "";
     GenAny(val, d);
+    if (!start.empty())
+        LandValue(d.s, ScopeTop0(si), start, d.t ? d.t : val->exprtype, d.lenlv);
 }
 
 inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
@@ -555,7 +631,7 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
     // A return passes through the exits of every scope, whose `defer`
     // bodies run after its values are taken.
     auto restores = false;
-    for (auto &s : scopes) restores = restores || !s.defers.empty();
+    for (auto &s : scopes) restores = restores || !s.defers.empty() || !s.saves.empty();
     vector<string> rv;
     if (vals.size() == 1 && sp->rets.size() > 1) {
         // A single call forwards all its results (§7.1).
@@ -576,6 +652,34 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
         }
         if (!c || !c->spec || c->spec->rets.size() != sp->rets.size())
             Fail(vals[0]->line, "internal: a return forwarding no call's results");
+        if (!PlainSig(c->spec)) {
+            // Each result into its channel: a non-fixed one built at this
+            // function's destination for it, its count into gs_rl<i>
+            // (CodeGen::GenForward).
+            vector<GoDst> chans(sp->rets.size());
+            for (size_t i = 0; i < sp->rets.size(); i++) {
+                auto rt = sp->rets[i];
+                if (!IsBytesT(rt)) continue;
+                if (!TEq(c->spec->rets[i], rt))
+                    Unsupported(c->line, cat("forwarding a ", TypeText(c->spec->rets[i]),
+                                             " result as a ", TypeText(rt)));
+                chans[i] = GoDst { GD_STACK, cat("gs_dst", i), rt,
+                                   IsResz(rt) ? dstcounts[i] : string() };
+            }
+            auto res = EmitSpecCall(c, c->spec, chans[0], &chans);
+            if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
+            for (size_t i = 0; i < sp->rets.size(); i++) {
+                auto rt = sp->rets[i];
+                if (IsResz(rt)) rv.push_back(dstcounts[i]);
+                else if (!IsBytesT(rt)) rv.push_back(Snapshot(rt, CoerceVal(res[i], c->spec->rets[i], rt, c->line)));
+            }
+            EmitExitRestores(0);
+            string list;
+            for (size_t i = 0; i < rv.size(); i++) Append(list, i ? ", " : "", rv[i]);
+            L(list.empty() ? string("return") : cat("return ", list));
+            dead = true;
+            return;
+        }
         auto same = true;
         for (size_t i = 0; i < sp->rets.size(); i++)
             same = same && SameGoT(c->spec->rets[i], sp->rets[i]);
@@ -597,10 +701,33 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
     } else {
         if (vals.size() != sp->rets.size()) Fail(sp->sf->line, "internal: return value count");
         for (size_t i = 0; i < vals.size(); i++) {
+            auto rt = sp->rets[i];
+            if (IsBytesT(rt)) {
+                // Built at this function's destination for it (§7.3): a
+                // named result in place already, any other value at the top
+                // and moved down over whatever is in front of it
+                // (CodeGen::GenNormalReturn).
+                auto id = Is<Ident>(vals[i]);
+                auto named = id && id->vdef ? nrvo.find(id->vdef) : nrvo.end();
+                auto dst = cat("gs_dst", i);
+                auto direct = named != nrvo.end() && !named->second.inlined && named->second.stk == dst;
+                auto lenlv = IsResz(rt) ? dstcounts[i] : string();
+                if (direct) {
+                    if (IsResz(rt))
+                        L(lenlv, " = ", IsFrameObj(rt) ? VarRef(id->vdef, vals[i]->line)
+                                                       : cat(VarRef(id->vdef, vals[i]->line), ".Len"));
+                } else {
+                    auto start = ExitStart(vals[i], dst, lenlv, 0);
+                    GenConstruct(vals[i], dst, rt, lenlv);
+                    if (!start.empty()) LandValue(dst, DstTop0(i), start, rt, lenlv);
+                }
+                if (IsResz(rt)) rv.push_back(lenlv);
+                continue;
+            }
             auto later = false;
             for (auto j = i + 1; j < vals.size(); j++) later = later || HasStmts(vals[j]);
-            auto x = Coerce(GenX(vals[i]), vals[i]->exprtype, sp->rets[i], vals[i]->line);
-            if ((later || restores) && !IsGoConst(x)) x = Snapshot(sp->rets[i], x);
+            auto x = Coerce(GenX(vals[i]), vals[i]->exprtype, rt, vals[i]->line);
+            if ((later || restores) && !IsGoConst(x) && x != "nil") x = Snapshot(rt, x);
             rv.push_back(x);
         }
     }
@@ -624,7 +751,7 @@ inline void CodeGenGo::GenVarDecl(VarDecl *vd) {
         return;
     }
     for (size_t i = 0; i < vd->defs.size(); i++)
-        BindLocal(vd->defs[i], i < vd->inits.size() ? vd->inits[i] : nullptr);
+        BindLocal(vd->defs[i], i < vd->inits.size() ? vd->inits[i] : nullptr, !vd->inline_arg);
 }
 
 // A local's Go name, given afresh at each declaration: a `defer` body emitted
@@ -645,8 +772,28 @@ inline string CodeGenGo::Unique2(const string &base) {
     return name;
 }
 
-inline void CodeGenGo::BindLocal(VarDef *d, Node *init) {
+inline void CodeGenGo::BindLocal(VarDef *d, Node *init, bool forlocal) {
     auto t = d->type;
+    // A resizable or bytes value, on a data stack of its own (or its
+    // destination's, a named result), where it is built.
+    if (IsBytesT(t)) {
+        GoT(t, d->line);
+        if (!init) Fail(d->line, cat("internal: ", d->name, " has no initializer"));
+        auto dst = DeclStackLocal(d, forlocal);
+        GenConstruct(init, dst.s, dst.t, dst.lenlv);
+        return;
+    }
+    if (PrefVar(d)) {
+        GoT(t, d->line);
+        auto name = LocalName(d);
+        if (!init) {
+            Decl(name, "GsPref");
+            return;
+        }
+        auto x = GenPrefVal(init);
+        Decl(name, "GsPref", x);
+        return;
+    }
     auto gt = LocalT(t, d->line);
     if (!init) {
         Decl(LocalName(d), gt);
@@ -723,6 +870,34 @@ inline CodeGenGo::GoLoc CodeGenGo::AssignLoc(Node *lval, bool pointee) {
 }
 
 inline void CodeGenGo::GenAssign(Assign *a) {
+    if (a->op == T_ASSIGN) {
+        // A whole resizable: emptied (its stack's top back to its base), then
+        // its new contents constructed in place (§4.4).
+        auto lt = a->lval->exprtype;
+        if (lt && lt->kind == TY_REF && a->pointee) lt = lt->ref->sub;
+        if (lt && IsResz(lt)) {
+            auto l = GenLoc(a->lval);
+            if (a->pointee || l.t->kind == TY_REF) DerefLoc(l);
+            if (l.viaref) l = PinRz(l);
+            if (l.stk.empty()) Fail(a->line, "internal: a resizable assigned without its stack");
+            if (IsFrameObj(l.t) && !l.lv.empty()) {
+                L(Top(l.stk), " = ", FoTailHdr(l.t, l.lv), ".Base");
+                GenConstruct(a->rhs, l.stk, l.t, l.lv);
+                return;
+            }
+            L(Top(l.stk), " = ", l.addr);
+            GenConstruct(a->rhs, l.stk, l.t, l.lenlv);
+            return;
+        }
+        if (lt && IsBytesT(lt)) Unsupported(a->line, cat("assigning a value of type ", TypeText(lt)));
+    }
+    if (a->op == T_DOTASSIGN) {
+        auto l = GenLoc(a->lval);
+        if (l.ispref) {
+            L(l.lv, " = ", GenPrefVal(a->rhs));
+            return;
+        }
+    }
     auto l = AssignLoc(a->lval, a->pointee);
     auto t = l.t;
     if (a->op == T_DOTASSIGN) {
@@ -737,7 +912,7 @@ inline void CodeGenGo::GenAssign(Assign *a) {
             return;
         }
         if (Is<NullLit>(a->rhs)) {
-            L(l.lv, " = nil");
+            L(l.lv, IsFatRef(t) ? " = GsRref{}" : " = nil");
             return;
         }
         GenAny(a->rhs, GoDst { GD_LVALUE, l.lv, t });
