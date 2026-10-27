@@ -179,8 +179,17 @@ struct CodeGenGo {
     // Control cannot reach the code being emitted: it follows a statement Go
     // takes to end the flow (a return, a break or continue, a panic, a `for`
     // without a condition or a break). Go's vet reports such code, so none
-    // is emitted (L), up to where some other path joins again.
+    // of it is emitted (L), up to where another path joins again: the end of
+    // a construct whose opening line was. What the program has there is
+    // generated all the same, into text that is dropped (GenUnreached, `dry`
+    // deep), from every entry point (GenStmt, GenStmt2, GenAny, GenX) and
+    // from every construct whose first part (a condition, a scrutinee, an
+    // argument) ends the flow before the construct opens. So only a
+    // construct whose opening line was emitted closes, or joins paths again.
     bool dead = false;
+    int dry = 0;
+    bool Unreached() const { return dead && !dry; }
+    void GenUnreached(const function<void()> &gen);
 
     // Scopes mirror Go's blocks, as the C backend's mirror C's (CScope).
     enum { SC_PLAIN, SC_FN, SC_LOOP, SC_BLOCK, SC_IB, SC_STMT };

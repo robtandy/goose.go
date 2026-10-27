@@ -16,12 +16,47 @@ inline void CodeGenGo::PushSc(int kind) {
     scopes.push_back(s);
 }
 
-// Leaves the innermost scope at its end, which runs its restores where
-// control gets there.
+// Leaves the innermost scope at its end, which runs its restores (the
+// generated ones only, where control does not get there).
 inline void CodeGenGo::PopSc() {
-    if (!dead) EmitRestores(scopes.back());
+    if (Unreached()) GenUnreached([&] { EmitRestores(scopes.back()); });
+    else EmitRestores(scopes.back());
     stknext = scopes.back().stkbase;
     scopes.pop_back();
+}
+
+// Code no path reaches, which the program has where Go's flow has ended:
+// none of it is emitted, since Go's vet reports such code, but it is
+// generated all the same, into text that is dropped. The C backend emits
+// it, so what it would take of the data stacks (AllocStk, NoteStackCall)
+// is counted as the C backend counts it, and both report and reserve the
+// same stacks (--stacks). Nothing else it does reaches the code that is
+// kept: not its text, nor the labels it names or the defers it registers.
+// The names it gives its locals stay theirs, for the unreached code after
+// it in their scope, which is generated the same way; they are unique, and
+// no code that is kept is in that scope.
+inline void CodeGenGo::GenUnreached(const function<void()> &gen) {
+    struct Mark { bool usedlabel, usedbrk; size_t defers; };
+    vector<Mark> marks;
+    for (auto &s : scopes) marks.push_back({ s.usedlabel, s.usedbrk, s.defers.size() });
+    auto nscopes = scopes.size();
+    auto text = std::move(body);
+    body.clear();
+    auto saveind = ind, savenext = stknext;
+    dry++;
+    dead = false;
+    gen();
+    dry--;
+    if (scopes.size() != nscopes) Fail(Line {}, "internal: unbalanced scopes in unreached code");
+    for (size_t i = 0; i < nscopes; i++) {
+        scopes[i].usedlabel = marks[i].usedlabel;
+        scopes[i].usedbrk = marks[i].usedbrk;
+        scopes[i].defers.resize(marks[i].defers);
+    }
+    body = std::move(text);
+    ind = saveind;
+    stknext = savenext;
+    dead = true;
 }
 
 // A data stack index for the innermost scope, free again once it ends.
@@ -62,7 +97,7 @@ inline void CodeGenGo::RegisterDefer(Defer *d) {
 // own. Every exit emits the body again, so what it declares is named afresh
 // each time (CodeGen::NameScope). The body cannot leave (§6.6).
 inline void CodeGenGo::EmitDeferBody(Defer *d) {
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { EmitDeferBody(d); });
     auto names = vnames;
     PushSc(SC_PLAIN);
     L("{");
@@ -97,7 +132,8 @@ inline string CodeGenGo::UseLabel(int si, bool brk) {
 // Leaves the labeled scope at its end; its restores already ran where they
 // had to (the caller emptied them otherwise). Returns it, for PlaceLabel.
 inline CodeGenGo::GoScope CodeGenGo::PopLabeled() {
-    if (!dead) EmitRestores(scopes.back());
+    if (Unreached()) GenUnreached([&] { EmitRestores(scopes.back()); });
+    else EmitRestores(scopes.back());
     auto s = scopes.back();
     stknext = s.stkbase;
     scopes.pop_back();
@@ -121,7 +157,8 @@ inline void CodeGenGo::PlaceLabel(const GoScope &s) {
 // is its value; an inlined body's tail is a return too (exitscope).
 inline void CodeGenGo::GenBlockInner(Block *b, const GoDst &d, size_t first, int exitscope) {
     for (auto i = first; i < b->stmts.size(); ++i) GenStmt(b->stmts[i]);
-    if (!b->tail || dead) return;
+    if (!b->tail) return;
+    if (Unreached()) return GenUnreached([&] { GenBlockInner(b, d, b->stmts.size(), exitscope); });
     if (!IsVoidT(b->tail->exprtype) && d.k != GD_DISCARD) {
         if (exitscope >= 0) GenExitValue(b->tail, exitscope);
         else GenAny(b->tail, d);
@@ -145,14 +182,14 @@ inline size_t CodeGenGo::GenInlineArgs(Block *b) {
 }
 
 inline void CodeGenGo::GenStmt(Node *n) {
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenStmt(n); });
     PushSc(SC_STMT);
     GenStmt2(n);
     PopSc();
 }
 
 inline void CodeGenGo::GenStmt2(Node *n) {
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenStmt2(n); });
     switch (n->nkind) {
         case NK_VarDecl: GenVarDecl((VarDecl *)n); return;
         case NK_Assign: GenAssign((Assign *)n); return;
@@ -173,7 +210,7 @@ inline void CodeGenGo::GenBlock(Block *b, const GoDst &d) {
     // A self-call's arguments, bound in front of the base case inlined in
     // its place (optimize_basecase.h).
     auto first = GenInlineArgs(b);
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenBlock(b, d); });
     PushSc(SC_PLAIN);
     L("{");
     ind++;
@@ -188,7 +225,7 @@ inline void CodeGenGo::GenBlock(Block *b, const GoDst &d) {
 
 inline void CodeGenGo::GenIf(IfExpr *fi, const GoDst &d) {
     auto c = GenTruth(fi->cond);
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenIf(fi, d); });
     if (fi->flat) {
         // The else cannot complete normally, so the then-block's contents
         // follow it in this block (IfExpr::flat): a run of guards nests no
@@ -242,7 +279,7 @@ inline void CodeGenGo::GenMatch(MatchExpr *m, const GoDst &d) {
     }
     GoT(st, m->line);
     auto x = GenPure(m->scrutinee);
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenMatch(m, d); });
     auto first = true, alldead = true, wild = false;
     for (auto &arm : m->arms) {
         string open;
@@ -281,7 +318,7 @@ inline void CodeGenGo::GenMatch(MatchExpr *m, const GoDst &d) {
 // `block { ... }` (§6.4): a switch with only a default, which a break
 // leaves, that is a block of its own otherwise.
 inline void CodeGenGo::GenEarlyBlock(EarlyBlock *eb, const GoDst &d) {
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenEarlyBlock(eb, d); });
     OpenLabeled(SC_BLOCK);
     scopes.back().dst = d;
     LabelHere();
@@ -300,7 +337,7 @@ inline void CodeGenGo::GenEarlyBlock(EarlyBlock *eb, const GoDst &d) {
 // as a break leaves a block.
 inline void CodeGenGo::GenInlineBlock(InlineBlock *ib, const GoDst &d) {
     auto first = GenInlineArgs(ib->body);
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenInlineBlock(ib, d); });
     OpenLabeled(SC_IB);
     auto si = (int)scopes.size() - 1;
     scopes[si].ibsf = ib->sf;
@@ -327,13 +364,14 @@ inline void CodeGenGo::GenInlineBlock(InlineBlock *ib, const GoDst &d) {
 inline void CodeGenGo::GenLoopBody(Block *bodyb, size_t first) {
     for (auto i = first; i < bodyb->stmts.size(); i++) GenStmt(bodyb->stmts[i]);
     if (bodyb->tail) GenStmt(bodyb->tail);
-    if (!dead) EmitRestores(scopes.back());
+    if (Unreached()) GenUnreached([&] { EmitRestores(scopes.back()); });
+    else EmitRestores(scopes.back());
     // Restored by every path out of an iteration already.
     scopes.back().defers.clear();
 }
 
 inline void CodeGenGo::GenWhile(While *w) {
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenWhile(w); });
     // The `while v > 0 { v--; ... }` of a countdown loop (While::countdown)
     // is the counted loop it is as written.
     OpenLabeled(SC_LOOP);
@@ -342,7 +380,10 @@ inline void CodeGenGo::GenWhile(While *w) {
     auto incond = !HasStmts(w->cond);
     string c;
     if (incond) c = GenTruth(w->cond);
-    if (dead) { PopLabeled(); return; }
+    if (Unreached()) {   // Not without statements; but nothing opens unreached.
+        PopLabeled();
+        return GenUnreached([&] { GenWhile(w); });
+    }
     LabelHere();
     L(incond ? cat("for ", CondText(c), " {") : string("for {"));
     ind++;
@@ -350,23 +391,28 @@ inline void CodeGenGo::GenWhile(While *w) {
         PushSc(SC_PLAIN);
         c = GenTruth(w->cond);
         PopSc();
-        L("if !", c, " {");
-        ind++;
-        L("break ", UseLabel(si, true));
-        ind--;
-        LS("}");
-        dead = false;
+        // A condition that ends the flow itself, with a break or a return
+        // in it, leaves no test to make, and the body unreached.
+        if (!dead) {
+            L("if !", c, " {");
+            ind++;
+            L("break ", UseLabel(si, true));
+            ind--;
+            LS("}");
+        }
     }
     GenLoopBody(w->body);
     ind--;
     LS("}");
     auto s = PopLabeled();
     PlaceLabel(s);
-    dead = false;
+    // Go's flow goes on past a `for` with a condition, and past one without
+    // only where a break leaves it.
+    dead = !incond && !s.usedbrk;
 }
 
 inline void CodeGenGo::GenLoop(LoopExpr *lp, const GoDst &d) {
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenLoop(lp, d); });
     OpenLabeled(SC_LOOP);
     scopes.back().dst = d;
     LabelHere();
@@ -394,7 +440,7 @@ inline void CodeGenGo::GenFor(ForLoop *f) {
     if (r) lov = Snapshot(ct, Coerce(GenX(r->lo), r->lo->exprtype, ct, f->line));
     auto hi = r ? r->hi : f->iter;
     auto hiv = Snapshot(ct, Coerce(GenX(hi), hi->exprtype, ct, f->line));
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenFor(f); });
     auto vt = f->vdef->type;
     GoT(vt, f->line);
     auto wide = !SameGoT(vt, ct);
@@ -432,7 +478,8 @@ inline void CodeGenGo::GenBreak(Break *b) {
     }
     if (si < 0) Fail(b->line, "internal: break outside a loop or block");
     if (b->val) GenExitValue(b->val, si);
-    if (dead) return;
+    // A value that ends the flow itself leaves the break unreached.
+    if (Unreached()) return GenUnreached([&] { GenBreak(b); });
     EmitExitRestores(si);
     L("break ", UseLabel(si, true));
     dead = true;
@@ -458,7 +505,7 @@ inline void CodeGenGo::GenReturn(Return *r) {
             // A function with several results is never inlined (Optimizer::Scan).
             if (r->vals.size() > 1) Fail(r->line, "internal: an inlined body with several results");
             if (!r->vals.empty()) GenExitValue(r->vals[0], i);
-            if (dead) return;
+            if (Unreached()) return GenUnreached([&] { GenReturn(r); });
             EmitExitRestores(i);
             L("break ", UseLabel(i, true));
             dead = true;
@@ -480,6 +527,7 @@ inline void CodeGenGo::GenExitValue(Node *val, int si) {
 }
 
 inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
+    if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
     auto sp = curspec;
     // A return passes through the exits of every scope, whose `defer`
     // bodies run after its values are taken.
@@ -495,19 +543,20 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
         for (size_t i = 0; i < sp->rets.size(); i++)
             same = same && SameGoT(c->spec->rets[i], sp->rets[i]);
         auto call = SpecCallX(c, c->spec);
-        if (dead) return;
+        if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
         if (same && !restores) {
             L("return ", call);
             dead = true;
             return;
         }
-        string names;
+        string names, marks;
         for (size_t i = 0; i < sp->rets.size(); i++) {
             auto t = T();
             rv.push_back(Coerce(t, c->spec->rets[i], sp->rets[i], c->line));
             Append(names, i ? ", " : "", t);
+            Append(marks, i ? "," : "", t);
         }
-        L(names, " := ", call);
+        L(names, " := ", call, DECLMARK, marks);
     } else {
         if (vals.size() != sp->rets.size()) Fail(sp->sf->line, "internal: return value count");
         for (size_t i = 0; i < vals.size(); i++) {
@@ -518,7 +567,7 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
             rv.push_back(x);
         }
     }
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
     EmitExitRestores(0);
     string list;
     for (size_t i = 0; i < rv.size(); i++) Append(list, i ? ", " : "", rv[i]);

@@ -396,7 +396,10 @@ inline string CodeGenGo::ShiftX(TType op, TypeExpr *t, const string &l, const st
 inline string CodeGenGo::GenX(Node *n) {
     // Past a statement that ends the flow nothing is emitted, and the value
     // is never used.
-    if (dead) return "0";
+    if (Unreached()) {
+        GenUnreached([&] { GenX(n); });
+        return "0";
+    }
     switch (n->nkind) {
         case NK_IntLit: {
             auto i = (IntLit *)n;
@@ -488,7 +491,10 @@ inline string CodeGenGo::GenBinary(Binary *b) {
         // left one leaves the value open.
         auto t = T();
         Decl(t, "bool", l);
-        if (dead) return t;
+        if (Unreached()) {
+            GenUnreached([&] { GenTruth(b->right); });
+            return t;
+        }
         L("if ", op == T_ANDAND ? t : cat("!", t), " {");
         ind++;
         PushSc(SC_PLAIN);
@@ -589,7 +595,7 @@ inline string CodeGenGo::CtlValX(Node *n) {
 }
 
 inline void CodeGenGo::GenAny(Node *n, const GoDst &d) {
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenAny(n, d); });
     switch (n->nkind) {
         case NK_Block: GenBlock((Block *)n, d); return;
         case NK_IfExpr: GenIf((IfExpr *)n, d); return;

@@ -71,7 +71,7 @@ inline string CodeGenGo::GenCall(Call *c) {
     if (sp->rets.size() > 1) {
         // A call in an ordinary value context yields its first result.
         GoT(sp->rets[0], c->line);
-        L(FirstResult(t, sp->rets.size()), " := ", call);
+        L(FirstResult(t, sp->rets.size()), " := ", call, DECLMARK, t);
     } else {
         Decl(t, GoT(sp->rets[0], c->line), call);
     }
@@ -94,7 +94,7 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
     auto want = d.t ? d.t : c->exprtype;
     if (sp->rets.size() > 1) {
         auto t = T();
-        L(FirstResult(t, sp->rets.size()), " := ", call);
+        L(FirstResult(t, sp->rets.size()), " := ", call, DECLMARK, t);
         L(d.s, " = ", Coerce(t, sp->rets[0], want, c->line));
         return;
     }
@@ -136,14 +136,14 @@ inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
 inline void CodeGenGo::GenFvCall(Call *c, const GoDst &d) {
     auto et = c->fvbody->exprtype;
     auto wantsval = !IsVoidT(et) && d.k != GD_DISCARD;
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { GenFvCall(c, d); });
     PushSc(SC_PLAIN);
     L("{");
     ind++;
     for (size_t i = 0; i < c->fvparams.size(); i++)
         BindLocal(c->fvparams[i], i < c->args.size() ? c->args[i] : nullptr);
     for (auto st : c->fvbody->stmts) GenStmt(st);
-    if (c->fvbody->tail && !dead) {
+    if (c->fvbody->tail) {
         if (wantsval) GenAny(c->fvbody->tail, GoDst { GD_LVALUE, d.s, d.t ? d.t : c->exprtype });
         else GenAny(c->fvbody->tail, GoDst {});
     }
@@ -172,7 +172,7 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
         case B_PRINT: EmitPrint(c); return;
         case B_ASSERT: {
             auto x = GenTruth(an[0]);
-            if (dead) return;
+            if (Unreached()) return GenUnreached([&] { GenBuiltin(c, d); });
             L("if !", x, " {");
             ind++;
             L("GsAbort(GsEAssert, ", LocArgs(ln), ")");
@@ -218,13 +218,15 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
 // write (§3.7), as the C backend's does (TempBuilder). The bytes are written
 // at the stack's top through a cursor of the line's own: nothing else uses
 // that stack while it is rendered, since a call in an argument is handed the
-// indices above it.
+// indices above it. An argument that ends the flow (a return out of an
+// inlined body, say) leaves the cursor declared and the rest of the line
+// unreached, which FinishBody gives a use of its own.
 inline void CodeGenGo::EmitPrint(Call *c) {
-    if (dead) return;
+    if (Unreached()) return GenUnreached([&] { EmitPrint(c); });
     auto stk = AllocStk();
     auto base = T(), cur = T();
-    L(base, " := ", stk);
-    L(cur, " := ", base);
+    Decl(base, "unsafe.Pointer", stk);
+    Decl(cur, "unsafe.Pointer", base);
     for (auto a : c->ArgNodes()) RenderInto(cur, a, c);
     L(cur, " = gsPutStr(", cur, ", \"\\n\")");
     L("gsOut(", base, ", ", cur, ")");

@@ -111,6 +111,7 @@ inline void CodeGenGo::ResetFnState() {
     fvptr.clear();
     scopes.clear();
     dead = false;
+    dry = 0;
 }
 
 // The identifiers a line reads, into uses: every one but the declared names
@@ -201,7 +202,7 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp) {
     PushSc(SC_FN);
     auto sig = Signature(sp);
     for (auto st : sp->body->stmts) GenStmt(st);
-    if (auto tail = sp->body->tail; tail && !dead) {
+    if (auto tail = sp->body->tail) {
         auto asvalue = !sp->rets.empty() && !IsVoidT(tail->exprtype);
         if (auto fi = Is<IfExpr>(tail); fi && !fi->elseb) asvalue = false;
         if (asvalue) {
@@ -334,8 +335,9 @@ inline void CodeGenGo::EmitGlobalInit() {
             if (gstatic.count(d) || !usedglobals.count(d)) continue;
             GenAny(g->inits[i], GoDst { GD_LVALUE, gnames[d], d->type });
         }
+        // An initializer that never completes (a `loop {}`) leaves the ones
+        // after it unreached, for Go as for the program.
         PopSc();
-        dead = false;
     }
     PopSc();
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
