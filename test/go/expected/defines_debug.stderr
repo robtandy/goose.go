@@ -1,0 +1,1 @@
+goose runtime error: integer overflow (debug): 127 + 1 at i8 (test/go/programs/defines_debug.goose:8)

@@ -972,7 +972,8 @@ bool ParseSize(string s, uint64_t &out) {
 }
 
 // The value of a runtime configuration macro as runtime.h spells its
-// defaults and a -D may: an integer with C suffixes, or `(N << M)`.
+// defaults and a -D may: an integer as C writes one (decimal, 0x hex, 0b
+// binary or octal, with u and l suffixes), or `(N << M)` of two.
 bool ParseConfigValue(string s, uint64_t &out) {
     auto strip = [](string &t) {
         while (!t.empty() && isspace((unsigned char)t.back())) t.pop_back();
@@ -990,9 +991,20 @@ bool ParseConfigValue(string s, uint64_t &out) {
         while (!t.empty() && (tolower((unsigned char)t.back()) == 'u' ||
                               tolower((unsigned char)t.back()) == 'l'))
             t.pop_back();
-        if (t.empty() || t.size() > 19 || t.find_first_not_of("0123456789") != string::npos)
-            return false;
-        v = strtoull(t.c_str(), nullptr, 10);
+        uint64_t base = 10;
+        size_t at = 0;
+        if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) base = 16, at = 2;
+        else if (t.size() > 2 && t[0] == '0' && (t[1] == 'b' || t[1] == 'B')) base = 2, at = 2;
+        else if (t.size() > 1 && t[0] == '0') base = 8, at = 1;
+        if (at >= t.size()) return false;
+        uint64_t n = 0;
+        for (auto i = at; i < t.size(); i++) {
+            auto c = (unsigned char)t[i];
+            uint64_t d = isdigit(c) ? c - '0' : isxdigit(c) ? tolower(c) - 'a' + 10 : base;
+            if (d >= base || n > (UINT64_MAX - d) / base) return false;
+            n = n * base + d;
+        }
+        v = n;
         return true;
     };
     if (auto sh = s.find("<<"); sh != string::npos) {
@@ -1740,6 +1752,21 @@ int Main(int argc, char **argv) {
         if (gotarget) {
             // The Go backend's runtime configuration is the C one's
             // (runtime.h, --stack-reserve and -D); the other -D are C's.
+            // No C compiler reads these for it: a value the compiler cannot
+            // read stops the compile, where the C backend's report keeps
+            // the default (StackConfigOf).
+            for (auto &d : cdefines) {
+                auto eq = d.find('=');
+                auto name = d.substr(0, eq);
+                uint64_t v;
+                if (eq == string::npos || ParseConfigValue(d.substr(eq + 1), v)) continue;
+                for (auto rt : { "GS_DEBUG", "GS_STACK_RESERVE", "GS_STACK_GAP", "GS_STACK_BUDGET",
+                                 "GS_MAX_STACKS" })
+                    if (name == rt)
+                        throw CompileError { cat("-D", d, ": --target=go reads ", name,
+                                                 " as an integer constant, as 65536, 0x10000 or "
+                                                 "(1 << 16)") };
+            }
             auto stackcfg = StackConfigOf(cdefines);
             GoOptions go;
             go.library = golib;
@@ -1749,7 +1776,7 @@ int Main(int argc, char **argv) {
                 auto eq = d.find('=');
                 if (d.substr(0, eq) != "GS_DEBUG") continue;
                 uint64_t v = 1;
-                if (eq != string::npos && !ParseConfigValue(d.substr(eq + 1), v)) v = 1;
+                if (eq != string::npos) ParseConfigValue(d.substr(eq + 1), v);
                 go.debug = v != 0;
             }
             go.stacks = stackcfg;

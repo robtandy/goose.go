@@ -529,7 +529,10 @@ supported, 64-bit only. The design is in [DESIGN.md](../DESIGN.md).
 * `--debug` (or `-DGS_DEBUG=1`) turns on the overflow and `as` range checks,
   and `--stack-reserve`, `-DGS_STACK_RESERVE` and `-DGS_STACK_GAP` size the
   data stacks, as they do for C. The other `-D` macros are C's, and do not
-  reach the Go.
+  reach the Go. No C compiler reads these for the Go: the compiler takes
+  each value as an integer constant as C writes one (`65536`, `0x10000`,
+  `0200000`, with `u` and `l` suffixes) or `(N << M)` of two, and a value it
+  cannot read stops the compile.
 
 The Go toolchain is `go` on `PATH`, or the one `GOOSE_GO` names.
 

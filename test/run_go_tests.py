@@ -698,6 +698,21 @@ class Runner:
             ok = r.returncode == 0 and \
                 tc.decode(r.stdout) == "library global initialized\nhost main ran\n"
         check("a Go program imports a --library package, whose init runs no fn main", ok, detail)
+        # The runtime's configuration in the forms C reads a -D in: the Go is
+        # sized by the value itself, and both reports give it. One the
+        # compiler cannot read stops a Go compile, which no C compiler reads.
+        code, o, e = self.goose("--target=go", "-DGS_STACK_RESERVE=0x10000", "-o", gofile, hello)
+        text = gofile.read_text(encoding="utf-8") if gofile.exists() else ""
+        check("-DGS_STACK_RESERVE=0x10000 sizes the Go's stacks",
+              code == 0 and "\n\tgsStackReserve = 65536\n" in text, o + e)
+        for target in ([], ["--target=go"]):
+            code, o, e = self.goose(*target, "--check", "--stacks", "-DGS_STACK_RESERVE=(1ull << 16)",
+                                    hello)
+            check(f"--stacks {' '.join(target + ['-DGS_STACK_RESERVE=(1ull << 16)'])}",
+                  code == 0 and (o + e).startswith("data stacks: 64 KB reserved per stack"), o + e)
+        code, o, e = self.goose("--target=go", "-DGS_STACK_RESERVE=lots", hello)
+        check("--target=go refuses a -DGS_STACK_RESERVE it cannot read",
+              code == 1 and "reads GS_STACK_RESERVE as an integer constant" in e, f"exit {code}\n{o}{e}")
         code, o, e = self.goose("--target=rust", hello)
         check("--target=rust is refused", code == 1 and "--target takes c or go" in e, o + e)
         code, o, e = self.goose("--go-package", "geese", "-o", self.work / "cli.c", hello)
