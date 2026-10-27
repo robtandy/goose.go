@@ -65,6 +65,7 @@ inline string CodeGenGo::StackArgs(FnSpec *sp, Line ln) {
 // declared parameters, then the free variables. An argument read before a
 // later one that runs statements is taken into a temporary first (§2).
 inline string CodeGenGo::SpecCallX(Call *c, FnSpec *sp) {
+    if (sp->sf->isextern) return ExternCallX(c, sp);
     if (!sinfo.count(sp)) Fail(c->line, cat("internal: no Go function for ", sp->sf->name));
     auto &ki = sinfo[sp];
     auto an = CallArgNodes(c, sp->params.size());
@@ -80,7 +81,55 @@ inline string CodeGenGo::SpecCallX(Call *c, FnSpec *sp) {
     for (auto fv : ki.freevars) args.push_back(FreeVarArg(c->FreeVarArg(fv)));
     auto list = StackArgs(sp, c->line);
     for (auto &a : args) Append(list, list.empty() ? "" : ", ", a);
-    return cat(ki.name, "(", list, ")");
+    auto call = cat(ki.name, "(", list, ")");
+    if (!ki.hasrf) return call;
+    // A long-distance return can come back through it: the call is a
+    // statement of its own, checked after (EmitRfCheck), its results in
+    // temporaries -- what this gives, "" for none.
+    string names, marks;
+    for (auto rt : sp->rets) {
+        auto t = T();
+        NoteType(t, GoT(rt, c->line));
+        Append(names, names.empty() ? "" : ", ", t);
+        Append(marks, marks.empty() ? "" : ",", t);
+    }
+    if (names.empty()) L(call);
+    else L(names, " := ", call, DECLMARK, marks);
+    EmitRfCheck(sp);
+    return names;
+}
+
+// A call of an extern fn (§7.10): the C functions std binds that the Go
+// runtime has an equivalent of, its arguments evaluated in order as for
+// any call (CodeGen::EmitExternCall). Any other is not supported yet.
+inline string CodeGenGo::ExternCallX(Call *c, FnSpec *sp) {
+    auto &name = sp->sf->cname;
+    auto an = CallArgNodes(c, sp->argtypes.size());
+    auto known = sp->sf->dylib.empty() &&
+                 (name == "gs_popcount" || name == "gs_clz" || name == "gs_ctz" || name == "gs_find_any" ||
+                  name == "gs_find_pair" || name == "frexp" || name == "ldexp");
+    if (!known) Unsupported(c->line, cat("a call to the extern fn ", sp->sf->name, " (C's ", name, ")"));
+    vector<bool> later(an.size() + 1, false);
+    for (size_t i = an.size(); i-- > 0;) later[i] = later[i + 1] || HasStmts(an[i]);
+    vector<string> a;
+    for (size_t i = 0; i < an.size(); i++) {
+        auto pt = sp->argtypes[i];
+        auto x = Coerce(GenX(an[i]), an[i]->exprtype, pt, an[i]->line);
+        if (later[i + 1] && !IsGoConst(x)) x = Snapshot(pt, x);
+        a.push_back(x);
+    }
+    // popcount, clz and ctz count 64 for zero, as Go's math/bits does.
+    if (name == "gs_popcount" || name == "gs_clz" || name == "gs_ctz") {
+        usesbits = true;
+        auto fn = name == "gs_popcount" ? "OnesCount64" : name == "gs_clz" ? "LeadingZeros64" : "TrailingZeros64";
+        return cat("int64(bits.", fn, "(", a[0], "))");
+    }
+    if (name == "gs_find_any") return cat("gsFindAny(", a[0], ", ", AddrOfRef(sp->argtypes[1], a[1]), ")");
+    if (name == "gs_find_pair")
+        return cat("gsFindPair(", a[0], ", ", AddrOfRef(sp->argtypes[1], a[1]), ", ", a[2], ", ",
+                   AddrOfRef(sp->argtypes[3], a[3]), ")");
+    if (name == "frexp") return cat("gsFrexp(", a[0], ", ", a[1], ")");
+    return cat("math.Ldexp(", a[0], ", int(", a[1], "))");
 }
 
 // A call of a specialization by the full calling convention (C.3,
@@ -217,6 +266,8 @@ inline vector<string> CodeGenGo::EmitSpecCall(Call *c, FnSpec *sp, const GoDst &
     if (names.empty()) L(call);
     else L(names, " := ", call, DECLMARK, marks);
     for (auto &[lv, t] : assigns) L(lv, " = ", t);
+    // A long-distance return in flight leaves dummies, nothing to adjust.
+    if (HasRf(sp)) EmitRfCheck(sp);
     if (!reprefixbase.empty()) EmitReprefix(sp, reprefix, reprefixbase, reprefixcnt);
     // The value form arrived as [len][elems]: its prefix slid out, the count
     // reported.
@@ -307,13 +358,13 @@ inline vector<string> CodeGenGo::GenCallVals(Call *c, const GoDst &d0, vector<Go
         return GenDispatch(c);
     }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
-    if (c->spec->sf->isextern) Unsupported(c->line, "a call to an extern fn");
+    if (c->spec->sf->isextern && !PlainSig(c->spec)) Unsupported(c->line, "a call to an extern fn");
     if (PlainSig(c->spec)) {
         auto sp = c->spec;
         auto call = SpecCallX(c, sp);
         vector<string> res;
         if (sp->rets.empty()) {
-            L(call);
+            if (!call.empty()) L(call);
             return res;
         }
         string names, marks;
@@ -457,6 +508,7 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
                 for (size_t i = 0; i < res.size(); i++) Append(names, i ? ", " : "", res[i]);
                 L(names, " = ", call);
             }
+            if (ki.hasrf) EmitRfCheck(sp);
             PopSc();
             ind--;
         }
@@ -485,7 +537,7 @@ inline string CodeGenGo::GenCall(Call *c) {
     }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
     auto sp = c->spec;
-    if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");
+    if (sp->sf->isextern && !PlainSig(sp)) Unsupported(c->line, "a call to an extern fn");
     if (sp->rets.empty()) Fail(c->line, "internal: a call without results as a value");
     if (!PlainSig(sp)) {
         auto rets = EmitSpecCall(c, sp, GoDst {}, nullptr);
@@ -531,7 +583,7 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
     }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
     auto sp = c->spec;
-    if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");
+    if (sp->sf->isextern && !PlainSig(sp)) Unsupported(c->line, "a call to an extern fn");
     if (!PlainSig(sp)) {
         auto rets = EmitSpecCall(c, sp, d, nullptr);
         if (d.k == GD_DISCARD || rets.empty() || Unreached()) return;
@@ -551,9 +603,10 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
         return;
     }
     auto call = SpecCallX(c, sp);
-    // A call's results may go unused, as an expression statement.
+    // A call's results may go unused, as an expression statement; a call
+    // checked for a long-distance return has run already.
     if (d.k == GD_DISCARD || sp->rets.empty()) {
-        L(call);
+        if (!HasRf(sp)) L(call);
         return;
     }
     auto want = d.t ? d.t : c->exprtype;

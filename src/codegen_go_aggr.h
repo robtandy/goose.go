@@ -1176,10 +1176,14 @@ inline CodeGenGo::FnState CodeGenGo::SaveFnState() {
     s.dstcounts = std::move(dstcounts);
     s.ltypes = std::move(ltypes);
     s.ptypes = std::move(ptypes);
-    s.curnres = curnres;
+    s.fdstsaves = std::move(fdstsaves);
+    s.curzeros = std::move(curzeros);
+    s.curgorets = std::move(curgorets);
+    fdstsaves.clear();
+    curzeros.clear();
+    curgorets.clear();
     ltypes.clear();
     ptypes.clear();
-    curnres = 0;
     vstk.clear();
     vpool.clear();
     nrvo.clear();
@@ -1224,7 +1228,9 @@ inline void CodeGenGo::RestoreFnState(FnState &s) {
     dstcounts = std::move(s.dstcounts);
     ltypes = std::move(s.ltypes);
     ptypes = std::move(s.ptypes);
-    curnres = s.curnres;
+    fdstsaves = std::move(s.fdstsaves);
+    curzeros = std::move(s.curzeros);
+    curgorets = std::move(s.curgorets);
 }
 
 }  // namespace goose

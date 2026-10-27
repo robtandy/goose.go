@@ -1785,6 +1785,41 @@ func gsIsLE() bool {
 	x := uint16(1)
 	return *(*byte)(unsafe.Pointer(&x)) == 1
 }
+
+// ---------------------------------------------------------------------------
+// The C functions std binds as extern fns (runtime_ext.h), where Go's own
+// library has no equivalent. A ByteSet's members, a bool[256], lead it.
+
+// gsFindAny is std's find_any: the first i with s[i] in set, -1 if none
+// (gs_find_any).
+func gsFindAny(s GsSlice, set unsafe.Pointer) int64 {
+	m := (*[256]bool)(set)
+	for i := int64(0); i < s.Len; i++ {
+		if m[*(*byte)(unsafe.Add(s.Data, i))] {
+			return i
+		}
+	}
+	return -1
+}
+
+// gsFindPair is std's byte_set_pair: the first i with s[i] in a and
+// s[i+d] in b, of those with i + d < s.Len; -1 if none (gs_find_pair).
+func gsFindPair(s GsSlice, a unsafe.Pointer, d int64, b unsafe.Pointer) int64 {
+	ma, mb := (*[256]bool)(a), (*[256]bool)(b)
+	for i := int64(0); i+d < s.Len; i++ {
+		if ma[*(*byte)(unsafe.Add(s.Data, i))] && mb[*(*byte)(unsafe.Add(s.Data, i+d))] {
+			return i
+		}
+	}
+	return -1
+}
+
+// gsFrexp is C's frexp: the fraction, its exponent through e.
+func gsFrexp(x float64, e *int32) float64 {
+	f, n := math.Frexp(x)
+	*e = int32(n)
+	return f
+}
 )GSGO",
 };
 

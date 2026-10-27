@@ -559,7 +559,30 @@ struct CodeGenGo {
         vector<VarDef *> freevars;
         bool needssp = false;
         bool needsgs = false;
+        // A long-distance return (§7.9) can come back through a call of it:
+        // its callers check for one in flight (EmitRfCheck).
+        bool hasrf = false;
     };
+    // Long-distance returns (`return ... from`, a block's return out of the
+    // functions it is handed to, §7.9), as the C backend has them
+    // (CodeGen::GenFromReturn): the return site puts the values in its
+    // target's channels (gsLret_/gsFdst_/gsFval_<id>_<i>, package
+    // variables: the Go backend runs one thread program) and sets gsRf to
+    // the target's number; every function on the way back returns at once
+    // with dummy values, until the target's own check after its call takes
+    // the values and returns them. A target with a non-fixed result keeps
+    // its destination stack in its channel while it runs (fdstsaves).
+    unordered_map<FnSpec *, int> fromids;
+    set<FnSpec *> fromemitted;
+    string rfdecls;
+    vector<string> fdstsaves;
+    vector<string> curzeros;            // A dummy value per Go result of the function emitted.
+    vector<string> curgorets;           // The Go type of each.
+    bool HasRf(FnSpec *sp) { auto it = sinfo.find(sp); return it != sinfo.end() && it->second.hasrf; }
+    void EnsureFromChannels(FnSpec *t);
+    void GenFromReturn(Return *r);
+    void PropagateReturn(const string &rfval);
+    void EmitRfCheck(FnSpec *callee);
     unordered_map<FnSpec *, SpecInfo> sinfo;
     vector<FnSpec *> livespecs;
 
@@ -685,7 +708,7 @@ struct CodeGenGo {
         vector<string> dsttop0, dstcounts;
         unordered_map<string, string> ltypes;
         vector<pair<string, string>> ptypes;
-        int curnres = 0;
+        vector<string> fdstsaves, curzeros, curgorets;
     };
     FnState SaveFnState();
     void RestoreFnState(FnState &s);
@@ -725,7 +748,6 @@ struct CodeGenGo {
     // body is reached, which gives the frame back as a return does.
     unordered_map<string, string> ltypes;
     vector<pair<string, string>> ptypes;
-    int curnres = 0;                    // The Go results of the function emitted.
     // The Go types of the fixed-size values of more than NATIVE_VALUE_LIMIT
     // bytes a recursive cycle's locals hold: in the frame too, as C would
     // keep them off its native stack were they outside a cycle.
@@ -844,6 +866,8 @@ struct CodeGenGo {
     bool PlainSig(FnSpec *sp);
     string StackArgs(FnSpec *sp, Line ln);
     string SpecCallX(Call *c, FnSpec *sp);
+    string ExternCallX(Call *c, FnSpec *sp);
+    bool usesbits = false;   // A call needs math/bits (ExternCallX).
     vector<string> EmitSpecCall(Call *c, FnSpec *sp, const GoDst &d0, vector<GoDst> *alldst);
     bool NeedsReprefix(const GoDst &d, TypeExpr *rt);
     void EmitSlidePrefix(const string &base, IntStorage ls, const string &stk, const string &lenlv);
@@ -875,7 +899,8 @@ struct CodeGenGo {
     string ParamT(TypeExpr *t, Line ln);
     string Signature(FnSpec *sp);
     void ResetFnState();
-    string FinishBody(const string &b, bool frames = false, int nres = 0, bool *framed = nullptr);
+    string FinishBody(const string &b, bool frames = false, const vector<string> &rtypes = {},
+                      bool *framed = nullptr);
     void EmitSpec(FnSpec *sp, bool er = false);
     // Globals initialized at their declaration, which gsInitGlobals skips,
     // and those the program can tell are there (FindUsedGlobals).

@@ -28,6 +28,9 @@ inline void CodeGenGo::CollectSpecs() {
     for (auto sp : livespecs) {
         specnum[sp] = (int)numspec.size();
         numspec.push_back(sp);
+        sinfo[sp].hasrf = !sp->needs.empty();
+        for (auto t : sp->needs)
+            if (!fromids.count(t)) fromids[t] = (int)fromids.size() + 1;
     }
     for (auto sp : livespecs) {
         auto &si = sinfo[sp];
@@ -238,6 +241,8 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
     }
     string rets;
     auto nrets = 0;
+    curzeros.clear();
+    curgorets.clear();
     for (size_t i = 0; i < sp->rets.size(); i++) {
         auto rt = sp->rets[i];
         if (IsBytesT(rt)) {
@@ -246,10 +251,15 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
             // The element-run twin returns its run's count.
             if (emiter && i == 0) {
                 Append(rets, nrets++ ? ", " : "", "int64");
+                curzeros.push_back("0");
+                curgorets.push_back("int64");
                 continue;
             }
             if (!IsResz(rt)) continue;
-            Append(rets, nrets++ ? ", " : "", IsFrameObj(rt) ? RzGoT(rt, sp->sf->line) : "int64");
+            auto gt = IsFrameObj(rt) ? RzGoT(rt, sp->sf->line) : string("int64");
+            Append(rets, nrets++ ? ", " : "", gt);
+            curzeros.push_back(IsFrameObj(rt) ? cat(gt, "{}") : string("0"));
+            curgorets.push_back(gt);
             continue;
         }
         // A result holding relative references is built where it is
@@ -260,8 +270,9 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
             Unsupported(sp->sf->line, cat("a function result holding relative references (",
                                           TypeText(rt), ")"));
         Append(rets, nrets++ ? ", " : "", ParamT(rt, sp->sf->line));
+        curzeros.push_back(ZeroOf(rt, sp->sf->line));
+        curgorets.push_back(ParamT(rt, sp->sf->line));
     }
-    curnres = nrets;
     if (nrets > 1) rets = cat("(", rets, ")");
     return cat("func ", emiter ? ernames[sp] : si.name, "(", params, ")", rets.empty() ? "" : " ", rets);
 }
@@ -271,7 +282,8 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
 inline string CodeGenGo::EnsureEr(FnSpec *sp) {
     if (auto it = ernames.find(sp); it != ernames.end()) return it->second;
     auto rt = sp->rets.size() == 1 ? sp->rets[0] : nullptr;
-    auto ok = rt && rt->kind == TY_ARRAY && rt->arr->akind == A_VAR && sp->body && sinfo.count(sp);
+    auto ok = rt && rt->kind == TY_ARRAY && rt->arr->akind == A_VAR && sp->body && sinfo.count(sp) &&
+              !fromids.count(sp);
     if (!ok) return ernames[sp] = "";
     auto name = Unique(cat(sinfo[sp].name, "_er"));
     ernames[sp] = name;
@@ -299,7 +311,9 @@ inline void CodeGenGo::ResetFnState() {
     dstcounts.clear();
     ltypes.clear();
     ptypes.clear();
-    curnres = 0;
+    fdstsaves.clear();
+    curzeros.clear();
+    curgorets.clear();
 }
 
 // The identifiers a line reads, into uses: every one but the declared names
@@ -429,8 +443,9 @@ static string GoRename(string_view s, const unordered_map<string, pair<string, s
 // the frame is taken as the body starts, its slots' offsets constants Go
 // works out from their types, and given back at every return (the values
 // returned read first) and where the body's end is reached (FRAMEEND).
-// `nres` is the function's count of Go results; `framed` reports a frame.
-inline string CodeGenGo::FinishBody(const string &b, bool frames, int nres, bool *framed) {
+// `rtypes` are the function's Go result types; `framed` reports a frame.
+inline string CodeGenGo::FinishBody(const string &b, bool frames, const vector<string> &rtypes,
+                                    bool *framed) {
     unordered_map<string, int> uses;
     unordered_set<string> addressed;
     vector<string_view> lines;
@@ -552,14 +567,19 @@ inline string CodeGenGo::FinishBody(const string &b, bool frames, int nres, bool
             if (done.empty()) {
                 auto rc = GoRename(body, ren);
                 if (rc == "return" || rc.compare(0, 7, "return ") == 0) {
-                    // The values first, then the frame given back.
-                    if (rc == "return" || nres == 0) {
+                    // The values first, into temporaries of the results'
+                    // types, then the frame given back.
+                    if (rc == "return" || rtypes.empty()) {
                         Append(done, indent, "gs.Frame = gs_fr\n", indent, rc, "\n");
                     } else {
                         string rs;
-                        for (int i = 0; i < nres; i++) Append(rs, i ? ", " : "", "gs_r", i);
-                        Append(done, indent, "{\n", indent, "\t", rs, " := ", rc.substr(7), "\n", indent,
-                               "\tgs.Frame = gs_fr\n", indent, "\treturn ", rs, "\n", indent, "}\n");
+                        Append(done, indent, "{\n");
+                        for (size_t i = 0; i < rtypes.size(); i++) {
+                            Append(rs, i ? ", " : "", "gs_r", i);
+                            Append(done, indent, "\tvar gs_r", i, " ", rtypes[i], "\n");
+                        }
+                        Append(done, indent, "\t", rs, " = ", rc.substr(7), "\n", indent, "\tgs.Frame = gs_fr\n",
+                               indent, "\treturn ", rs, "\n", indent, "}\n");
                     }
                 } else {
                     Append(done, indent, rc, "\n");
@@ -600,6 +620,19 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
     // In the element-run form a named result is not built at the
     // destination: the copy at the return is the cost of the run (§7.3).
     if (!er) DetectNrvo(sp);
+    if (fromids.count(sp)) {
+        // A long-distance return's target: its non-fixed results' channels
+        // name its destinations while it runs, for the values in flight.
+        EnsureFromChannels(sp);
+        auto tid = fromids[sp];
+        for (size_t i = 0; i < sp->rets.size(); i++) {
+            if (!IsBytesT(sp->rets[i])) continue;
+            auto sav = T();
+            Decl(sav, "int64", cat("gsFdst_", tid, "_", i));
+            L("gsFdst_", tid, "_", i, " = gs_dst", i);
+            fdstsaves.push_back(cat("gsFdst_", tid, "_", i, " = ", sav));
+        }
+    }
     for (auto st : sp->body->stmts) GenStmt(st);
     if (auto tail = sp->body->tail) {
         auto asvalue = !sp->rets.empty() && !IsVoidT(tail->exprtype);
@@ -624,7 +657,7 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
         Fail(sp->sf->line, cat("internal: ", curinfo->name, " uses data stacks without gs_sp"));
     stackown[sp] = std::max(stackown[sp], stkmax);
     auto framed = false;
-    auto fb = FinishBody(body, true, curnres, &framed);
+    auto fb = FinishBody(body, true, curgorets, &framed);
     if (framed) hasframe.insert(sp);
     Append(code, "// ", sp->sf->qname, ", line ", sp->sf->line.line, er ? ", its element-run twin" : "", "\n",
            sig, " {\n", fb, "}\n\n");
@@ -815,7 +848,7 @@ inline void CodeGenGo::EmitGlobalInit() {
     L(FRAMEEND);
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
     Append(code, "// The globals' initializers, in declaration order (§11.1).\n"
-                 "func gsInitGlobals(gs *GsStackBlock) {\n\t_ = gs\n", FinishBody(body, true, 0), "}\n\n");
+                 "func gsInitGlobals(gs *GsStackBlock) {\n\t_ = gs\n", FinishBody(body, true), "}\n\n");
 }
 
 // A global's dedicated stack, and its pool's freelist's, set up where its
@@ -947,7 +980,7 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "// keywords and of the runtime's gs and Gs names; a namespaced name ns::x is\n"
                    "// ns_x_g followed by the namespace's length.\n\n"
                    "package ", opts.package, "\n\n"
-                   "import (\n\t\"math\"\n\t\"os\"\n",
+                   "import (\n\t\"math\"\n", usesbits ? "\t\"math/bits\"\n" : "", "\t\"os\"\n",
                    "\t\"runtime/debug\"\n\t\"strconv\"\n\t\"syscall\"\n\t\"unsafe\"\n)\n\n"
                    "// The runtime configuration the program was compiled with (--stack-reserve,\n"
                    "// -D GS_STACK_RESERVE, -D GS_STACK_GAP).\n"
@@ -955,7 +988,7 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "\n\tgsStackGap     = ", opts.stacks.gap, "\n)\n\n");
     for (auto part : go_runtime_prologue) s += part;
     Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, gdecls,
-           gdecls.empty() ? "" : "\n", code, eqcode, bcode, ldstcode);
+           gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code, eqcode, bcode, ldstcode);
     return s;
 }
 

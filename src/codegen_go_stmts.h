@@ -109,6 +109,10 @@ inline void CodeGenGo::EmitRestores(const GoScope &s) {
 // What an exit runs on its way out down to (and including) scope `to`.
 inline void CodeGenGo::EmitExitRestores(int to) {
     for (auto i = (int)scopes.size() - 1; i >= to; i--) EmitRestores(scopes[i]);
+    // Leaving the function: a long-distance return's target gives its
+    // channels back the destinations they had.
+    if (to == 0)
+        for (auto &s : fdstsaves) L(s);
 }
 
 // A `defer` statement (§6.6): its body joins the exits of the block it is
@@ -618,7 +622,145 @@ inline void CodeGenGo::GenReturn(Return *r) {
         GenNormalReturn(r->vals);
         return;
     }
-    Unsupported(r->line, "`return ... from` (a long-distance return)");
+    GenFromReturn(r);
+}
+
+// A target's channels (CodeGen::EnsureFromChannels): a fixed result's
+// value; a non-fixed one's destination stack, where the value starts there,
+// and a resizable one's count (or frame object).
+inline void CodeGenGo::EnsureFromChannels(FnSpec *t) {
+    if (!fromemitted.insert(t).second) return;
+    auto tid = fromids.at(t);
+    auto &rets = t->rets;
+    Append(rfdecls, "// The result channels of a long-distance return to ", t->sf->qname, " (§7.9).\n");
+    for (size_t i = 0; i < rets.size(); i++) {
+        if (IsFix(rets[i])) {
+            Append(rfdecls, "var gsLret_", tid, "_", i, " ", GoT(rets[i], t->sf->line), "\n");
+            continue;
+        }
+        Append(rfdecls, "var gsFdst_", tid, "_", i, " int64\nvar gsFval_", tid, "_", i, " unsafe.Pointer\n");
+        if (IsResz(rets[i]))
+            Append(rfdecls, "var gsLret_", tid, "_", i, " ",
+                   IsFrameObj(rets[i]) ? RzGoT(rets[i], t->sf->line) : string("int64"), "\n");
+    }
+    if (fromemitted.size() == 1)
+        rfdecls = cat("// The long-distance return in flight: its target's number, 0 for none.\nvar gsRf int32\n\n",
+                      rfdecls);
+    rfdecls += "\n";
+}
+
+// A long-distance return site (CodeGen::GenFromReturn): the values into
+// the target's channels, then the return in flight.
+inline void CodeGenGo::GenFromReturn(Return *r) {
+    auto t = r->targetspec;
+    if (!t || !fromids.count(t)) Fail(r->line, "internal: a long-distance return without its target");
+    if (!curinfo || !curinfo->hasrf) Fail(r->line, "internal: a long-distance return no caller checks for");
+    if (Unreached()) return GenUnreached([&] { GenFromReturn(r); });
+    auto tid = fromids[t];
+    EnsureFromChannels(t);
+    auto &rets = t->rets;
+    auto chan = [&](const char *k, size_t i) { return cat("gs", k, "_", tid, "_", i); };
+    // The values land at the channels' tops, which is not where the
+    // target's caller expects them when anything was built in its
+    // destination since: the catch moves them down (EmitRfCheck).
+    for (size_t i = 0; i < rets.size(); i++)
+        if (IsBytesT(rets[i])) L(chan("Fval", i), " = ", Top(chan("Fdst", i)));
+    if (r->vals.size() == rets.size()) {
+        for (size_t i = 0; i < rets.size(); i++) {
+            if (IsResz(rets[i])) GenConstruct(r->vals[i], chan("Fdst", i), rets[i], chan("Lret", i));
+            else if (IsBytesT(rets[i])) GenConstruct(r->vals[i], chan("Fdst", i), rets[i]);
+            else GenAny(r->vals[i], GoDst { GD_LVALUE, chan("Lret", i), rets[i] });
+        }
+    } else {
+        // One call's results forwarded into the channels.
+        auto c = r->vals.size() == 1 ? Is<Call>(r->vals[0]) : nullptr;
+        if (!c) Fail(r->line, "internal: a long-distance return forwarding no call's results");
+        vector<GoDst> chans(rets.size());
+        for (size_t i = 0; i < rets.size(); i++) {
+            if (IsResz(rets[i])) chans[i] = GoDst { GD_STACK, chan("Fdst", i), rets[i], chan("Lret", i) };
+            else if (IsBytesT(rets[i])) chans[i] = GoDst { GD_STACK, chan("Fdst", i), rets[i] };
+            else chans[i] = GoDst { GD_LVALUE, chan("Lret", i), rets[i] };
+        }
+        auto res = GenCallVals(c, chans[0], &chans);
+        if (Unreached()) return;
+        auto rtypes = c->builtin >= 0 || c->fvbody || !c->dispatch.empty() ? c->rettypes
+                                                                             : c->spec->rets;
+        for (size_t i = 0; i < rets.size() && i < res.size(); i++) {
+            if (IsBytesT(rets[i]) || res[i].empty()) continue;
+            auto from = i < rtypes.size() ? rtypes[i] : rets[i];
+            // A non-fixed result (a variable-mode ADT for a fixed one, say)
+            // is read as the channel's type from where the call built it.
+            auto x = IsBytesT(from) ? LoadLoc(IsResz(from) ? RzTempLoc(from, res[i], "") : BytesLoc(res[i], from, GoLoc {}),
+                                              rets[i], r->line)
+                                    : CoerceVal(res[i], from, rets[i], r->line);
+            if (x != chans[i].s) L(chans[i].s, " = ", x);
+        }
+    }
+    if (Unreached()) return;
+    PropagateReturn(cat(tid));
+}
+
+// A return in flight leaving this function (CodeGen::PropagateReturn): its
+// exits run, then it returns dummy values. `rfval` names the target where
+// this starts the return, "" where gsRf holds it already.
+inline void CodeGenGo::PropagateReturn(const string &rfval) {
+    EmitExitRestores(0);
+    if (!rfval.empty()) L("gsRf = ", rfval);
+    string list;
+    for (auto &z : curzeros) Append(list, list.empty() ? "" : ", ", z);
+    L(list.empty() ? string("return") : cat("return ", list));
+    dead = true;
+}
+
+// After a call a long-distance return can come back through
+// (CodeGen::EmitRfCheck): this function's own is caught here, its values
+// taken from the channels and returned; any other goes on out.
+inline void CodeGenGo::EmitRfCheck(FnSpec *callee) {
+    if (Unreached()) return;
+    L("if gsRf != 0 {");
+    ind++;
+    auto caught = curspec && callee->needs.count(curspec);
+    if (caught) {
+        auto tid = fromids.at(curspec);
+        EnsureFromChannels(curspec);
+        L("if gsRf == ", tid, " {");
+        ind++;
+        L("gsRf = 0");
+        vector<string> rv;
+        for (size_t i = 0; i < curspec->rets.size(); i++) {
+            auto rt = curspec->rets[i];
+            auto lret = cat("gsLret_", tid, "_", i);
+            // The value is on this function's destination, behind anything
+            // the calls it unwound built there: down to where the caller
+            // expects it.
+            if (IsBytesT(rt)) LandValue(cat("gs_dst", i), DstTop0((int)i), cat("gsFval_", tid, "_", i), rt, lret);
+            if (IsResz(rt)) {
+                L(dstcounts[i], " = ", lret);
+                rv.push_back(dstcounts[i]);
+                continue;
+            }
+            if (IsBytesT(rt)) continue;
+            rv.push_back(lret);
+        }
+        EmitExitRestores(0);
+        string list;
+        for (auto &v : rv) Append(list, list.empty() ? "" : ", ", v);
+        L(list.empty() ? string("return") : cat("return ", list));
+        ind--;
+        LS("} else {");
+        ind++;
+        if (curinfo && curinfo->hasrf) PropagateReturn("");
+        else L("panic(\"unexpected long-distance return\")");
+        ind--;
+        LS("}");
+    } else if (curinfo && curinfo->hasrf) {
+        PropagateReturn("");
+    } else {
+        L("panic(\"unexpected long-distance return\")");
+    }
+    ind--;
+    LS("}");
+    dead = false;
 }
 
 // A break's value, or a return's leaving an inlined body, for scope si.
@@ -638,7 +780,7 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
     auto sp = curspec;
     // A return passes through the exits of every scope, whose `defer`
     // bodies run after its values are taken.
-    auto restores = false;
+    auto restores = !fdstsaves.empty();
     for (auto &s : scopes) restores = restores || !s.defers.empty() || !s.saves.empty();
     vector<string> rv;
     if (vals.size() == 1 && sp->rets.size() > 1) {
