@@ -72,6 +72,15 @@ sys.path.insert(0, str(REPO / "scripts"))
 import toolchain as tc
 
 UNSUPPORTED = "is not supported by --target=go yet"
+
+# C suite fixtures --sweep counts as differing by design, with the reason: a
+# recursion that exhausts the native stack, which the C runtime reports as a
+# Goose abort, overflows the goroutine's stack in Go only at 1 GB, and that
+# is a fatal Go runtime error, which no Go program can recover from.
+SWEEP_KNOWN = {
+    "runtime/native_stack_overflow.goose": "native stack exhaustion",
+    "runtime/render_reference_cycle.goose": "native stack exhaustion",
+}
 FLOW_TIMEOUT = 60   # Seconds a --fuzz-flow program may run.
 
 
@@ -402,6 +411,7 @@ class Runner:
         self.failures = []
         self.oks = 0
         self.skips = []
+        self.known = []
 
     # --- processes -----------------------------------------------------------
 
@@ -432,6 +442,10 @@ class Runner:
                     self.skips.append(what)
                     if self.verbose:
                         print(f"skip {what}")
+                elif kind == "known":
+                    self.known.append(what)
+                    if self.verbose:
+                        print(f"known difference: {what}")
                 else:
                     self.failures.append(what)
                     print(f"FAIL {what}")
@@ -689,6 +703,10 @@ class Runner:
         by its blessed output otherwise."""
         out = []
         name = f"sweep-{src.parent.name}-{src.stem}"
+        known = SWEEP_KNOWN.get(f"{src.parent.name}/{src.name}")
+        if known:
+            out.append(("known", f"sweep {src.parent.name}/{src.name} ({known})", None))
+            return out
         flags = runtime_defines(src)
         gofile = self.work / f"{name}.go"
         code, o, e = self.goose(*flags, "--target=go", "-o", gofile, src)
@@ -882,7 +900,8 @@ def main():
     if not args.names and not args.bless:
         r.report(r.cli())
     print(f"{r.oks} ok, {len(r.failures)} failed" +
-          (f", {len(r.skips)} not supported by --target=go yet" if r.skips else ""))
+          (f", {len(r.skips)} not supported by --target=go yet" if r.skips else "") +
+          (f", {len(r.known)} known differences" if r.known else ""))
     if r.failures:
         print("failures:")
         for f in r.failures:
