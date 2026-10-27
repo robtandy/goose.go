@@ -9,13 +9,15 @@ import are in programs/modules/), is
    nothing is inlined;
 2. checked with `go vet`, which must find nothing;
 3. built with `go build` and run;
-4. compiled with the C backend as well, with the same flags (`goose -o
-   <name>.c --standalone` and the C compiler scripts/toolchain.py finds, or
-   TinyCC in the compiler's own process where there is none), and run;
-5. judged: the two runs must agree on stdout, stderr and the exit code, and
-   match what test/go/expected/ holds for the program (<name>.out, and
-   <name>.stderr and <name>.exit where it writes to stderr or does not exit
-   with 0);
+4. compiled with the C backend as well, with the same flags and at the same
+   level (`goose -o <name>.c --standalone` and the C compiler
+   scripts/toolchain.py finds, or TinyCC in the compiler's own process where
+   there is none), and run: --debug checks the operations as the
+   optimizations leave them, so a program can fail at one level only;
+5. judged: the two runs at each level must agree on stdout, stderr and the
+   exit code, and the C run at -O2 match what test/go/expected/ holds for
+   the program (<name>.out, and <name>.stderr and <name>.exit where it
+   writes to stderr or does not exit with 0);
 6. reported on with `goose --check --stacks` for both targets, at both
    levels, which must agree: both backends count data stacks with the same
    analysis (BoundStacks, src/codegen_stacks.h).
@@ -474,11 +476,11 @@ class Runner:
         return None if exe is None else run_capture([exe], timeout=timeout)
 
     def c_build(self, src, name, flags, out):
-        """The C backend's executable for src, built with the C compiler at
-        -O2, or None after saying why."""
+        """The C backend's executable for src, at the Goose level flags name
+        (-O2 by default), or None after saying why."""
         cfile = self.work / f"{name}.c"
         exe = self.work / f"{name}-c{tc.EXE_SUFFIX}"
-        code, o, e = self.goose(*flags, "-O2", "--standalone", "-o", cfile, src)
+        code, o, e = self.goose(*flags, "--standalone", "-o", cfile, src)
         if code != 0:
             out.append(("fail", f"goose -o {name}.c", o + e))
             return None
@@ -504,11 +506,16 @@ class Runner:
         name = src.stem
         flags = goose_flags(src)
         out = []
-        ref = self.c_run(src, name, flags, out)
-        # At -O2 as the C reference is, and at -O0, where nothing is inlined.
+        # At -O2 and at -O0, where nothing is inlined, each against the C
+        # backend's build at the same level: --debug checks the operations as
+        # the optimizations leave them, so a tail loop's accumulator can
+        # overflow where the recursion as written does not (optimize_tre.h).
+        refs = {}
         for level in ("2", "0"):
             label = f"{name} -O{level}"
-            exe = self.go_program(src, f"{name}-O{level}", flags + [f"-O{level}"], out)
+            lflags = flags + [f"-O{level}"]
+            ref = refs[level] = self.c_run(src, f"{name}-O{level}", lflags, out)
+            exe = self.go_program(src, f"{name}-O{level}", lflags, out)
             if exe is None or ref is None:
                 continue
             got = tc.run_capture([exe])
@@ -522,6 +529,8 @@ class Runner:
                                 else f"go {g}, c {c}"))
             if same:
                 out.append(("ok", f"run {label}", None))
+        # What test/go/expected/ holds is the C run at -O2.
+        ref = refs["2"]
         if ref is None:
             return out
         exp = HERE / "go" / "expected"
@@ -594,14 +603,14 @@ class Runner:
         name = f"flow-{seed}"
         src = self.work / f"{name}.goose"
         tc.write_text(src, flow_program(seed))
-        ref = self.c_run(src, name, [], out, timeout=FLOW_TIMEOUT)
-        if ref is None:
-            return out
-        if ref[0] is None:
-            out.append(("fail", f"fuzz-flow seed {seed}: the C run did not end in {FLOW_TIMEOUT}s "
-                        f"({src})", None))
-            return out
         for level in ("2", "0"):
+            ref = self.c_run(src, f"{name}-O{level}", [f"-O{level}"], out, timeout=FLOW_TIMEOUT)
+            if ref is None:
+                continue
+            if ref[0] is None:
+                out.append(("fail", f"fuzz-flow seed {seed} -O{level}: the C run did not end in "
+                            f"{FLOW_TIMEOUT}s ({src})", None))
+                continue
             exe = self.go_program(src, f"{name}-O{level}", [f"-O{level}"], out)
             if exe is None:
                 continue

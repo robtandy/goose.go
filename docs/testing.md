@@ -545,10 +545,12 @@ backend. It needs the Go toolchain (`go` on `PATH`, or `GOOSE_GO`). For each
 program in `test/go/programs/`, at Goose `-O2` and at `-O0`, where nothing is
 inlined, it writes the Go with `goose --target=go -o`, requires `go vet` to
 find nothing in it, builds it with `go build` and runs it. It builds the same
-program with the C backend (`--standalone` C and the C compiler
-`scripts/toolchain.py` finds, or TinyCC with `--jit-reference`) and requires
-both runs to print the same stdout and stderr and exit with the same code, and
-the C run to match `test/go/expected/` (`<name>.out`, and `<name>.stderr` and
+program with the C backend at the same level (`--standalone` C and the C
+compiler `scripts/toolchain.py` finds, or TinyCC with `--jit-reference`) and
+requires both runs to print the same stdout and stderr and exit with the same
+code: `--debug` checks the operations as the optimizations leave them, so a
+program can fail at one level and not the other. The C run at `-O2` must
+match `test/go/expected/` (`<name>.out`, and `<name>.stderr` and
 `<name>.exit` where the program writes to stderr or does not exit with 0).
 `--bless` writes those from the C run. A program's first line may name flags
 for both compiles, `// goose-flags: --debug`. It also requires `goose --check
