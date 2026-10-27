@@ -948,8 +948,28 @@ inline string CodeGenGo::ElemAddr(const GoView &v, const string &i) {
 inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, TypeExpr *t,
                                  bool nested, Line ln) {
     if (l.t->kind == TY_REF && t->kind != TY_REF) DerefLoc(l);
+    if (auto sp = FmtSpecFor(rctx, t)) {
+        EmitUserFormat(cur, l, sp, ln);
+        return;
+    }
     auto lit = [&](const string &s) { L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(s), ")"); };
     auto nominal = t->kind == TY_STRUCT || t->kind == TY_VARIANT || t->kind == TY_ENUM;
+    auto overloads = rctx && !rctx->fmtspecs.empty();
+    // An overload rendering one part of a value may rebind a reference on
+    // the way to it: the other parts are read from where the value lay when
+    // its rendering began, which the checker holds meanwhile.
+    if (l.viaref && overloads && nominal) {
+        if (IsResz(t)) {
+            l = PinRz(l);
+        } else if (IsBytesT(t)) {
+            auto p = T();
+            Decl(p, "unsafe.Pointer", l.addr);
+            l.addr = p;
+            l.viaref = false;
+        } else {
+            l = PinLoc(l);
+        }
+    }
     if (nominal) {
         for (auto r : rendering)
             if (TEq(r, t)) {
@@ -971,7 +991,7 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
             auto at = [&](const string &p) {
                 if (IsResz(sub)) return FatRefLoc(p, sub);
                 if (IsBytesT(sub)) return BytesLoc(p, sub, GoLoc {});
-                return AtTyped(p, sub);
+                return RefIsAddr(t) ? AtAddr(p, sub) : AtTyped(p, sub);
             };
             if (t->ref->optional) {
                 auto p = Snapshot(ast.RefTo(sub, ln, true), x);
@@ -1067,6 +1087,11 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
                 if (bytes) pl = PayloadLoc(l, (int)vi, ln);
                 else if (ti.voffs.empty() || ti.voffs[vi] < 0) pl = AtVar(ZeroOf(vt, ln), vt);
                 else pl = PayloadLoc(l, (int)vi, ln);
+                // An overload rendering one part of a fixed-mode value may
+                // overwrite it with another variant: the parts are rendered
+                // from a copy (CodeGen::RenderLoc).
+                if (!bytes && overloads && !(ti.voffs.empty() || ti.voffs[vi] < 0))
+                    pl = AtVar(Snapshot(vt, Ld(pl)), vt);
                 RenderVariant(cur, end, pl, vt, ln);
                 PopSc();
                 ind--;
@@ -1168,6 +1193,10 @@ inline CodeGenGo::FnState CodeGenGo::SaveFnState() {
     s.curspec = curspec;
     s.curinfo = curinfo;
     s.rendering = std::move(rendering);
+    s.rtarget = rtarget;
+    s.rctx = rctx;
+    rtarget = nullptr;
+    rctx = nullptr;
     s.vstk = std::move(vstk);
     s.vpool = std::move(vpool);
     s.nrvo = std::move(nrvo);
@@ -1220,6 +1249,8 @@ inline void CodeGenGo::RestoreFnState(FnState &s) {
     curspec = s.curspec;
     curinfo = s.curinfo;
     rendering = std::move(s.rendering);
+    rtarget = s.rtarget;
+    rctx = s.rctx;
     vstk = std::move(s.vstk);
     vpool = std::move(s.vpool);
     nrvo = std::move(s.nrvo);

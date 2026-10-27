@@ -372,6 +372,23 @@ struct CodeGenGo {
     };
     vector<RenderReq> renderqueue;
     void RenderLoc(const string &cur, const string &end, GoLoc l, TypeExpr *t, bool nested, Line ln);
+    // A user format overload (§3.7) appends to a u8[>..] builder: the text
+    // being rendered is one, at the top of the stack its cursor runs on --
+    // the builder being formatted into (b, with the cursor's start), or the
+    // line print renders, from base -- which an overload is handed whole,
+    // its text so far included, as C hands it its builder; the cursor goes
+    // on after what the builder holds then (EmitUserFormat). rctx is the
+    // call whose overloads apply to the value being rendered.
+    struct RenderTarget {
+        string stk, base, start;
+        GoLoc b;
+        bool used = false;   // An overload ran: the stack's top moved.
+    };
+    RenderTarget *rtarget = nullptr;
+    Call *rctx = nullptr;
+    FnSpec *FmtSpecFor(Call *c, TypeExpr *t);
+    GoLoc RenderedLoc(Node *a);
+    void EmitUserFormat(const string &cur, const GoLoc &l, FnSpec *sp, Line ln);
     void RenderVariant(const string &cur, const string &end, const GoLoc &l, TypeExpr *t, Line ln);
     void RenderScalar(const string &cur, const string &end, const string &x, TypeExpr *t, Line ln);
     string RenderFn(TypeExpr *t, Line ln);
@@ -701,6 +718,8 @@ struct CodeGenGo {
         FnSpec *curspec = nullptr;
         SpecInfo *curinfo = nullptr;
         vector<TypeExpr *> rendering;
+        RenderTarget *rtarget = nullptr;
+        Call *rctx = nullptr;
         unordered_map<const VarDef *, string> vstk;
         unordered_map<const VarDef *, pair<string, string>> vpool;
         unordered_map<const VarDef *, NrvoDest> nrvo;

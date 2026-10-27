@@ -1084,7 +1084,14 @@ inline void CodeGenGo::RenderToBuilder(const GoLoc &b, Node *a, Call *c) {
     Decl(start, "unsafe.Pointer", Top(b.stk));
     Decl(cur, "unsafe.Pointer", start);
     Decl(end, "unsafe.Pointer", cat("gs.End(", b.stk, ")"));
+    RenderTarget rt;
+    rt.stk = b.stk;
+    rt.start = start;
+    rt.b = b;
+    auto saved = rtarget;
+    rtarget = &rt;
     RenderInto(cur, end, a, c);
+    rtarget = saved;
     if (Unreached()) return;
     L(Top(b.stk), " = ", cur);
     L(b.lenlv, " += int64(uintptr(", cur, ") - uintptr(", start, "))");
@@ -1112,10 +1119,28 @@ inline void CodeGenGo::EmitFormatInto(GoLoc l, Node *a, Line ln, Call *c) {
         RenderToBuilder(l, a, c);
         return;
     }
-    auto b = TempBuilder();
-    RenderToBuilder(b, a, c);
+    auto t = a->exprtype;
+    if (!SimpleText(GoFmtContext(c, a), t)) {
+        auto b = TempBuilder();
+        RenderToBuilder(b, a, c);
+        if (Unreached()) return;
+        AppendBytes(l, cat(b.hdr, ".Base"), cat(b.hdr, ".Len"), ln);
+        return;
+    }
+    if (t->kind == TY_ARRAY || t->kind == TY_SLICE) {
+        auto se = GenSrcElems(a);
+        if (Unreached()) return;
+        AppendBytes(l, se.elems, se.n, ln);
+        return;
+    }
+    auto buf = T(), start = T(), cur = T(), n = T();
+    Decl(buf, "[gsFmtMax]byte");
+    Decl(start, "unsafe.Pointer", cat("unsafe.Pointer(&", buf, ")"));
+    Decl(cur, "unsafe.Pointer", start);
+    RenderInto(cur, cat("unsafe.Add(", start, ", gsFmtMax)"), a, c);
     if (Unreached()) return;
-    AppendBytes(l, cat(b.hdr, ".Base"), cat(b.hdr, ".Len"), ln);
+    Decl(n, "int64", cat("int64(uintptr(", cur, ") - uintptr(", start, "))"));
+    AppendBytes(l, start, n, ln);
 }
 
 // str(a, b, ...): the arguments' text as a fresh u8[>..] at the

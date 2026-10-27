@@ -827,13 +827,15 @@ inline string CodeGenGo::GenFvCall(Call *c, const GoDst &d0) {
 // ------------------------------------------------------------------
 // Builtins.
 
-// The format overloads the call's argument is rendered with, which this
-// version renders none of (CodeGen::FmtContext, FmtSpecFor).
+// The call whose format overloads (§3.7) the call's argument is rendered
+// with (CodeGen::FmtContext).
 static Call *GoFmtContext(Call *c, Node *arg) {
     if (!c || c->fmtcontexts.empty()) return c;
     auto args = c->ArgNodes();
-    for (size_t i = 0; i < args.size(); i++)
-        if (args[i] == arg && i < c->fmtcontexts.size()) return c->fmtcontexts[i];
+    // format's first argument is its builder, which has no context.
+    size_t start = c->builtin == B_FORMAT ? 1 : 0;
+    for (size_t i = start; i < args.size(); i++)
+        if (args[i] == arg && i - start < c->fmtcontexts.size()) return c->fmtcontexts[i - start];
     return c;
 }
 
@@ -1021,9 +1023,99 @@ inline void CodeGenGo::EmitPrint(Call *c) {
     Decl(base, "unsafe.Pointer", cat("gs.Stks[", k, "]"));
     Decl(cur, "unsafe.Pointer", base);
     Decl(end, "unsafe.Pointer", cat("gs.End(", k, ")"));
+    RenderTarget rt;
+    rt.stk = k;
+    rt.base = base;
+    auto saved = rtarget;
+    rtarget = &rt;
     for (auto a : c->ArgNodes()) RenderInto(cur, end, a, c);
+    rtarget = saved;
     L(cur, " = gsPutStr(", cur, ", ", end, ", \"\\n\")");
     L("gsOut(", base, ", ", cur, ")");
+    // An overload grew the line as a builder: the stack's top goes back.
+    if (rt.used) L(Top(k), " = ", base);
+}
+
+// The place an argument is rendered from (CodeGen::RenderedLoc): a call's
+// or an inlined body's that gives a plain reference is the reference, held
+// in a local, so that an overload taking the value by reference is handed
+// the storage it points at, not a copy.
+inline CodeGenGo::GoLoc CodeGenGo::RenderedLoc(Node *a) {
+    auto c = Is<Call>(a);
+    auto ib = Is<InlineBlock>(a);
+    TypeExpr *rt = nullptr;
+    if (c && !c->rettypes.empty()) rt = c->rettypes[0];
+    else if (ib && ib->spec && ib->spec->rets.size() == 1) rt = ib->spec->rets[0];
+    if (!rt || !IsPlainRef(rt) || IsVarintT(rt->ref->sub)) return GenLoc(a);
+    auto v = T();
+    Decl(v, LocalT(rt, a->line));
+    GenAny(a, GoDst { GD_LVALUE, v, rt });
+    return AtVar(v, rt);
+}
+
+// The overload a rendering calls for a value of type t, if any.
+inline FnSpec *CodeGenGo::FmtSpecFor(Call *c, TypeExpr *t) {
+    if (!c) return nullptr;
+    for (auto &fs : c->fmtspecs)
+        if (TEq(fs.first, t)) return fs.second;
+    return nullptr;
+}
+
+// A user format overload called on the value at l (CodeGen::EmitUserFormat),
+// handed the builder the text is rendered into: the cursor's text joins it
+// first, and the cursor goes on after what it holds when the overload
+// returns -- which may have cleared it, as an overload may.
+inline void CodeGenGo::EmitUserFormat(const string &cur, const GoLoc &l, FnSpec *sp, Line ln) {
+    if (!rtarget) Fail(ln, "internal: a format overload with no builder to hand it");
+    if (!sinfo.count(sp)) Fail(ln, cat("internal: no Go function for ", sp->sf->name));
+    auto &ki = sinfo[sp];
+    if (IsPoolParam(sp, 0) || IsPoolParam(sp, 1) || !ki.freevars.empty())
+        Unsupported(ln, "a format overload taking a pool or capturing variables");
+    auto &rt = *rtarget;
+    PushSc(SC_PLAIN);
+    L(Top(rt.stk), " = ", cur);
+    GoLoc b;
+    if (rt.b.hdr.empty()) {
+        // print's line, from where it starts.
+        auto h = T();
+        Decl(h, "GsRhdr", cat("GsRhdr{", rt.base, ", int64(uintptr(", cur, ") - uintptr(", rt.base, "))}"));
+        b.t = GrowU8();
+        b.hdr = h;
+        b.stk = rt.stk;
+    } else {
+        L(rt.b.lenlv, " += int64(uintptr(", cur, ") - uintptr(", rt.start, "))");
+        b = rt.b;
+    }
+    auto pt = sp->argtypes[1];
+    string arg;
+    if (pt->kind == TY_REF && IsResz(pt->ref->sub)) {
+        arg = RefOfRz(l, ln);
+    } else if (pt->kind == TY_REF && IsBytesT(pt->ref->sub)) {
+        arg = l.addr;
+    } else if (pt->kind == TY_REF && IsVarintT(l.t)) {
+        // An i64 read out of varint storage, which holds no i64: the
+        // overload is handed a temporary holding the value (CodeGen::RefArg).
+        auto x = T();
+        Decl(x, GoT(pt->ref->sub, ln), LoadLoc(l, pt->ref->sub, ln));
+        arg = cat("&", x);
+    } else if (pt->kind == TY_REF) {
+        arg = RefOfLoc(l);
+    } else {
+        arg = LoadLoc(l, pt, ln);
+    }
+    if (!IsGoName(arg) && !IsGoConst(arg) && arg != "nil") arg = Snapshot(pt, arg);
+    auto list = StackArgs(sp, ln);
+    Append(list, list.empty() ? "" : ", ", RefOfRz(b, ln), ", ", arg);
+    L(ki.name, "(", list, ")");
+    if (ki.hasrf) EmitRfCheck(sp);
+    if (rt.b.hdr.empty()) {
+        L(cur, " = ", Top(rt.stk));
+    } else {
+        L(rt.start, " = ", Top(rt.stk));
+        L(cur, " = ", rt.start);
+    }
+    rt.used = true;
+    PopSc();
 }
 
 // The text of argument a at the cursor `cur` (§3.7): a scalar's, or a string
@@ -1031,18 +1123,22 @@ inline void CodeGenGo::EmitPrint(Call *c) {
 inline void CodeGenGo::RenderInto(const string &cur, const string &end, Node *a, Call *c) {
     auto ctx = GoFmtContext(c, a);
     auto t = a->exprtype;
-    // An overload the argument is rendered with, at any depth of it.
-    if (ctx && !ctx->fmtspecs.empty()) Unsupported(a->line, "a format overload");
-    if (auto s = Is<StrLit>(a)) {
+    // The overloads the argument is rendered with, at any depth of it.
+    struct Ctx {
+        Call *&r, *saved;
+        ~Ctx() { r = saved; }
+    } keep { rctx, rctx };
+    rctx = ctx;
+    auto vt = t->kind == TY_REF && !t->ref->optional ? t->ref->sub : t;
+    if (auto s = Is<StrLit>(a); s && !FmtSpecFor(ctx, t)) {
         L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(s->val), ")");
         return;
     }
-    if (!IsScalarT(t)) {
-        if (t->kind == TY_REF && !t->ref->optional) t = t->ref->sub;
-        GoT(t, a->line);
-        auto l = GenLoc(a);
+    if (!IsScalarT(t) || FmtSpecFor(ctx, t)) {
+        GoT(vt, a->line);
+        auto l = RenderedLoc(a);
         if (Unreached()) return;
-        RenderLoc(cur, end, l, t, false, a->line);
+        RenderLoc(cur, end, l, vt, false, a->line);
         return;
     }
     auto x = GenX(a);
