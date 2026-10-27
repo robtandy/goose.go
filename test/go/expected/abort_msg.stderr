@@ -1,0 +1,1 @@
+goose runtime error: division by zero requested (test/go/programs/abort_msg.goose:6)

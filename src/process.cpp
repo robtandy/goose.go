@@ -24,8 +24,11 @@
     #include <unistd.h>
     #include <dlfcn.h>
     #include <fcntl.h>
+    #include <spawn.h>
     #include <sys/file.h>
     #include <sys/stat.h>
+    #include <sys/wait.h>
+    extern char **environ;
 #endif
 
 namespace goose {
@@ -69,6 +72,80 @@ ProcessResult RunProcess(const vector<string> &argv, const string &cwd, bool ech
     subprocess_destroy(&p);
     r.code = code;
     return r;
+}
+
+#ifdef _WIN32
+// One argument as CommandLineToArgvW reads it back: quoted where it holds a
+// space, a tab or a quote, a quote escaped, and the backslashes in front of
+// a quote or of the closing one doubled.
+static void AppendWindowsArg(string &cmd, const string &a) {
+    if (!a.empty() && a.find_first_of(" \t\"") == string::npos) {
+        cmd += a;
+        return;
+    }
+    cmd += '"';
+    size_t slashes = 0;
+    for (auto c : a) {
+        if (c == '\\') {
+            slashes++;
+            continue;
+        }
+        cmd.append(c == '"' ? slashes * 2 + 1 : slashes, '\\');
+        slashes = 0;
+        cmd += c;
+    }
+    cmd.append(slashes * 2, '\\');
+    cmd += '"';
+}
+#endif
+
+int RunInheritingStdio(const vector<string> &argv, string &err) {
+    if (argv.empty()) {
+        err = "nothing to run";
+        return -1;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    #ifdef _WIN32
+        string cmd;
+        for (auto &a : argv) {
+            if (!cmd.empty()) cmd += ' ';
+            AppendWindowsArg(cmd, a);
+        }
+        STARTUPINFOA si = {};
+        si.cb = sizeof si;
+        PROCESS_INFORMATION pi = {};
+        if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si,
+                            &pi)) {
+            err = cat("cannot start ", argv[0], " (Windows error ", (unsigned)GetLastError(), ")");
+            return -1;
+        }
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return (int)code;
+    #else
+        vector<char *> args;
+        for (auto &a : argv) args.push_back(const_cast<char *>(a.c_str()));
+        args.push_back(nullptr);
+        pid_t pid;
+        if (auto rc = posix_spawnp(&pid, args[0], nullptr, nullptr, args.data(), environ)) {
+            err = cat("cannot start ", argv[0], ": ", strerror(rc));
+            return -1;
+        }
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno != EINTR) {
+                err = cat("cannot wait for ", argv[0], ": ", strerror(errno));
+                return -1;
+            }
+        }
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+        if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+        return -1;
+    #endif
 }
 
 static bool IsFile(const string &path) {

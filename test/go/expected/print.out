@@ -1,0 +1,27 @@
+
+
+hello, world
+tab	quote" backslash\ bell nul-free
+multi
+line
+string
+utf-8: héllo wörld ✓ 🦆
+abc123truefalse1.5-0.25
+i8 -128 u8 255 i16 -32768 u16 65535
+i32 -2147483648 u32 4294967295
+i64 -9223372036854775808 u64 18446744073709551615
+f32 0.1 0.33333334 f64 0.1 0.3333333333333333
+shout 21
+outer 42 end
+shout 1
+shout 2
+shout 3
+246
+t-3
+t-2
+t-1
+liftoff
+line 0: 0 true
+line 1: 1 false
+line 2: 4 true
+a very long line: 111111111122222222223333333333444444444455555555556666666666777777777788888888889999999999 and floats 1e+100 1e-100 123.456 -987.654321 the end

@@ -9,6 +9,7 @@
 - [Expected output and diagnostics](#expected-output-and-diagnostics)
 - [Additional compiler checks](#additional-compiler-checks)
 - [Fixture audit](#fixture-audit)
+- [The Go backend's suite](#the-go-backends-suite)
 
 </details>
 
@@ -109,6 +110,8 @@ Test fixtures are grouped by category; `run_tests.py` stays at the root of `test
 | `lsp/` | Language-server fixtures driven by `lsp_protocol.py` over the protocol, not compiled as programs. `basics.goose` declares queries and expected answers in `// lsp:` lines and imports `helper.goose`. `complete.goose` ends with `p.` to test completion. `recovery.goose` has errors in two functions; `// lsp: error` lines specify their locations, and queries use the code checked so far. `broken_decls.goose` has errors inside a struct, an enum, and functions, plus an unresolved import. `exemplar.goose` tests queries on uncalled generic functions using exemplar checks (`docs/design/language_server.md` §11). `roots_lib.goose` contains an error and is opened and closed alongside its importers, `roots_app.goose` and `roots_app2.goose`. `source_index.goose` tests globals whose initializers omit defaults or expand a `const for`, a generic function matching a `const for` arm list, and calls containing commas in literals and comments. `two_a.goose` and `two_b.goose` import `two_shared.goose`; only the second instantiates its generic function. `ufcs_ns.goose` makes UFCS calls on a namespaced type from the global namespace, one of which matches no overload. |
 | `expected/` | Shared output and runtime-diagnostic expectations. |
 | `run_tests.py` | The Python test runner. |
+| `go/` | The Go backend's suite, which `run_go_tests.py` runs ([below](#the-go-backends-suite)): its programs (`go/programs/`, with the modules they import in `programs/modules/`), what they print (`go/expected/`), programs that never end, which it only builds (`go/build_only/`), and programs it refuses (`go/unsupported/`). Two levels down, they are none of this runner's fixtures. |
+| `run_go_tests.py` | The Go backend's runner. |
 | `toolchain_selection.py` | Which compiler the runners use (`find_goose` in `scripts/toolchain.py`). An `--exe` path is used as given, made absolute, even when there are other compilers in `build/`. Without `--exe`, the runners use the first of `build/Release/`, `build/RelWithDebInfo/`, `build/` itself (for a single-configuration generator) and `build/Debug/`, so that a routine run uses an optimized compiler and an assertion build has to be chosen with `--exe`. If there is no compiler in any of these, or the `--exe` path does not exist, the run stops rather than using another compiler. A unittest, run by the main runner. |
 | `compiler_roots.cpp` | Root-set join laws, feedback on weakening, order-independent equality and the deliberate comparison projections; compiled and run in both native profiles. |
 | `compiler_containers.cpp` | The compiler's `small_vector` and `flat_map` against `std::vector` and `std::unordered_map` under random operations, across in-place/heap storage, growth and erasure, and `flat_map`'s reuse of an erased key's value cell; compiled and run in both native profiles. |
@@ -533,3 +536,54 @@ cached-call path, which could otherwise mask a missing propagation step.
 CI uses four jobs to cover these configurations without testing every
 combination of platform, sanitizer, optimization level, and runtime mode.
 Benchmarks run separately from CI.
+
+## The Go backend's suite
+
+`python3 test/run_go_tests.py` tests the Go backend (`--target=go`,
+[command_line.md](command_line.md#15-writing-go---targetgo)) against the C
+backend. It needs the Go toolchain (`go` on `PATH`, or `GOOSE_GO`). For each
+program in `test/go/programs/`, at Goose `-O2` and at `-O0`, where nothing is
+inlined, it writes the Go with `goose --target=go -o`, requires `go vet` to
+find nothing in it, builds it with `go build` and runs it. It builds the same
+program with the C backend at the same level (`--standalone` C and the C
+compiler `scripts/toolchain.py` finds, or TinyCC with `--jit-reference`) and
+requires both runs to print the same stdout and stderr and exit with the same
+code: `--debug` checks the operations as the optimizations leave them, so a
+program can fail at one level and not the other. The C run at `-O2` must
+match `test/go/expected/` (`<name>.out`, and `<name>.stderr` and
+`<name>.exit` where the program writes to stderr or does not exit with 0).
+`--bless` writes those from the C run. A program's first line may name flags
+for both compiles, `// goose-flags: --debug`. It also requires `goose --check
+--stacks` to print the same report for both targets, which share the data
+stack analysis.
+
+The programs in `test/go/build_only/` never end, as a program whose loop only
+stopping it leaves: each is written as Go at both levels, which must vet and
+build, and as C, which must compile, and reported on with `--stacks` as
+above, but neither is run.
+
+Data stack overflow is checked on programs the runner generates: with
+`--stack-reserve 64K`, a print whose line runs past its stack's region, by
+its literal or inside a value's text (an `i64`, `u64`, `f64`, `f32` or
+`bool`), and lines that just fit, must run in Go as they do in C, with the
+C runtime's message and exit status.
+
+Each program in `test/go/unsupported/` uses something this version of the
+backend does not compile, and must stop the Go compile with every message its
+`// error:` lines name, where the C backend checks it. A few command-line
+checks follow: `-o out.go` implying the target, `--go-package`, `--library`,
+`goose run --target=go` with the program's exit code, and `goose build
+--target=go`.
+
+`--sweep` also runs the fixtures of this suite (`test/<category>/`) through
+the Go backend. The ones it compiles must vet, build and print what
+`test/expected/` holds for them, as a C run must; the ones it refuses as not
+supported yet are counted, not failed. `--fuzz N` generates `N` programs of
+random arithmetic, shifts, conversions and comparisons at every scalar type
+(from `--fuzz-seed` on, every other one built with `--debug`), each of which
+both backends must run alike. `--fuzz-flow N` generates `N` programs of
+random control flow: returns, breaks, continues and guards that end it in
+every position Go's flow analysis follows (conditions, scrutinees, arguments,
+loop bounds, values), with code after them that is never reached, among
+defers and bounded loops. Each must vet, build and run as its C does at both
+levels, with the same `--stacks` report.

@@ -1,0 +1,36 @@
+-1 0 1 2
+6 5 4 3 3 0
+5 -1 64 111
+v=-1 -> 100
+v=0 -> 200
+v=1 -> 1000
+v=2 -> 300
+v=3 -> 3000
+42
+pairs 336
+0 126
+43
+w 4 calls 4
+fizzbuzz
+1
+2
+fizz
+4
+buzz
+fizz
+7
+8
+fizz
+buzz
+11
+fizz
+13
+14
+fizzbuzz
+250
+251 or 252
+251 or 252
+other 253
+other 254
+-50
+false true true 5

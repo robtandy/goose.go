@@ -1,0 +1,23 @@
+    leaf 10
+    leaf 100
+  middle 1 sees 11 and 101
+    leaf 20
+    leaf 200
+  middle 2 sees 21 and 201
+top 1 -> 2 -> 4
+result 3 81
+depth -> 0 9
+depth 4
+depth 3
+depth 2
+depth 1
+depth -> 4
+ping 5
+pong 4
+ping 3
+pong 2
+ping 1
+    leaf 0
+    leaf 1
+    leaf 2
+ping-pong -> 5 3

@@ -1,0 +1,1 @@
+goose runtime error: as conversion out of range (debug): 256 as u8 (test/go/programs/debug_cast_range.goose:4)

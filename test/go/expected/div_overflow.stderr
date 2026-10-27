@@ -1,0 +1,1 @@
+goose runtime error: integer overflow in division (test/go/programs/div_overflow.goose:4)

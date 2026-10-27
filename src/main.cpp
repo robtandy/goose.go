@@ -38,6 +38,12 @@
 #include "codegen_emit.h"
 #include "codegen_stacks.h"
 #include "codegen_nodes.h"
+#include "codegen_go_runtime.h"
+#include "codegen_go.h"
+#include "codegen_go_values.h"
+#include "codegen_go_stmts.h"
+#include "codegen_go_calls.h"
+#include "codegen_go_emit.h"
 #include "runtime_inline.h"
 #include "process.h"
 #include "jit.h"
@@ -665,6 +671,13 @@ R"(  --stats               Print what the compile did: the declarations parsed,
   --no-bce              Keep every bounds check.
   --bce-lines           Report the bounds checks elided and kept on each line.
   --specs               Print the specializations of each function.
+  --target c|go         The backend: C, the default, or Go, which writes one
+                        Go file that builds with the Go toolchain alone (or
+                        --target=c, --target=go). -o out.go picks Go too.
+  --go-package name     The package of the Go file (default main, or goose
+                        for a library).
+  --library             With --target=go, a package with no func main, for
+                        a Go program to use: fn main() is optional.
 )";
 
 constexpr const char *DEBUGOPTION =
@@ -697,6 +710,7 @@ Common options:
   -O0, -O1, -O2   Inlining level (default -O2).
   --debug         Overflow, range and tag checks that name the source line
                   they fail on.
+  --target c|go   The backend: C, the default, or Go (and -o out.go).
   --stats         Print what the compile did (declarations, bounds checks
                   removed, files written).
   --color when    Color errors and warnings: auto (on a terminal, unless
@@ -721,7 +735,8 @@ R"(usage: goose run file.goose [options] [-- program args...]
 
 Compiles the program and runs it in this process with TinyCC, and exits with
 its exit code. What follows -- is the program's arguments. A program that
-starts threads needs goose build.
+starts threads needs goose build. With --target=go, the program's Go is
+built with the Go toolchain (`go`, or GOOSE_GO) and the executable is run.
 
 Options:
   -O0, -O1, -O2         Inlining level (default -O2).
@@ -736,7 +751,8 @@ R"(usage: goose build file.goose [options]
 
 Builds an executable beside the source with a C compiler on this machine
 (goose toolchain says which), linking the runtime and the native parts of
-the packages the program uses. Intermediates go under GOOSE_HOME.
+the packages the program uses. Intermediates go under GOOSE_HOME. With
+--target=go, the program's Go is written there and built with `go build`.
 
 Options:
   -o exe                Where the executable goes.
@@ -956,7 +972,8 @@ bool ParseSize(string s, uint64_t &out) {
 }
 
 // The value of a runtime configuration macro as runtime.h spells its
-// defaults and a -D may: an integer with C suffixes, or `(N << M)`.
+// defaults and a -D may: an integer as C writes one (decimal, 0x hex, 0b
+// binary or octal, with u and l suffixes), or `(N << M)` of two.
 bool ParseConfigValue(string s, uint64_t &out) {
     auto strip = [](string &t) {
         while (!t.empty() && isspace((unsigned char)t.back())) t.pop_back();
@@ -974,9 +991,20 @@ bool ParseConfigValue(string s, uint64_t &out) {
         while (!t.empty() && (tolower((unsigned char)t.back()) == 'u' ||
                               tolower((unsigned char)t.back()) == 'l'))
             t.pop_back();
-        if (t.empty() || t.size() > 19 || t.find_first_not_of("0123456789") != string::npos)
-            return false;
-        v = strtoull(t.c_str(), nullptr, 10);
+        uint64_t base = 10;
+        size_t at = 0;
+        if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) base = 16, at = 2;
+        else if (t.size() > 2 && t[0] == '0' && (t[1] == 'b' || t[1] == 'B')) base = 2, at = 2;
+        else if (t.size() > 1 && t[0] == '0') base = 8, at = 1;
+        if (at >= t.size()) return false;
+        uint64_t n = 0;
+        for (auto i = at; i < t.size(); i++) {
+            auto c = (unsigned char)t[i];
+            uint64_t d = isdigit(c) ? c - '0' : isxdigit(c) ? tolower(c) - 'a' + 10 : base;
+            if (d >= base || n > (UINT64_MAX - d) / base) return false;
+            n = n * base + d;
+        }
+        v = n;
         return true;
     };
     if (auto sh = s.find("<<"); sh != string::npos) {
@@ -1338,6 +1366,9 @@ int Main(int argc, char **argv) {
     auto json = false, refresh = false, debug = false, verbose = false, dryrun = false;
     auto jsondiag = false;
     string ccrequest;
+    // The backend (--target): "c", "go", or "" for the one -o's name implies.
+    string target, gopackage;
+    auto golibrary = false;
     // The inlining at its highest. The C compiler optimizes whatever the
     // level, unless --debug (Builder::CFlags).
     auto optlevel = 2;
@@ -1449,6 +1480,29 @@ int Main(int argc, char **argv) {
             stderrcolor = when == "always" ? StderrColor(true) : when == "auto" && StderrColor(false);
         }
         else if (arg == "--dry-run") dryrun = true;
+        else if ((arg == "--target" && i + 1 < argc) || arg.rfind("--target=", 0) == 0) {
+            target = arg == "--target" ? argv[++i] : arg.substr(9);
+            if (target != "c" && target != "go") {
+                fprintf(stderr, "--target takes c or go, not %s\n", target.c_str());
+                return 1;
+            }
+        }
+        else if ((arg == "--go-package" && i + 1 < argc) || arg.rfind("--go-package=", 0) == 0) {
+            gopackage = arg == "--go-package" ? argv[++i] : arg.substr(13);
+            auto isid = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
+            static const set<string> keywords = {
+                "break", "case", "chan", "const", "continue", "default", "defer", "else",
+                "fallthrough", "for", "func", "go", "goto", "if", "import", "interface", "map",
+                "package", "range", "return", "select", "struct", "switch", "type", "var",
+            };
+            if (gopackage.empty() || isdigit((unsigned char)gopackage[0]) || gopackage == "_" ||
+                keywords.count(gopackage) || !all_of(gopackage.begin(), gopackage.end(), isid)) {
+                fprintf(stderr, "--go-package takes a Go package name, not %s\n",
+                        gopackage.c_str());
+                return 1;
+            }
+        }
+        else if (arg == "--library") golibrary = true;
         else if (arg == "--update") package_update = true;
         else if (arg == "--offline") package_nofetch = true;
         else if (arg == "--dump-docs") dumpdocs = true;
@@ -1528,6 +1582,36 @@ int Main(int argc, char **argv) {
     // which is what --jit asks for explicitly; a build writes the C to its
     // build directory instead.
     auto jit = verb != "build" && (forcejit || outname.empty());
+    // The backend: --target's, else Go where -o names a .go file, C
+    // otherwise. A build's -o names the executable, which says neither.
+    auto gotarget = target == "go" ||
+                    (target.empty() && verb != "build" && outname.size() > 3 &&
+                     outname.compare(outname.size() - 3, 3, ".go") == 0);
+    if (!gotarget && (!gopackage.empty() || golibrary)) {
+        fprintf(stderr, "--go-package and --library are for --target=go\n");
+        return 1;
+    }
+    if (gotarget && !headername.empty()) {
+        fprintf(stderr, "--header writes a C host's header, and --target=go writes no C\n");
+        return 1;
+    }
+    if (gotarget && !includenames.empty()) {
+        fprintf(stderr, "--include is not supported by --target=go yet\n");
+        return 1;
+    }
+    if (gotarget && forcejit && !outname.empty()) {
+        fprintf(stderr, "--jit runs the C backend's program in this process; with --target=go, "
+                        "goose run builds the Go and runs it\n");
+        return 1;
+    }
+    // A Go program to run is built with the Go toolchain and run as a
+    // process of its own, where the C one runs in this process.
+    auto gorun = gotarget && jit;
+    if ((gorun || (gotarget && verb == "build")) && !gopackage.empty() && gopackage != "main") {
+        fprintf(stderr, "an executable is package main: --go-package is for the Go that -o "
+                        "writes\n");
+        return 1;
+    }
     if (!headername.empty() && (jit || multitest)) {
         fprintf(stderr, "--header requires C output for a single input file\n");
         return 1;
@@ -1559,6 +1643,9 @@ int Main(int argc, char **argv) {
     // The compile's diagnostics as data (--diagnostics json): the warnings
     // as they come, then the error's.
     vector<Diagnostic> found;
+    // Whether the Go the compile writes is a library, and whether it wrote
+    // the file (set by the compile).
+    auto golib = false, gowrote = false;
     auto compile = [&]() -> int {
         if (tokens) {
             DumpTokens(filename);
@@ -1612,7 +1699,12 @@ int Main(int argc, char **argv) {
             if (stats) fprintf(msgs, "roundtrip ok: %d bytes of dump\n", (int)dumped.size());
         }
         if (parseonly) return 0;
-        TypeCheckProgram(ast, library, nocgen);
+        // A Go library (--library, or export fns and no main()) is a package
+        // with no func main, for a Go program to use: main() is optional.
+        golib = gotarget && (golibrary || (!ast.DeclaresMain() &&
+                                           any_of(ast.functions.begin(), ast.functions.end(),
+                                                  [](SFunction *sf) { return sf->isexport; })));
+        TypeCheckProgram(ast, library, nocgen || golib);
         // The checker reported the errors it went on past, root by root.
         if (!ast.errors.empty()) return 1;
         Optimizer opt(ast, optlevel);
@@ -1657,6 +1749,48 @@ int Main(int argc, char **argv) {
         // --stacks needs the generated program's bounds, so --check runs
         // the backend for them and writes nothing.
         if (nocgen && !stacks) return 0;
+        if (gotarget) {
+            // The Go backend's runtime configuration is the C one's
+            // (runtime.h, --stack-reserve and -D); the other -D are C's.
+            // No C compiler reads these for it: a value the compiler cannot
+            // read stops the compile, where the C backend's report keeps
+            // the default (StackConfigOf).
+            for (auto &d : cdefines) {
+                auto eq = d.find('=');
+                auto name = d.substr(0, eq);
+                uint64_t v;
+                if (eq == string::npos || ParseConfigValue(d.substr(eq + 1), v)) continue;
+                for (auto rt : { "GS_DEBUG", "GS_STACK_RESERVE", "GS_STACK_GAP", "GS_STACK_BUDGET",
+                                 "GS_MAX_STACKS" })
+                    if (name == rt)
+                        throw CompileError { cat("-D", d, ": --target=go reads ", name,
+                                                 " as an integer constant, as 65536, 0x10000 or "
+                                                 "(1 << 16)") };
+            }
+            auto stackcfg = StackConfigOf(cdefines);
+            GoOptions go;
+            go.library = golib;
+            go.package = !gopackage.empty() ? gopackage : golib ? "goose" : "main";
+            go.debug = debug;
+            for (auto &d : cdefines) {
+                auto eq = d.find('=');
+                if (d.substr(0, eq) != "GS_DEBUG") continue;
+                uint64_t v = 1;
+                if (eq != string::npos) ParseConfigValue(d.substr(eq + 1), v);
+                go.debug = v != 0;
+            }
+            go.stacks = stackcfg;
+            CodeGenGo cg(ast, go);
+            if (stacks) cg.StackReport(msgs, stackcfg);
+            if (!outfile.empty() && !nocgen) {
+                auto out = cg.Source(filename);
+                if (!WriteFileMakingDirs(outfile, out))
+                    throw CompileError { cat("cannot write output file: ", outfile) };
+                if (stats) fprintf(msgs, "wrote %s (%d bytes)\n", outfile.c_str(), (int)out.size());
+                gowrote = true;
+            }
+            return 0;
+        }
         // A quoted include resolves against the including file's own directory
         // first, so the --include headers are written relative to where the .c
         // goes: the generated file then compiles wherever the tree sits,
@@ -1758,7 +1892,7 @@ int Main(int argc, char **argv) {
                 outfile.replace(pos, 1, stem);
         }
         includes = includenames;
-        if (verb == "build") {
+        if (verb == "build" || gorun) {
             builddir = ProgramBuildDir(file);
             std::error_code ec;
             filesystem::create_directories(filesystem::path(builddir), ec);
@@ -1766,7 +1900,11 @@ int Main(int argc, char **argv) {
                 fprintf(stderr, "cannot create the build directory %s\n", builddir.c_str());
                 return 1;
             }
-            outfile = cat(builddir, "/", PathStem(file), ".c");
+            // The go tool reads a file's name: one ending in _test is a test,
+            // and one starting with . or _ is not read at all. The Go is
+            // main.go, whatever the program's name, which its build directory
+            // has (ProgramBuildDir).
+            outfile = gotarget ? cat(builddir, "/main.go") : cat(builddir, "/", PathStem(file), ".c");
             // The C is written far from where the command was given, so a
             // header named relative to here is named relative to nowhere
             // else: absolute, and the C names it relative to itself.
@@ -1774,6 +1912,7 @@ int Main(int argc, char **argv) {
                 if (FileExists(inc)) inc = AbsolutePath(inc);
         }
         program.clear();
+        gowrote = false;
         astp.reset();
         nativepkgs.clear();
         found.clear();
@@ -1785,6 +1924,42 @@ int Main(int argc, char **argv) {
             // (CMakeLists.txt).
             auto code = RunOnCompilerStack(compile);
             if (code) return code;
+            if (gotarget && (verb == "build" || gorun)) {
+                // Nothing to build where the compile stopped short of the Go
+                // (--check, --parse, --dump, ...).
+                if (!gowrote || multitest) return 0;
+                if (golib) {
+                    fprintf(stderr, "%s is a library, with no main to %s: --target=go writes it "
+                                    "with -o file.go\n", filename.c_str(),
+                            verb == "build" ? "build" : "run");
+                    return 1;
+                }
+                if (verb == "build")
+                    return BuildGoExecutable(filename, outfile, builddir, buildopts, msgs,
+                                             astp->packages[0].output);
+                // Built beside the Go, and run as a process of its own, on
+                // this one's streams: its exit code is ours. Named as the Go
+                // is, so that no program's name (main.go.goose's) is the
+                // Go's.
+                BuildOptions goopts;
+                goopts.verbose = verbose;
+                string goexe = cat(builddir, "/main");
+                #ifdef _WIN32
+                    goexe += ".exe";
+                #endif
+                if (!GoBuild(outfile, goexe, goopts, msgs, cat(builddir, "/go-build.log")))
+                    return 1;
+                vector<string> runargv = { goexe };
+                runargv.insert(runargv.end(), progargs.begin(), progargs.end());
+                fflush(msgs);
+                string err;
+                auto rc = RunInheritingStdio(runargv, err);
+                if (rc < 0) {
+                    fprintf(stderr, "%s\n", err.c_str());
+                    return 1;
+                }
+                return rc;
+            }
             if (verb == "build") {
                 if (nocgen) return 0;
                 // The native parts first, so that the link can take their

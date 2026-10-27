@@ -1,0 +1,1 @@
+goose runtime error: division by zero (test/go/programs/div_zero.goose:5)

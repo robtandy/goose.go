@@ -17,6 +17,7 @@
 - [12. Environment and files](#12-environment-and-files)
 - [13. Exit status](#13-exit-status)
 - [14. Options for working on the compiler](#14-options-for-working-on-the-compiler)
+- [15. Writing Go: --target=go](#15-writing-go---targetgo)
 
 </details>
 
@@ -196,6 +197,7 @@ These options have the same meaning for `goose run`, `goose build`,
 | `--bce-lines` | Report, for each source line, how many bounds checks the compiler removed and how many it kept. |
 | `--no-bce` | Keep every bounds check. `checkfree` functions are then not verified, and the compiler warns about that. |
 | `--specs` | Print every specialization of each function, after optimization, as source. |
+| `--target c\|go` | The backend: C, the default, or Go ([§15](#15-writing-go---targetgo)). `-o out.go` picks Go too. |
 | `--stats` | Print a few lines about what the compile did: the declarations parsed, the specializations and optimizations, the bounds checks removed, and the files written. |
 | `--color auto\|always\|never` | Whether errors and warnings are in color ([§6](#6-what-goose-prints)). |
 | `--diagnostics text\|json` | Print errors and warnings as text on stderr (the default), or as JSON on stdout ([§6](#6-what-goose-prints)). |
@@ -491,3 +493,58 @@ writes nothing. It checks the result as a format does, and that formatting
 it again changes nothing, and it skips a file that does not parse. Setting
 `GOOSE_ROUNDS` in the environment makes the typechecker trace what keeps a
 recursive cycle's rounds going.
+
+## 15. Writing Go: --target=go
+
+```bash
+goose --target=go -o hello.go hello.goose    # or just: goose -o hello.go hello.goose
+go build hello.go && ./hello
+goose run --target=go hello.goose            # build the Go and run it
+goose build --target=go hello.goose          # an executable beside the source
+```
+
+`--target=go` compiles the program to one Go source file instead of C, from
+the same checked, optimized and bounds-checked program the C backend
+compiles. The file holds its own runtime, so `go build file.go` builds it
+with nothing but the Go standard library and no cgo, and `go vet` finds
+nothing in it. It runs as the C program does: the same output, the same
+`goose runtime error: ...` messages and exit codes, and the same data stacks
+(`--stacks` reports the same counts for both targets). Linux and macOS are
+supported, 64-bit only. The design is in [DESIGN.md](../DESIGN.md).
+
+* `-o out.go` writes the file, and implies `--target=go`.
+* `goose run --target=go`, or `goose --target=go file.goose`, writes the Go
+  to the program's build directory under `GOOSE_HOME`, builds it with
+  `go build`, and runs the executable with the arguments after `--`,
+  exiting with its exit code. The Go there is `main.go`, whatever the
+  program is called: the go tool takes a file named `*_test.go` for a test,
+  and does not read one whose name starts with `.` or `_`.
+* `goose build --target=go` builds the executable beside the root file, or
+  where `-o` says, and `--debug` builds it without the Go compiler's
+  optimizations, for a debugger. `--dry-run` and `-v` print the `go build`
+  command.
+* `--go-package name` is the file's package: `main` by default, and `goose`
+  for a library. `--library`, or `export fn`s in a program without `main`,
+  writes a library: a package with no `func main`, whose `init` initializes
+  the globals and does nothing else. A `fn main()` the program has is not
+  run: the Go program that imports the package runs instead.
+* `--debug` (or `-DGS_DEBUG=1`) turns on the overflow and `as` range checks,
+  and `--stack-reserve`, `-DGS_STACK_RESERVE` and `-DGS_STACK_GAP` size the
+  data stacks, as they do for C. The other `-D` macros are C's, and do not
+  reach the Go. No C compiler reads these for the Go: the compiler takes
+  each value as an integer constant as C writes one (`65536`, `0x10000`,
+  `0200000`, with `u` and `l` suffixes) or `(N << M)` of two, and a value it
+  cannot read stops the compile.
+
+The Go toolchain is `go` on `PATH`, or the one `GOOSE_GO` names.
+
+This version compiles the scalar core of the language: integers, floats and
+`bool` with their operators and conversions, globals, locals, every control
+construct, `defer`, calls (recursive ones and tail recursion turned into
+loops included), nested functions and function values, and `print`,
+`assert`, `abort` and `exit`. A program using anything else -- arrays,
+slices and strings held in variables, structs, enums, references, `return
+... from` across a call, threads, `extern fn` and `export fn` -- stops with
+an error at the first such construct, naming it: `... is not supported by
+--target=go yet`. `test/run_go_tests.py` checks what it compiles against
+the C backend ([testing.md](testing.md)).

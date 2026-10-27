@@ -1,0 +1,1 @@
+goose runtime error: as conversion changes the value (debug): 3.5 as i32 (test/go/programs/debug_cast.goose:6)

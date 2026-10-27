@@ -1,0 +1,1 @@
+goose runtime error: integer overflow (debug): -(-9223372036854775808) at i64 (test/go/programs/unused_global_check.goose:9)
