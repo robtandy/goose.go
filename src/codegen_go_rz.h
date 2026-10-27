@@ -301,13 +301,15 @@ inline void CodeGenGo::EmitValStore(const string &stk, TypeExpr *t, const string
         if (!IsGoName(x) && !IsGoConst(x)) L("_ = ", x);
         return;
     }
-    L("*(*", ti.name, ")(", Top(stk), ") = ", x);
+    // A stack's top may be unaligned: a value holding Go pointers is
+    // stored byte for byte.
+    if (GoHasPtrs(t)) L(LdStFn(t, true), "(", Top(stk), ", ", x, ")");
+    else L("*(*", ti.name, ")(", Top(stk), ") = ", x);
     Bump(stk, cat(ti.size));
 }
 
-// Copies `n` elements of the fixed type `elem` from `src`, an
-// unsafe.Pointer, to the stack's top, as Go copies them: element by
-// element where they hold pointers, which the collector must see written.
+// Copies `n` elements of the type `elem` from `src`, an unsafe.Pointer, to
+// the stack's top, as memmove moves them.
 inline void CodeGenGo::EmitCopyElems(const string &stk, TypeExpr *elem, const string &src,
                                      const string &n) {
     if (!IsFix(elem)) {
@@ -327,8 +329,7 @@ inline void CodeGenGo::EmitCopyElems(const string &stk, TypeExpr *elem, const st
     }
     auto &ti = TI(elem, elem->line);
     auto nn = IsGoName(n) || IsGoConst(n) ? n : cat("(", n, ")");
-    L("copy(unsafe.Slice((*", ti.name, ")(", Top(stk), "), ", nn, "), unsafe.Slice((*", ti.name,
-      ")(", src, "), ", nn, "))");
+    CopyElemBytes(Top(stk), src, nn, ti.size);
     Bump(stk, ti.size == 1 ? nn : cat(nn, "*", ti.size));
 }
 
@@ -367,7 +368,7 @@ inline CodeGenGo::SrcElems CodeGenGo::GenSrcElems(Node *n) {
     auto l = GenLoc(n);
     while (l.t->kind == TY_REF) DerefLoc(l);
     if (l.t->kind == TY_SLICE) {
-        auto x = l.lv;
+        auto x = Ld(l);
         if (!IsGoName(x)) x = Snapshot(l.t, x);
         r.elems = cat(x, ".Data");
         r.n = cat(x, ".Len");
@@ -758,7 +759,7 @@ inline CodeGenGo::GoLoc CodeGenGo::RzRecvLoc(Node *n) {
     auto viaref = l.viaref;
     if (l.t->kind == TY_REF && viaref && !l.ispref) {
         // The reference itself, read now.
-        auto r = Snapshot(l.t, l.lv);
+        auto r = Snapshot(l.t, Ld(l));
         l = AtVar(r, l.t);
         viaref = false;
     }
@@ -848,7 +849,7 @@ inline string CodeGenGo::GenRzArrayBuiltin(Call *c) {
                 Decl(p, "unsafe.Pointer", Top(l.stk));
                 return Snapshot(rt, LoadLoc(AtAddr(p, elem), rt, ln));
             }
-            return Snapshot(elem, slot.lv);
+            return Snapshot(elem, Ld(slot));
         }
         case B_POP_N: {
             auto l = RzRecvLoc(an[0]);
@@ -918,7 +919,7 @@ inline string CodeGenGo::GenRzArrayBuiltin(Call *c) {
                     if (fv == "nil") L(slot.lv, " = 0");
                     else EmitRelStore(slot, fv, NonNullRef(an[2]), false, ln);
                 } else {
-                    L(slot.lv, " = ", fv);
+                    St(slot, fv);
                 }
                 L(cur, " = unsafe.Add(", cur, ", ", v.esize, ")");
                 ind--;
@@ -1478,9 +1479,9 @@ inline void CodeGenGo::EmitSliceExtend(const GoLoc &l, const string &end, int64_
 // all zero where the default is that, else each built.
 inline void CodeGenGo::EmitDefaultElems(const GoView &v, const string &first, const string &count,
                                         Node *init) {
-    auto gt = GoT(v.elem, v.elem->line);
+    GoT(v.elem, v.elem->line);
     if (!HasFieldDefaults(v.elem) || !init) {
-        L("clear(unsafe.Slice((*", gt, ")(", ElemAddr(v, first), "), ", count, "))");
+        ClearElemBytes(ElemAddr(v, first), count, v.esize);
         return;
     }
     auto k = T();
@@ -1489,7 +1490,7 @@ inline void CodeGenGo::EmitDefaultElems(const GoView &v, const string &first, co
     auto e = T();
     Decl(e, "unsafe.Pointer", ElemAddr(v, cat(first, " + ", k)));
     PushSc(SC_PLAIN);
-    GenAny(init, GoDst { GD_LVALUE, AtAddr(e, v.elem).lv, v.elem });
+    GenInto(init, AtAddr(e, v.elem), v.elem);
     PopSc();
     ind--;
     LS("}");
@@ -1571,11 +1572,9 @@ inline vector<string> CodeGenGo::EmitSlicePool(Call *c, vector<Node *> &an, Line
         ind++;
         auto ni = T();
         Decl(ni, "int64", cat("GsSpansRegrow(", SpanArgs(l), ", ", l.lenlv, ", ", i, ", ", ol, ", ", n, ")"));
-        auto gt = GoT(elem, ln);
         L("if ", ni, " != ", i, " {");
         ind++;
-        L("copy(unsafe.Slice((*", gt, ")(", ElemAddr(v, ni), "), ", ol, "), unsafe.Slice((*", gt, ")(",
-          ElemAddr(v, i), "), ", ol, "))");
+        CopyElemBytes(ElemAddr(v, ni), ElemAddr(v, i), ol, v.esize);
         ind--;
         LS("}");
         L(i, " = ", ni);

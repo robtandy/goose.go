@@ -193,6 +193,18 @@ struct CodeGenGo {
     set<string> repchecked;   // The nominal types CheckRepresentable has seen.
     void CheckRepresentable(TypeExpr *t, Line ln);
     string GoT(TypeExpr *t, Line ln);
+    // Whether t's Go representation holds Go pointers: a plain reference,
+    // a slice, a resizable's header, an array of them. Every aggregate that
+    // holds an address is the bytes of its C layout instead, which hold
+    // none (codegen_go_types.h).
+    bool GoHasPtrs(TypeExpr *t);
+    // A plain reference to a fixed-size value whose Go type holds Go
+    // pointers is its address, an unsafe.Pointer: such a value can lie
+    // unaligned, where no typed Go pointer may point (RefIsAddr); any other
+    // to a fixed-size value is a typed Go pointer.
+    bool RefIsAddr(TypeExpr *rt);
+    string RefFromAddr(TypeExpr *rt, const string &addr);
+    string AddrOfRef(TypeExpr *rt, const string &x);
     static const char *RelGoT(TypeExpr *rt);
     // How a fixed-size type is held: as Go holds a scalar, a pointer, a
     // GsSlice or an array of those (GR_PLAIN); as a native Go struct
@@ -203,7 +215,8 @@ struct CodeGenGo {
         string name;            // Its Go type.
         GoRep rep = GR_PLAIN;
         int64_t size = 0, align = 1;   // In Go's memory.
-        bool ptrs = false;      // It holds Go pointers: references or slices.
+        bool ptrs = false;      // Its Go type holds Go pointers (GoHasPtrs).
+        bool addrs = false;     // It holds addresses: references or slices, in any form.
         bool exact = true;      // Its Go layout is its C layout.
         bool goeq = true;       // Go's == is its structural equality (§4.5).
         vector<int64_t> offs;   // A struct or variant: each field's offset.
@@ -221,7 +234,6 @@ struct CodeGenGo {
     void BuildEnum(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
     void BuildFrameObj(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
     void BuildLimited(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
-    static string VariantField(EnumInst *ei, int vi);
     void EmitTypeDecls();
     unordered_map<string, string> eqfns;
 
@@ -237,6 +249,11 @@ struct CodeGenGo {
         // A reference on the way here can be rebound, so evaluating lv later
         // may reach other storage.
         bool viaref = false;
+        // A value whose Go type holds Go pointers, at addr, which may be
+        // unaligned: it has no lvalue, and is read and written byte for byte
+        // (Ld, St), as checkptr requires and the collector never needs to
+        // see -- everything it can point at is outside the Go heap.
+        bool unal = false;
         // A value on a data stack (codegen_go_rz.h), as the C backend's Loc
         // has it: the stack it lives on (an int64 index into gs.Stks), and,
         // for a resizable, its header's lvalue (a GsRhdr, or a frame
@@ -267,7 +284,23 @@ struct CodeGenGo {
     static GoLoc AtVar(const string &x, TypeExpr *t);
     static string AddrOf(const GoLoc &l);
     string PtrOf(const GoLoc &l);
+    string RefOfLoc(const GoLoc &l);
     GoLoc PinLoc(const GoLoc &l);
+    // A place's value, and a store into it: where it holds Go pointers at
+    // an address (GoLoc::unal), byte for byte through gsLd_/gsSt_ helpers,
+    // which have alignment 1 and leave the collector nothing to see.
+    string Ld(const GoLoc &l);
+    void St(const GoLoc &l, const string &x);
+    string LdStFn(TypeExpr *t, bool store);
+    // n elements of esize bytes copied (memmove) or zeroed, byte for byte,
+    // as elements holding Go pointers that may lie unaligned must be.
+    void CopyElemBytes(const string &dst, const string &src, const string &n, int64_t esize);
+    void ClearElemBytes(const string &dst, const string &n, int64_t esize);
+    unordered_map<string, pair<string, string>> ldstfns;   // Go type -> its gsLd_, gsSt_.
+    string ldstcode;
+    // n's value into the place l: straight into its lvalue, or through a
+    // temporary where it is reached by byte copies.
+    void GenInto(Node *n, const GoLoc &l, TypeExpr *t = nullptr);
     GoLoc FieldLocAt(const GoLoc &base, int fi, Line ln);
     string TagOf(const GoLoc &e, Line ln);
     GoLoc PayloadLoc(const GoLoc &e, int vi, Line ln);

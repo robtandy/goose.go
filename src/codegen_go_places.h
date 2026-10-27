@@ -27,12 +27,19 @@ inline string CodeGenGo::AddOff(const string &p, int64_t off) {
     return cat("unsafe.Add(", p, ", ", off, ")");
 }
 
-// The value of type t at address p, an unsafe.Pointer.
+// The value of type t at address p, an unsafe.Pointer: an lvalue of its Go
+// type, but for a type holding Go pointers, which p may hold unaligned
+// (GoLoc::unal).
 inline CodeGenGo::GoLoc CodeGenGo::AtAddr(const string &p, TypeExpr *t) {
     GoLoc l;
     l.t = t;
     l.addr = p;
-    l.lv = cat("(*(*", GoT(t, Line {}), ")(", p, "))");
+    if (GoHasPtrs(t)) {
+        GoT(t, Line {});
+        l.unal = true;
+    } else {
+        l.lv = cat("(*(*", GoT(t, Line {}), ")(", p, "))");
+    }
     return l;
 }
 
@@ -61,8 +68,17 @@ inline string CodeGenGo::AddrOf(const GoLoc &l) {
 
 inline string CodeGenGo::PtrOf(const GoLoc &l) {
     if (!l.ptr.empty()) return l.ptr;
+    if (l.unal) Fail(l.t->line, cat("internal: a typed pointer to a ", TypeText(l.t), " that may lie unaligned"));
     if (!l.addr.empty()) return cat("(*", GoT(l.t, Line {}), ")(", l.addr, ")");
     return cat("&", l.lv);
+}
+
+// A reference to the place l: its address where the reference is one
+// (RefIsAddr, a bytes value's), a typed Go pointer otherwise.
+inline string CodeGenGo::RefOfLoc(const GoLoc &l) {
+    if (IsBytesT(l.t) && !IsResz(l.t)) return l.addr;
+    if (GoHasPtrs(l.t)) return AddrOf(l);
+    return PtrOf(l);
 }
 
 // A place resolved to the storage it names now: what code run before its
@@ -70,9 +86,70 @@ inline string CodeGenGo::PtrOf(const GoLoc &l) {
 // receiver -- cannot move by rebinding a reference or changing an index.
 inline CodeGenGo::GoLoc CodeGenGo::PinLoc(const GoLoc &l) {
     auto p = T();
+    if (l.unal) {
+        Decl(p, "unsafe.Pointer", l.addr);
+        return AtAddr(p, l.t);
+    }
     Decl(p, cat("*", GoT(l.t, Line {})), PtrOf(l));
     auto r = AtTyped(p, l.t);
     return r;
+}
+
+inline string CodeGenGo::Ld(const GoLoc &l) {
+    if (!l.unal) return l.lv;
+    return cat(LdStFn(l.t, false), "(", l.addr, ")");
+}
+
+inline void CodeGenGo::St(const GoLoc &l, const string &x) {
+    if (!l.unal) {
+        L(l.lv, " = ", x);
+        return;
+    }
+    L(LdStFn(l.t, true), "(", l.addr, ", ", x, ")");
+}
+
+// The helpers that read and write a value of type t at an address that may
+// be unaligned: a copy of its bytes through a variable of its Go type,
+// which Go compiles to a few loads and stores.
+inline string CodeGenGo::LdStFn(TypeExpr *t, bool store) {
+    auto &ti = TI(t, t->line);
+    auto it = ldstfns.find(ti.name);
+    if (it == ldstfns.end()) {
+        auto m = Mangle(t);
+        auto ld = Unique(cat("gsLd_", m)), st = Unique(cat("gsSt_", m));
+        it = ldstfns.emplace(ti.name, pair<string, string> { ld, st }).first;
+        Append(ldstcode, "// A ", ti.name, " where it may lie unaligned, byte for byte.\nfunc ", ld,
+               "(p unsafe.Pointer) (v ", ti.name, ") {\n\t*(*[", ti.size,
+               "]byte)(unsafe.Pointer(&v)) = *(*[", ti.size, "]byte)(p)\n\treturn\n}\n\nfunc ", st,
+               "(p unsafe.Pointer, v ", ti.name, ") {\n\t*(*[", ti.size, "]byte)(p) = *(*[", ti.size,
+               "]byte)(unsafe.Pointer(&v))\n}\n\n");
+    }
+    return store ? it->second.second : it->second.first;
+}
+
+inline void CodeGenGo::CopyElemBytes(const string &dst, const string &src, const string &n,
+                                     int64_t esize) {
+    auto nn = IsGoName(n) || IsGoConst(n) ? n : cat("(", n, ")");
+    auto nb = esize == 1 ? nn : cat(nn, "*", esize);
+    L("copy(unsafe.Slice((*byte)(", dst, "), ", nb, "), unsafe.Slice((*byte)(", src, "), ", nb, "))");
+}
+
+inline void CodeGenGo::ClearElemBytes(const string &dst, const string &n, int64_t esize) {
+    auto nn = IsGoName(n) || IsGoConst(n) ? n : cat("(", n, ")");
+    L("clear(unsafe.Slice((*byte)(", dst, "), ", esize == 1 ? nn : cat(nn, "*", esize), "))");
+}
+
+inline void CodeGenGo::GenInto(Node *n, const GoLoc &l, TypeExpr *t) {
+    if (!t) t = l.t;
+    if (!l.unal) {
+        GenAny(n, GoDst { GD_LVALUE, l.lv, t });
+        return;
+    }
+    auto v = T();
+    Decl(v, LocalT(t, n->line));
+    GenAny(n, GoDst { GD_LVALUE, v, t });
+    if (Unreached()) return;
+    St(l, v);
 }
 
 // ------------------------------------------------------------------
@@ -138,7 +215,6 @@ inline string CodeGenGo::TagOf(const GoLoc &e, Line ln) {
     if (IsBytesT(e.t)) return cat("(*(*", IntGoT(TagStore(ei->en)), ")(", e.addr, "))");
     auto &ti = TI(e.t, ln);
     if (ti.rep == GR_TAG) return e.lv;
-    if (ti.rep == GR_NATIVE) return cat(e.lv, ".tag");
     if (TagStore(ei->en) == IS_U8) return cat(e.lv, "[0]");
     return cat("(*(*uint16)(", AddrOf(e), "))");
 }
@@ -150,9 +226,7 @@ inline CodeGenGo::GoLoc CodeGenGo::PayloadLoc(const GoLoc &e, int vi, Line ln) {
     if (IsBytesT(e.t)) return BytesLoc(AddOff(e.addr, TagSize(ei->en)), vt, e);
     auto &ti = TI(e.t, ln);
     if (ti.voffs[vi] < 0) Fail(ln, "internal: the payload of a variant without one");
-    GoLoc r;
-    if (ti.rep == GR_NATIVE) r = AtVar(cat(e.lv, ".", VariantField(ei, vi)), vt);
-    else r = AtAddr(AddOff(AddrOf(e), ti.voffs[vi]), vt);
+    auto r = AtAddr(AddOff(AddrOf(e), ti.voffs[vi]), vt);
     r.viaref = e.viaref;
     return r;
 }
@@ -165,8 +239,9 @@ inline CodeGenGo::GoView CodeGenGo::ArrayView(const GoLoc &l, Line ln) {
     auto t = l.t;
     if (t->kind == TY_SLICE) {
         v.elem = t->sub;
-        v.data = cat(l.lv, ".Data");
-        v.len = cat(l.lv, ".Len");
+        auto x = Ld(l);
+        v.data = cat(x, ".Data");
+        v.len = cat(x, ".Len");
     } else if (t->kind == TY_ARRAY && t->arr->akind == A_FIXED) {
         v.elem = t->arr->sub;
         v.arr = l.lv;
@@ -331,7 +406,7 @@ inline void CodeGenGo::DerefLoc(GoLoc &l) {
     auto viaref = l.viaref;
     if (!IsRelRef(l.t) && IsResz(sub)) {
         auto ispref = l.ispref;
-        auto x = l.lv;
+        auto x = Ld(l);
         l = FatRefLoc(x, sub);
         if (ispref) {
             l.fl = cat("(*", x, ".FreeHdr)");
@@ -341,7 +416,7 @@ inline void CodeGenGo::DerefLoc(GoLoc &l) {
         return;
     }
     if (!IsRelRef(l.t) && IsBytesT(sub)) {
-        auto x = l.lv;
+        auto x = Ld(l);
         l = GoLoc {};
         l.t = sub;
         l.addr = x;
@@ -352,8 +427,10 @@ inline void CodeGenGo::DerefLoc(GoLoc &l) {
         auto p = T();
         Decl(p, "unsafe.Pointer", RelLoad(l));
         l = IsBytesT(sub) ? BytesLoc(p, sub, GoLoc {}) : AtAddr(p, sub);
+    } else if (RefIsAddr(l.t)) {
+        l = AtAddr(Ld(l), sub);
     } else {
-        l = AtTyped(l.lv, sub);
+        l = AtTyped(Ld(l), sub);
     }
     l.viaref = viaref;
 }
@@ -441,7 +518,7 @@ inline string CodeGenGo::LoadLoc(GoLoc l, TypeExpr *et, Line ln) {
     }
     if (IsRelRef(l.t)) {
         auto sub = l.t->ref->sub;
-        if (IsBytesT(sub)) return RelLoad(l);
+        if (IsBytesT(sub) || GoHasPtrs(sub)) return RelLoad(l);
         return cat("(*", GoT(sub, ln), ")(", RelLoad(l), ")");
     }
     if (et->kind == TY_SLICE && l.t->kind == TY_ARRAY) {
@@ -466,7 +543,7 @@ inline string CodeGenGo::LoadLoc(GoLoc l, TypeExpr *et, Line ln) {
     }
     if (et->kind == TY_ENUM && l.t->kind == TY_VARIANT) return AdaptToEnum(l, et, ln);
     if (IsScalarT(l.t) && IsScalarT(et)) return Coerce(l.lv, l.t, et, ln);
-    return l.lv;
+    return Ld(l);
 }
 
 // A variant or a variable-mode ADT, as a bytes value, read as the fixed-mode
@@ -534,9 +611,13 @@ inline void CodeGenGo::CopyIntoLimited(const GoLoc &l, TypeExpr *et, Line ln, co
     ind--;
     LS("}");
     auto dv = ArrayView(dst, ln);
-    auto egt = GoT(v.elem, ln);
-    L("copy(unsafe.Slice((*", egt, ")(", dv.data, "), ", n, "), unsafe.Slice((*", egt, ")(", v.data,
-      "), ", n, "))");
+    // Byte for byte: elements holding Go pointers may lie unaligned.
+    auto nb = n;
+    if (v.esize != 1) {
+        nb = T();
+        Decl(nb, "int64", cat(n, "*", v.esize));
+    }
+    L("copy(unsafe.Slice((*byte)(", dv.data, "), ", nb, "), unsafe.Slice((*byte)(", v.data, "), ", nb, "))");
     L(dv.lenlv, " = ", IntGoT(dv.lenst), "(", n, ")");
 }
 
@@ -548,8 +629,7 @@ inline string CodeGenGo::GenRefVal(Node *child, Line ln) {
     // A reference to a resizable value is its header's address and its
     // stack (C.2), one to a bytes value the value's address.
     if (IsResz(l.t)) return RefOfRz(l, ln);
-    if (IsBytesT(l.t)) return l.addr;
-    return PtrOf(l);
+    return RefOfLoc(l);
 }
 
 // x, a value of type `from`, as a value of type `to` (Coerce for the rest of
@@ -566,7 +646,7 @@ inline string CodeGenGo::CoerceVal(const string &x, TypeExpr *from, TypeExpr *to
         auto sub = from->ref->sub;
         if (IsResz(sub)) return LoadLoc(FatRefLoc(x, sub), to, ln);
         if (IsBytesT(sub)) return LoadLoc(BytesLoc(x, sub, GoLoc {}), to, ln);
-        return LoadLoc(AtTyped(x, sub), to, ln);
+        return LoadLoc(RefIsAddr(from) ? AtAddr(x, sub) : AtTyped(x, sub), to, ln);
     }
     if (TEq(from, to)) return x;
     auto needsplace = (to->kind == TY_SLICE && from->kind == TY_ARRAY) ||

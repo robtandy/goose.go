@@ -830,7 +830,7 @@ inline void CodeGenGo::LeafAny(Node *n, const GoDst &d) {
                 CopyIntoLimited(l, d.t, n->line, AtVar(d.s, d.t));
                 return;
             }
-            L(d.s, " = ", l.lv);
+            L(d.s, " = ", Ld(l));
             return;
         }
         auto x = d.t ? GenXD(n, d.t) : GenX(n);

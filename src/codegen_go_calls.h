@@ -772,7 +772,7 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
                 L("for ", i, " := int64(0); ", i, " < ", ArrSize(t->arr), "; ", i, "++ {");
                 ind++;
                 PushSc(SC_PLAIN);
-                GenAny(c->defaultinit, GoDst { GD_LVALUE, ElemAt(av, i, ln).lv, t->arr->sub });
+                GenInto(c->defaultinit, ElemAt(av, i, ln), t->arr->sub);
                 PopSc();
                 ind--;
                 LS("}");

@@ -61,7 +61,7 @@ inline void CodeGenGo::StructLitInto(StructLit *sl, const GoLoc &dst, bool fresh
             auto ft = ftypes[i];
             auto f = FieldLocAt(base, (int)i, ln);
             if (!init) {
-                if (!fresh) L(f.lv, " = ", ZeroOf(ft, ln));
+                if (!fresh) St(f, ZeroOf(ft, ln));
                 continue;
             }
             if (IsRelRef(ft)) {
@@ -73,7 +73,7 @@ inline void CodeGenGo::StructLitInto(StructLit *sl, const GoLoc &dst, bool fresh
                 LitInto(init, f, fresh);
                 continue;
             }
-            GenAny(init, GoDst { GD_LVALUE, f.lv, ft });
+            GenInto(init, f, ft);
         }
     };
     if (et->kind == TY_STRUCT) {
@@ -108,7 +108,7 @@ inline void CodeGenGo::ArrayLitInto(ArrayLit *al, const GoLoc &dst, bool fresh) 
     auto emit = [&](Node *e, const GoLoc &at) {
         if (IsRelRef(elem)) GenRelStore(at, e, false);
         else if ((Is<StructLit>(e) || Is<ArrayLit>(e)) && HasRelRef(elem)) LitInto(e, at, fresh);
-        else GenAny(e, GoDst { GD_LVALUE, at.lv, elem });
+        else GenInto(e, at, elem);
     };
     if (al->fillval) {
         // The value is evaluated once, also for no elements, and repeated
@@ -572,7 +572,7 @@ inline void CodeGenGo::GenForArray(ForLoop *f) {
     auto e = ElemAt(moves ? ArrayView(l, f->line) : v, gi, f->line);
     e.viaref = l.viaref || held;
     auto iv = LocalName(f->vdef);
-    if (!f->vdef->copybind && !held) Decl(iv, LocalT(et, f->line), PtrOf(e));
+    if (!f->vdef->copybind && !held) Decl(iv, LocalT(et, f->line), RefOfLoc(e));
     else Decl(iv, LocalT(et, f->line), LoadLoc(e, et, f->line));
     GenLoopBody(f->body);
     ind--;
@@ -725,9 +725,9 @@ inline void CodeGenGo::StoreElem(Node *n, const GoLoc &slot, const string &ev) {
         else EmitRelStore(slot, ev, NonNullRef(n), false, n->line);
     } else if (ev.empty()) {
         if (Is<StructLit>(n) || Is<ArrayLit>(n)) LitInto(n, slot, false);
-        else GenAny(n, GoDst { GD_LVALUE, slot.lv, slot.t });
+        else GenInto(n, slot);
     } else {
-        L(slot.lv, " = ", ev);
+        St(slot, ev);
     }
 }
 
@@ -736,7 +736,7 @@ inline void CodeGenGo::StoreElem(Node *n, const GoLoc &slot, const string &ev) {
 // references, §3.8).
 inline string CodeGenGo::NewElemResult(const GoLoc &slot, Line ln) {
     if (IsBytesT(slot.t) && slot.t->kind != TY_REF) return slot.addr;
-    if (slot.t->kind != TY_REF) return PtrOf(slot);
+    if (slot.t->kind != TY_REF) return RefOfLoc(slot);
     return Snapshot(ast.RefTo(slot.t->ref->sub, ln, slot.t->ref->optional),
                     LoadLoc(slot, slot.t, ln));
 }
@@ -825,9 +825,7 @@ inline string CodeGenGo::GenArrayBuiltin(Call *c) {
             L("GsAbort(GsECapacity, ", LocArgs(ln), ")");
             ind--;
             LS("}");
-            auto egt = GoT(v.elem, ln);
-            L("copy(unsafe.Slice((*", egt, ")(", ElemAddr(v, ol), "), ", nn, "), unsafe.Slice((*", egt,
-              ")(", sd, "), ", nn, "))");
+            CopyElemBytes(ElemAddr(v, ol), sd, nn, v.esize);
             L(v.lenlv, " = ", IntGoT(v.lenst), "(", ol, " + ", nn, ")");
             return "";
         }
@@ -848,7 +846,7 @@ inline string CodeGenGo::GenArrayBuiltin(Call *c) {
             auto slot = ElemAt(v, nl, ln);
             auto rt = c->rettypes.empty() ? v.elem : c->rettypes[0];
             if (IsRelRef(v.elem)) return Snapshot(rt, LoadLoc(slot, rt, ln));
-            return Snapshot(v.elem, slot.lv);
+            return Snapshot(v.elem, Ld(slot));
         }
         case B_POP_N: {
             auto l = RecvLoc(an[0]);
@@ -917,7 +915,7 @@ inline string CodeGenGo::GenArrayBuiltin(Call *c) {
                     if (fv == "nil") L(slot.lv, " = 0");
                     else EmitRelStore(slot, fv, NonNullRef(an[2]), false, ln);
                 } else {
-                    L(slot.lv, " = ", fv);
+                    St(slot, fv);
                 }
                 ind--;
                 LS("}");

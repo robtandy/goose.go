@@ -714,7 +714,7 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "\n\tgsStackGap     = ", opts.stacks.gap, "\n)\n\n");
     for (auto part : go_runtime_prologue) s += part;
     Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, gdecls,
-           gdecls.empty() ? "" : "\n", code, eqcode, bcode);
+           gdecls.empty() ? "" : "\n", code, eqcode, bcode, ldstcode);
     return s;
 }
 

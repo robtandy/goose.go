@@ -926,7 +926,7 @@ inline void CodeGenGo::GenAssign(Assign *a) {
         // Rebinding a reference (§3.8): the reference itself, encoded where
         // the slot is relative.
         if (t->kind != TY_REF) {
-            GenAny(a->rhs, GoDst { GD_LVALUE, l.lv, t });
+            GenInto(a->rhs, l, t);
             return;
         }
         if (IsRelRef(t)) {
@@ -934,10 +934,10 @@ inline void CodeGenGo::GenAssign(Assign *a) {
             return;
         }
         if (Is<NullLit>(a->rhs)) {
-            L(l.lv, IsFatRef(t) ? " = GsRref{}" : " = nil");
+            St(l, IsFatRef(t) ? "GsRref{}" : "nil");
             return;
         }
-        GenAny(a->rhs, GoDst { GD_LVALUE, l.lv, t });
+        GenInto(a->rhs, l, t);
         return;
     }
     if (a->op == T_ASSIGN) {
@@ -945,7 +945,7 @@ inline void CodeGenGo::GenAssign(Assign *a) {
             GenRelStore(l, a->rhs, RelApartOf(a->lval, t));
             return;
         }
-        GenAny(a->rhs, GoDst { GD_LVALUE, l.lv, t });
+        GenInto(a->rhs, l, t);
         return;
     }
     // The old value is read before the right side runs where that runs

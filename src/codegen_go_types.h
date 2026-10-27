@@ -474,8 +474,12 @@ inline string CodeGenGo::GoT(TypeExpr *t, Line ln) {
             if (t->ref->lenstorage == IS_VARINT) return "unsafe.Pointer";
             if (t->ref->lenstorage >= 0) return RelGoT(t);
             if (IsResz(t->ref->sub)) return "GsRref";
-            // A reference to a bytes value is its address.
-            if (IsBytesT(t->ref->sub)) return "unsafe.Pointer";
+            // A reference to a bytes value is its address, as one to a value
+            // whose Go type holds Go pointers is (RefIsAddr).
+            if (IsBytesT(t->ref->sub) || GoHasPtrs(t->ref->sub)) {
+                GoT(t->ref->sub, ln);
+                return "unsafe.Pointer";
+            }
             return cat("*", GoT(t->ref->sub, ln));
         case TY_SLICE: return "GsSlice";
         case TY_ARRAY:
@@ -493,6 +497,38 @@ inline string CodeGenGo::GoT(TypeExpr *t, Line ln) {
     gonames[m] = name;
     pendingtypes.push_back({ t, ln });
     return name;
+}
+
+inline bool CodeGenGo::GoHasPtrs(TypeExpr *t) {
+    switch (t->kind) {
+        case TY_REF: return t->ref->lenstorage < 0;
+        case TY_SLICE: return true;
+        case TY_ARRAY:
+            switch (t->arr->akind) {
+                case A_FIXED: return ArrSize(t->arr) > 0 && GoHasPtrs(t->arr->sub);
+                case A_GROW: case A_GROWSHRINK: return true;
+                default: return false;
+            }
+        case TY_STRUCT: return IsFrameObj(t);
+        default: return false;
+    }
+}
+
+inline bool CodeGenGo::RefIsAddr(TypeExpr *rt) {
+    if (rt->kind != TY_REF || rt->ref->lenstorage >= 0 || IsResz(rt->ref->sub)) return false;
+    return IsBytesT(rt->ref->sub) || GoHasPtrs(rt->ref->sub);
+}
+
+// A reference of type rt to the value at addr, an unsafe.Pointer.
+inline string CodeGenGo::RefFromAddr(TypeExpr *rt, const string &addr) {
+    if (RefIsAddr(rt)) return addr;
+    return cat("(*", GoT(rt->ref->sub, rt->line), ")(", addr, ")");
+}
+
+// The address the reference x of type rt holds, an unsafe.Pointer.
+inline string CodeGenGo::AddrOfRef(TypeExpr *rt, const string &x) {
+    if (RefIsAddr(rt)) return x;
+    return cat("unsafe.Pointer(", x, ")");
 }
 
 // The integer a relative reference is stored as (§3.9): signed, measured
@@ -524,7 +560,7 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
     if (IsBytesT(t) && !IsFrameObj(t)) {
         ti.size = gt == "GsRhdr" ? 16 : 8;
         ti.align = 8;
-        ti.ptrs = gt != "int64";
+        ti.ptrs = ti.addrs = gt != "int64";
         ti.exact = false;
         ti.goeq = false;
         return typeinfo[m] = ti;
@@ -546,16 +582,16 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
                 // A GsRref: the header's address and the stack.
                 ti.size = 16;
                 ti.align = 8;
-                ti.ptrs = true;
+                ti.ptrs = ti.addrs = true;
             } else {
                 ti.size = ti.align = 8;
-                ti.ptrs = true;
+                ti.ptrs = ti.addrs = true;
             }
             return typeinfo[m] = ti;
         case TY_SLICE:
             ti.size = 16;
             ti.align = 8;
-            ti.ptrs = true;
+            ti.ptrs = ti.addrs = true;
             return typeinfo[m] = ti;
         case TY_ARRAY:
             if (t->arr->akind == A_FIXED) {
@@ -564,6 +600,7 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
                 ti.size = k * e.size;
                 ti.align = e.align;
                 ti.ptrs = k > 0 && e.ptrs;
+                ti.addrs = k > 0 && e.addrs;
                 ti.exact = e.exact;
                 ti.goeq = e.goeq;
                 return typeinfo[m] = ti;
@@ -572,7 +609,7 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
                 // Its header (GsRhdr).
                 ti.size = 16;
                 ti.align = 8;
-                ti.ptrs = true;
+                ti.ptrs = ti.addrs = true;
                 ti.goeq = false;
                 return typeinfo[m] = ti;
             }
@@ -619,7 +656,7 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
 inline void CodeGenGo::BuildStructLike(GoTypeInfo &ti, string &decl, const vector<Field> &fields,
                                        const vector<TypeExpr *> &ftypes, const Layout &lo,
                                        int64_t csize, bool bitwise, Line ln) {
-    auto exact = true, aligned = true, ptrs = false, goeq = true;
+    auto exact = true, aligned = true, addrs = false, goeq = true, empty = false;
     int64_t maxalign = 1;
     auto real = 0;
     for (size_t i = 0; i < fields.size(); i++) {
@@ -628,10 +665,13 @@ inline void CodeGenGo::BuildStructLike(GoTypeInfo &ti, string &decl, const vecto
         real++;
         exact = exact && f.exact && f.size == FixedSize(ftypes[i]);
         aligned = aligned && lo.offs[i] % f.align == 0;
-        ptrs = ptrs || f.ptrs;
+        addrs = addrs || f.addrs;
         goeq = goeq && f.goeq;
+        // A field of no bytes would get Go's padding at the end of a struct.
+        empty = empty || f.size == 0;
         maxalign = std::max(maxalign, f.align);
     }
+    ti.addrs = addrs;
     ti.offs.assign(fields.size(), 0);
     if (!real && csize <= 1) {
         // No bytes of its own: a struct's one byte C gives it (`gs_empty`),
@@ -641,13 +681,12 @@ inline void CodeGenGo::BuildStructLike(GoTypeInfo &ti, string &decl, const vecto
         decl = cat("[", csize, "]byte");
         return;
     }
-    if (exact && aligned && csize % maxalign == 0) {
+    if (exact && aligned && csize % maxalign == 0 && !addrs && !empty) {
         // Go lays the fields out where C does: a native struct, its gaps
         // (the pads) blank fields that Go's == leaves out.
         ti.rep = GR_NATIVE;
         ti.size = csize;
         ti.align = maxalign;
-        ti.ptrs = ptrs;
         ti.goeq = goeq;
         decl = "struct {\n";
         int64_t cur = 0;
@@ -662,41 +701,13 @@ inline void CodeGenGo::BuildStructLike(GoTypeInfo &ti, string &decl, const vecto
         decl += "}";
         return;
     }
-    if (!ptrs) {
-        // The bytes of the C layout, each field at its own offset.
-        ti.rep = GR_BYTES;
-        ti.size = csize;
-        ti.goeq = bitwise;
-        for (size_t i = 0; i < fields.size(); i++) ti.offs[i] = lo.offs[i];
-        decl = cat("[", csize, "]byte");
-        return;
-    }
-    // References or slices where C packs them unaligned: Go's own layout,
-    // every pointer where the collector looks for one.
-    ti.rep = GR_NATIVE;
-    ti.exact = false;
-    ti.ptrs = true;
-    ti.goeq = goeq;
-    decl = "struct {\n";
-    int64_t off = 0;
-    for (size_t i = 0; i < fields.size(); i++) {
-        if (fields[i].ispad) {
-            ti.offs[i] = off;
-            if (fields[i].padsize > 0) {
-                Append(decl, "\t_ [", fields[i].padsize, "]byte\n");
-                off += fields[i].padsize;
-            }
-            continue;
-        }
-        auto &f = TI(ftypes[i], ln);
-        off = (off + f.align - 1) / f.align * f.align;
-        ti.offs[i] = off;
-        Append(decl, "\t", Sanitize(fields[i].name), " ", f.name, "\n");
-        off += f.size;
-    }
-    ti.align = maxalign;
-    ti.size = (off + maxalign - 1) / maxalign * maxalign;
-    decl += "}";
+    // The bytes of the C layout, each field at its own offset: references
+    // and slices among them too, where C packs them unaligned or not.
+    ti.rep = GR_BYTES;
+    ti.size = csize;
+    ti.goeq = bitwise;
+    for (size_t i = 0; i < fields.size(); i++) ti.offs[i] = lo.offs[i];
+    decl = cat("[", csize, "]byte");
 }
 
 // A frame object (C.2): the Go struct of its fixed fields, its tail's
@@ -740,11 +751,11 @@ inline void CodeGenGo::BuildEnum(GoTypeInfo &ti, string &decl, TypeExpr *t, Line
     auto ts = TagSize(ei->en);
     auto tagt = IntGoT(TagStore(ei->en));
     auto nv = ei->en->variants.size();
-    auto allempty = true, ptrs = false;
+    auto allempty = true, addrs = false;
     for (size_t vi = 0; vi < nv; vi++) {
         if (EmptyLayout(ei->en->variants[vi].fields)) continue;
         allempty = false;
-        ptrs = ptrs || TI(VariantType(t, (int)vi), ln).ptrs;
+        addrs = addrs || TI(VariantType(t, (int)vi), ln).addrs;
     }
     ti.voffs.assign(nv, -1);
     if (allempty) {
@@ -754,33 +765,14 @@ inline void CodeGenGo::BuildEnum(GoTypeInfo &ti, string &decl, TypeExpr *t, Line
         decl = tagt;
         return;
     }
-    if (!ptrs) {
-        ti.rep = GR_BYTES;
-        ti.size = FixedSize(t);
-        ti.goeq = false;
-        for (size_t vi = 0; vi < nv; vi++)
-            if (!EmptyLayout(ei->en->variants[vi].fields)) ti.voffs[vi] = ts;
-        decl = cat("[", ti.size, "]byte");
-        return;
-    }
-    ti.rep = GR_NATIVE;
-    ti.exact = false;
-    ti.ptrs = true;
+    // The tag, then the payloads overlapping behind it, as C's union.
+    ti.rep = GR_BYTES;
+    ti.size = FixedSize(t);
     ti.goeq = false;
-    decl = cat("struct {\n\ttag ", tagt, "\n");
-    int64_t off = ts, maxalign = ts;
-    for (size_t vi = 0; vi < nv; vi++) {
-        if (EmptyLayout(ei->en->variants[vi].fields)) continue;
-        auto &v = TI(VariantType(t, (int)vi), ln);
-        off = (off + v.align - 1) / v.align * v.align;
-        ti.voffs[vi] = off;
-        off += v.size;
-        maxalign = std::max(maxalign, v.align);
-        Append(decl, "\t", VariantField(ei, (int)vi), " ", v.name, "\n");
-    }
-    ti.align = maxalign;
-    ti.size = (off + maxalign - 1) / maxalign * maxalign;
-    decl += "}";
+    ti.addrs = addrs;
+    for (size_t vi = 0; vi < nv; vi++)
+        if (!EmptyLayout(ei->en->variants[vi].fields)) ti.voffs[vi] = ts;
+    decl = cat("[", ti.size, "]byte");
 }
 
 // A static-capacity limited array (§3.3): its length, then its slots.
@@ -799,32 +791,17 @@ inline void CodeGenGo::BuildLimited(GoTypeInfo &ti, string &decl, TypeExpr *t, L
     }
     auto &e = TI(t->arr->sub, ln);
     auto ma = std::max(lw, e.align);
-    if (e.exact && e.size == FixedSize(t->arr->sub) && lw % e.align == 0 && csize % ma == 0) {
+    ti.addrs = e.addrs;
+    if (e.exact && e.size == FixedSize(t->arr->sub) && lw % e.align == 0 && csize % ma == 0 && !e.addrs) {
         ti.rep = GR_NATIVE;
         ti.size = csize;
         ti.align = ma;
-        ti.ptrs = e.ptrs;
         decl = cat("struct {\n\tlen ", lt, "\n\te   [", k, "]", e.name, "\n}");
         return;
     }
-    if (!e.ptrs) {
-        ti.rep = GR_BYTES;
-        ti.size = csize;
-        decl = cat("[", csize, "]byte");
-        return;
-    }
-    ti.rep = GR_NATIVE;
-    ti.exact = false;
-    ti.ptrs = true;
-    ti.align = ma;
-    ti.elemoff = (lw + e.align - 1) / e.align * e.align;
-    ti.size = (ti.elemoff + k * e.size + ma - 1) / ma * ma;
-    decl = cat("struct {\n\tlen ", lt, "\n\te   [", k, "]", e.name, "\n}");
-}
-
-// The field of a variant's payload in an ADT that holds its payloads apart.
-inline string CodeGenGo::VariantField(EnumInst *ei, int vi) {
-    return cat("v_", Sanitize(ei->en->variants[vi].name));
+    ti.rep = GR_BYTES;
+    ti.size = csize;
+    decl = cat("[", csize, "]byte");
 }
 
 // The declarations of every named type the program's Go names, whatever
@@ -845,7 +822,7 @@ inline void CodeGenGo::EmitTypeDecls() {
 inline string CodeGenGo::EqX(TypeExpr *t, const GoLoc &a, const GoLoc &b, Line ln) {
     if (IsBytesT(t) && !IsResz(t)) return cat(EqFnBytes(t, ln), "(", a.addr, ", ", b.addr, ")");
     auto &ti = TI(t, ln);
-    if (ti.goeq) return cat("(", a.lv, " == ", b.lv, ")");
+    if (ti.goeq) return cat("(", Ld(a), " == ", Ld(b), ")");
     return cat(EqFn(t, ln), "(", PtrOf(a), ", ", PtrOf(b), ")");
 }
 
