@@ -38,10 +38,19 @@ const gsRegionMin = 1 << 20
 
 var gsRegionUsable int64
 
+// The blocks NewStackBlock has made, in which a write that would run past a
+// region's end finds the region (gsOverflow).
+var gsBlocks []*GsStackBlock
+
 // NewStackBlock reserves numStacks data stacks of reserve usable bytes each,
-// with gap bytes of PROT_NONE guard behind each one.
+// with gap bytes of PROT_NONE guard behind each one. A region is whole pages
+// (gs_rt_start).
 func NewStackBlock(numStacks int, reserve, gap int64) *GsStackBlock {
+	if reserve < int64(syscall.Getpagesize()) {
+		GsPanic("the data stack reservation (GS_STACK_RESERVE) is less than a page")
+	}
 	gs := &GsStackBlock{reserve: reserve, gap: gap}
+	gsBlocks = append(gsBlocks, gs)
 	gs.EnsureStacks(numStacks)
 	return gs
 }
@@ -71,6 +80,44 @@ func (gs *GsStackBlock) Close() error {
 	}
 	gs.regions, gs.Stks, gs.Base, gs.Cap = nil, nil, nil, nil
 	return first
+}
+
+// End is where stack k's region ends, which a line print renders at the
+// stack's top does not write past (gsPutStr).
+func (gs *GsStackBlock) End(k int64) unsafe.Pointer { return unsafe.Add(gs.Base[k], gs.Cap[k]) }
+
+// gsOverflow is the C runtime's report of a data stack that grows past its
+// region (gs_overflow_text), raised before a write would cross end, where
+// the region ends. The stacks are main's: there are no threads yet.
+func gsOverflow(end unsafe.Pointer) {
+	var usable, reserve int64
+	for _, b := range gsBlocks {
+		for k := range b.Cap {
+			if b.End(int64(k)) == end {
+				usable, reserve = b.Cap[k], b.reserve
+			}
+		}
+	}
+	reserve -= reserve % int64(syscall.Getpagesize())
+	msg := "data stack overflow: a value on main's data stacks grew past the " + gsSize(usable) +
+		" reserved for it"
+	if usable < reserve {
+		msg += " (halved from " + gsSize(reserve) + " when the platform ran out of address space)"
+	}
+	panic(&GsError{Msg: msg + "; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, " +
+		"up to 256 TB"})
+}
+
+// gsSize is a size as the C runtime writes one (gs_size): a whole number of
+// the largest of bytes, KB, MB, GB and TB that has one.
+func gsSize(n int64) string {
+	units := [...]string{" bytes", " KB", " MB", " GB", " TB"}
+	u := 0
+	for u < 4 && n != 0 && n%1024 == 0 {
+		n /= 1024
+		u++
+	}
+	return strconv.FormatInt(n, 10) + units[u]
 }
 
 // gsReserveRegion maps one region: address space only, committed by the OS
@@ -600,39 +647,73 @@ func GsF2U(d float64, f32 bool, file string, line int) uint64 {
 // ---------------------------------------------------------------------------
 // Text forms (§3.7). Each writes a value's text at p, at most gsFmtMax
 // bytes, and returns where the text ends; print renders a line on a data
-// stack this way and writes it out whole.
+// stack this way and writes it out whole. end is where the stack's region
+// ends: a text that would run past it is a data stack overflow (gsOverflow),
+// found before a byte of it is written, where the C runtime's guard gap
+// finds it as the byte is written. A value is formatted in place while
+// gsFmtMax bytes are left, and in a buffer of its own nearer the end.
 
 const gsFmtMax = 32
 
 func gsFmtBuf(p unsafe.Pointer) []byte { return unsafe.Slice((*byte)(p), gsFmtMax)[:0] }
 
-func gsFmtI64(p unsafe.Pointer, v int64) unsafe.Pointer {
-	return unsafe.Add(p, len(strconv.AppendInt(gsFmtBuf(p), v, 10)))
-}
+func gsRoom(p, end unsafe.Pointer) bool { return uintptr(end)-uintptr(p) >= gsFmtMax }
 
-func gsFmtU64(p unsafe.Pointer, v uint64) unsafe.Pointer {
-	return unsafe.Add(p, len(strconv.AppendUint(gsFmtBuf(p), v, 10)))
-}
-
-func gsFmtF64(p unsafe.Pointer, v float64) unsafe.Pointer {
-	return unsafe.Add(p, len(gsAppendFloat(gsFmtBuf(p), v, false)))
-}
-
-func gsFmtF32(p unsafe.Pointer, v float32) unsafe.Pointer {
-	return unsafe.Add(p, len(gsAppendFloat(gsFmtBuf(p), float64(v), true)))
-}
-
-func gsFmtBool(p unsafe.Pointer, v bool) unsafe.Pointer {
-	if v {
-		return gsPutStr(p, "true")
+func gsFmtI64(p, end unsafe.Pointer, v int64) unsafe.Pointer {
+	if gsRoom(p, end) {
+		return unsafe.Add(p, len(strconv.AppendInt(gsFmtBuf(p), v, 10)))
 	}
-	return gsPutStr(p, "false")
+	var b [gsFmtMax]byte
+	return gsPutBytes(p, end, strconv.AppendInt(b[:0], v, 10))
+}
+
+func gsFmtU64(p, end unsafe.Pointer, v uint64) unsafe.Pointer {
+	if gsRoom(p, end) {
+		return unsafe.Add(p, len(strconv.AppendUint(gsFmtBuf(p), v, 10)))
+	}
+	var b [gsFmtMax]byte
+	return gsPutBytes(p, end, strconv.AppendUint(b[:0], v, 10))
+}
+
+func gsFmtF64(p, end unsafe.Pointer, v float64) unsafe.Pointer {
+	if gsRoom(p, end) {
+		return unsafe.Add(p, len(gsAppendFloat(gsFmtBuf(p), v, false)))
+	}
+	var b [gsFmtMax]byte
+	return gsPutBytes(p, end, gsAppendFloat(b[:0], v, false))
+}
+
+func gsFmtF32(p, end unsafe.Pointer, v float32) unsafe.Pointer {
+	if gsRoom(p, end) {
+		return unsafe.Add(p, len(gsAppendFloat(gsFmtBuf(p), float64(v), true)))
+	}
+	var b [gsFmtMax]byte
+	return gsPutBytes(p, end, gsAppendFloat(b[:0], float64(v), true))
+}
+
+func gsFmtBool(p, end unsafe.Pointer, v bool) unsafe.Pointer {
+	if v {
+		return gsPutStr(p, end, "true")
+	}
+	return gsPutStr(p, end, "false")
 }
 
 // gsPutStr writes the bytes of s at p.
-func gsPutStr(p unsafe.Pointer, s string) unsafe.Pointer {
+func gsPutStr(p, end unsafe.Pointer, s string) unsafe.Pointer {
+	if uintptr(len(s)) > uintptr(end)-uintptr(p) {
+		gsOverflow(end)
+	}
 	copy(unsafe.Slice((*byte)(p), len(s)), s)
 	return unsafe.Add(p, len(s))
+}
+
+// gsPutBytes writes the bytes of b at p.
+func gsPutBytes(p, end unsafe.Pointer, b []byte) unsafe.Pointer {
+	if uintptr(len(b)) > uintptr(end)-uintptr(p) {
+		gsOverflow(end)
+	}
+	copy(unsafe.Slice((*byte)(p), len(b)), b)
+	return unsafe.Add(p, len(b))
 }
 
 // gsOut writes the bytes from base up to end to stdout, in one write.

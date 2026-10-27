@@ -334,7 +334,7 @@ struct CodeGenGo {
     void GenFvCall(Call *c, const GoDst &d);
     void GenBuiltin(Call *c, const GoDst &d);
     void EmitPrint(Call *c);
-    void RenderInto(const string &cur, Node *a, Call *c);
+    void RenderInto(const string &cur, const string &end, Node *a, Call *c);
 
     // ------------------------------------------------------------------
     // Functions, globals and the program (codegen_go_emit.h).

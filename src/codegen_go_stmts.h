@@ -66,7 +66,7 @@ inline string CodeGenGo::AllocStk() {
     // Spaced as gofmt spaces an index.
     auto idx = SpIdx(k);
     idx.erase(std::remove(idx.begin(), idx.end(), ' '), idx.end());
-    return cat("gs.Stks[", idx, "]");
+    return idx;
 }
 
 // What an exit through scope s runs: its `defer` bodies, latest first. A

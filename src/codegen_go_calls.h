@@ -218,23 +218,26 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
 // write (§3.7), as the C backend's does (TempBuilder). The bytes are written
 // at the stack's top through a cursor of the line's own: nothing else uses
 // that stack while it is rendered, since a call in an argument is handed the
-// indices above it. An argument that ends the flow (a return out of an
-// inlined body, say) leaves the cursor declared and the rest of the line
-// unreached, which FinishBody gives a use of its own.
+// indices above it. Each write is bounded by the end of the stack's region:
+// a line that would run past it is a data stack overflow, as the C
+// runtime's guard gap makes it. An argument that ends the flow (a return
+// out of an inlined body, say) leaves the cursors declared and the rest of
+// the line unreached, which FinishBody gives a use of its own.
 inline void CodeGenGo::EmitPrint(Call *c) {
     if (Unreached()) return GenUnreached([&] { EmitPrint(c); });
-    auto stk = AllocStk();
-    auto base = T(), cur = T();
-    Decl(base, "unsafe.Pointer", stk);
+    auto k = AllocStk();
+    auto base = T(), cur = T(), end = T();
+    Decl(base, "unsafe.Pointer", cat("gs.Stks[", k, "]"));
     Decl(cur, "unsafe.Pointer", base);
-    for (auto a : c->ArgNodes()) RenderInto(cur, a, c);
-    L(cur, " = gsPutStr(", cur, ", \"\\n\")");
+    Decl(end, "unsafe.Pointer", cat("gs.End(", k, ")"));
+    for (auto a : c->ArgNodes()) RenderInto(cur, end, a, c);
+    L(cur, " = gsPutStr(", cur, ", ", end, ", \"\\n\")");
     L("gsOut(", base, ", ", cur, ")");
 }
 
 // The text of argument a at the cursor `cur` (§3.7): a scalar's, or a string
 // literal's bytes as they are.
-inline void CodeGenGo::RenderInto(const string &cur, Node *a, Call *c) {
+inline void CodeGenGo::RenderInto(const string &cur, const string &end, Node *a, Call *c) {
     auto ctx = GoFmtContext(c, a);
     auto t = a->exprtype;
     if (ctx)
@@ -242,21 +245,23 @@ inline void CodeGenGo::RenderInto(const string &cur, Node *a, Call *c) {
             if (fs.first == t || (IsScalarT(t) && IsScalarT(fs.first) && SameGoT(fs.first, t)))
                 Unsupported(a->line, "a format overload");
     if (auto s = Is<StrLit>(a)) {
-        L(cur, " = gsPutStr(", cur, ", ", GoStr(s->val), ")");
+        L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(s->val), ")");
         return;
     }
     if (!IsScalarT(t)) Unsupported(a->line, cat("printing a value of type ", TypeText(t)));
     auto x = GenX(a);
     switch (t->kind) {
         case TY_INT:
-            if (t->intstorage == IS_U64) L(cur, " = gsFmtU64(", cur, ", ", x, ")");
-            else L(cur, " = gsFmtI64(", cur, ", ", Coerce(x, t, ast.inttypes[IS_I64], a->line), ")");
+            if (t->intstorage == IS_U64) L(cur, " = gsFmtU64(", cur, ", ", end, ", ", x, ")");
+            else L(cur, " = gsFmtI64(", cur, ", ", end, ", ",
+                   Coerce(x, t, ast.inttypes[IS_I64], a->line), ")");
             return;
         case TY_FLT:
-            L(cur, " = gsFmt", t->fltstorage == FS_F32 ? "F32" : "F64", "(", cur, ", ", x, ")");
+            L(cur, " = gsFmt", t->fltstorage == FS_F32 ? "F32" : "F64", "(", cur, ", ", end, ", ", x,
+              ")");
             return;
         default:
-            L(cur, " = gsFmtBool(", cur, ", ", x, ")");
+            L(cur, " = gsFmtBool(", cur, ", ", end, ", ", x, ")");
             return;
     }
 }

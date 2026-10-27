@@ -560,6 +560,12 @@ stopping it leaves: each is written as Go at both levels, which must vet and
 build, and as C, which must compile, and reported on with `--stacks` as
 above, but neither is run.
 
+Data stack overflow is checked on programs the runner generates: with
+`--stack-reserve 64K`, a print whose line runs past its stack's region, by
+its literal or inside a value's text (an `i64`, `u64`, `f64`, `f32` or
+`bool`), and lines that just fit, must run in Go as they do in C, with the
+C runtime's message and exit status.
+
 Each program in `test/go/unsupported/` uses something this version of the
 backend does not compile, and must stop the Go compile with every message its
 `// error:` lines name, where the C backend checks it. A few command-line
