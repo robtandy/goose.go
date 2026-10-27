@@ -1,0 +1,1 @@
+goose runtime error: no 99 among 6 values (test/go/programs/abort_str.goose:7)

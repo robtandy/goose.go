@@ -1,0 +1,1 @@
+goose runtime error: balance went negative: -2 (test/go/programs/abort_computed.goose:9)
