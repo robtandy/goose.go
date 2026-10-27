@@ -1,0 +1,12 @@
+count 0 0
+count 1 1
+count 2 2
+range 5 5 1
+range 6 6 1
+range 7 7 1
+array 0 0 10
+array 1 1 20
+array 2 2 30
+indexed range 2 0 0
+indexed range 3 1 1
+110010
