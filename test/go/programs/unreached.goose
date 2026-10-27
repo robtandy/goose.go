@@ -185,7 +185,20 @@ fn nested(c: bool, d: bool) -> i64 {
     x + 1
 }
 
+// The review's repros, as written: the condition always breaks, and the
+// print's only argument returns before anything is written.
+fn review_while() {
+    let c = true;
+    while { if c { break; } true } {}
+    print("done");
+}
+
+fn review_print(c: bool) { print({ if c { return; } 1 }); }
+
 fn main() {
+    review_while();
+    review_print(true);
+    review_print(false);
     print(cond_break(true), " ", cond_break(false), " ", cond_return(true), " ",
           cond_return(false), " ", cond_always());
     early_print(true);
