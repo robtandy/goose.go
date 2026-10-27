@@ -601,35 +601,7 @@ struct CodeGenGo {
     FnSpec *curspec = nullptr;
     SpecInfo *curinfo = nullptr;
     string body;
-    // The indentation of the lines being emitted, one tab per Go block: a
-    // block closing (the indentation dropping) takes the locals declared in
-    // it out of the scopes that noted them (NoteLocal), so that no exit
-    // outside it names them.
-    struct Indent {
-        CodeGenGo *cg = nullptr;
-        int v = 1;
-        operator int() const { return v; }
-        Indent &operator=(int x) {
-            v = x;
-            return *this;
-        }
-        Indent &operator++() {
-            v++;
-            return *this;
-        }
-        int operator++(int) { return v++; }
-        Indent &operator--() {
-            v--;
-            cg->DropLocals(v);
-            return *this;
-        }
-        int operator--(int) {
-            auto o = v--;
-            cg->DropLocals(v);
-            return o;
-        }
-    };
-    Indent ind;
+    int ind = 1;   // The indentation of the lines being emitted, one tab per Go block.
     int tmpn = 0;
     int stknext = 0, stkmax = 0;
     string spexpr;                      // "gs_sp" in a function, "0" in gsInitGlobals.
@@ -671,10 +643,6 @@ struct CodeGenGo {
         // an exit runs them among the restores, latest first (EmitRestores).
         vector<pair<string, string>> saves;
         vector<pair<size_t, Defer *>> defers;
-        // The Go locals declared in this scope, each with the indentation of
-        // its Go block: every exit keeps those whose address the function
-        // takes alive up to it (KEEPMARK).
-        vector<pair<string, int>> locals;
         SFunction *ibsf = nullptr;      // SC_IB: which returns exit here.
         // SC_LOOP, SC_BLOCK, SC_IB: the Go label a break, continue or
         // return names, written in front of the statement once one does
@@ -715,6 +683,9 @@ struct CodeGenGo {
         unordered_map<const VarDef *, NrvoDest> nrvo;
         unordered_map<string, int> openat;
         vector<string> dsttop0, dstcounts;
+        unordered_map<string, string> ltypes;
+        vector<pair<string, string>> ptypes;
+        int curnres = 0;
     };
     FnState SaveFnState();
     void RestoreFnState(FnState &s);
@@ -738,32 +709,41 @@ struct CodeGenGo {
     // The marker a local's declaration ends with: FinishBody gives the
     // locals nothing reads a use of their own, which Go requires.
     static constexpr const char *DECLMARK = "\x01";
-    // The marker of a line that keeps a local alive where its scope is left
-    // (runtime.KeepAlive), which FinishBody keeps for the locals whose
-    // address the function takes and drops for the rest. A data stack is
-    // memory the collector does not scan, so a reference into a Go local
-    // stored there is no reference it sees: one the local's scope holds
-    // keeps it, as the lifetime rules make that scope outlive the reference
-    // (§9.2, AGENTS.md).
-    static constexpr const char *KEEPMARK = "\x02";
-    void NoteLocal(const string &name) {
-        for (auto i = (int)scopes.size() - 1; i >= 0; i--) {
-            if (scopes[i].kind == SC_STMT) continue;
-            auto &ls = scopes[i].locals;
-            if (ls.empty() || ls.back().first != name) ls.push_back({ name, (int)ind });
-            return;
-        }
-    }
-    void DropLocals(int depth) {
-        for (auto &s : scopes)
-            while (!s.locals.empty() && s.locals.back().second > depth) s.locals.pop_back();
-    }
     // Declares a local of Go type gt, with an initial value where init is
     // not empty.
     void Decl(const string &name, const string &gt, const string &init = "") {
         L("var ", name, " ", gt, init.empty() ? "" : " = ", init, DECLMARK, name);
-        NoteLocal(name);
+        NoteType(name, gt);
     }
+
+    // The fixed-frame stack (gs.Frame, codegen_go_emit.h). A local or a
+    // parameter whose address the function takes lives in the function's
+    // frame there rather than on Go's stack, which moves as it grows and
+    // which the collector scans where nothing a value's bytes hold is seen:
+    // FinishBody finds them, by the Go types the declarations give
+    // (ltypes; ptypes, the parameters'). FRAMEEND marks where the end of a
+    // body is reached, which gives the frame back as a return does.
+    unordered_map<string, string> ltypes;
+    vector<pair<string, string>> ptypes;
+    int curnres = 0;                    // The Go results of the function emitted.
+    // The Go types of the fixed-size values of more than NATIVE_VALUE_LIMIT
+    // bytes a recursive cycle's locals hold: in the frame too, as C would
+    // keep them off its native stack were they outside a cycle.
+    set<string> largegts;
+    void NoteType(const string &name, const string &gt) { ltypes[name] = gt; }
+    static constexpr const char *FRAMEEND = "\x03";
+    // Whether a callee takes the block is known once every body is: one
+    // whose frame holds a local takes it, as does any calling one. Until
+    // then a call's and a signature's place for it holds GSARG/GSPARAM and
+    // the specialization's number, which ResolveGsArgs replaces.
+    static constexpr const char *GSARG = "\x05";
+    static constexpr const char *GSPARAM = "\x06";
+    unordered_map<FnSpec *, int> specnum;
+    vector<FnSpec *> numspec;
+    unordered_map<FnSpec *, set<FnSpec *>> phcalls;
+    set<FnSpec *> hasframe;
+    string GsArgPh(FnSpec *sp);
+    void ResolveGsArgs();
 
     // The data stack index k of this function, and the first one free.
     string SpIdx(int k) { return spexpr == "0" ? cat(k) : k ? cat(spexpr, " + ", k) : spexpr; }
@@ -895,7 +875,7 @@ struct CodeGenGo {
     string ParamT(TypeExpr *t, Line ln);
     string Signature(FnSpec *sp);
     void ResetFnState();
-    string FinishBody(const string &b);
+    string FinishBody(const string &b, bool frames = false, int nres = 0, bool *framed = nullptr);
     void EmitSpec(FnSpec *sp, bool er = false);
     // Globals initialized at their declaration, which gsInitGlobals skips,
     // and those the program can tell are there (FindUsedGlobals).
@@ -915,7 +895,6 @@ struct CodeGenGo {
     string Source(const string &srcname);
 
     CodeGenGo(Ast &_ast, const GoOptions &o) : ast(_ast), opts(o) {
-        ind.cg = this;
         debug = opts.debug;
         maxstacks = opts.stacks.maxstacks;
         CollectSpecs();
@@ -929,6 +908,7 @@ struct CodeGenGo {
         EmitProgram();
         EmitRenderFns();
         EmitTypeDecls();
+        ResolveGsArgs();
     }
 };
 

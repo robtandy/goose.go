@@ -27,10 +27,23 @@ type GsStackBlock struct {
 	Stks    []unsafe.Pointer // Current stack tops, indexed by gs_sp + k.
 	Base    []unsafe.Pointer // Where each stack's region starts.
 	Cap     []int64          // Each region's usable bytes, its guard gap not included.
-	regions [][]byte
-	reserve int64
-	gap     int64
+	// The fixed-frame stack: the address-taken fixed-size locals of the
+	// functions running, each function's frame above its caller's, taken as
+	// it starts and given back at its every return, as a native stack's
+	// frame is. Outside the Go heap, they never move, so the bytes of a
+	// value may hold their addresses where the collector does not look.
+	Frame     unsafe.Pointer
+	FrameBase unsafe.Pointer
+	FrameEnd  unsafe.Pointer
+	frame     []byte
+	regions   [][]byte
+	reserve   int64
+	gap       int64
 }
+
+// The fixed-frame stack's reservation: address space only, as the data
+// stacks' is, whatever their own (C's frames are on its native stack).
+const gsFrameReserve = 1 << 30
 
 // The smallest a region gets before a refusal is fatal, and the usable size
 // new regions currently get: it halves, in whole pages, each time the
@@ -53,8 +66,34 @@ func NewStackBlock(numStacks int, reserve, gap int64) *GsStackBlock {
 	gs := &GsStackBlock{reserve: reserve, gap: gap}
 	gsBlocks = append(gsBlocks, gs)
 	gs.EnsureStacks(numStacks)
+	gs.reserveFrame()
 	return gs
 }
+
+// reserveFrame maps the fixed-frame stack, halving its reservation where
+// the platform refuses one.
+func (gs *GsStackBlock) reserveFrame() {
+	n := int64(gsFrameReserve)
+	for {
+		r, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
+			syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+		if err == nil {
+			gs.frame = r
+			gs.FrameBase = unsafe.Pointer(unsafe.SliceData(r))
+			gs.Frame = gs.FrameBase
+			gs.FrameEnd = unsafe.Add(gs.FrameBase, n)
+			return
+		}
+		if n <= gsRegionMin {
+			GsPanic("cannot reserve the fixed-frame stack's address space")
+		}
+		n /= 2
+	}
+}
+
+// GsFrameOverflow is a function's frame that does not fit what is left of
+// the fixed-frame stack, which C reports as its native stack's overflow.
+func GsFrameOverflow() { GsPanic("native call stack overflow") }
 
 // EnsureStacks reserves stacks until the block has at least n.
 func (gs *GsStackBlock) EnsureStacks(n int) {
@@ -68,8 +107,12 @@ func (gs *GsStackBlock) EnsureStacks(n int) {
 	}
 }
 
-// Reset rewinds every stack of the block to empty.
-func (gs *GsStackBlock) Reset() { copy(gs.Stks, gs.Base) }
+// Reset rewinds every stack of the block to empty, its fixed-frame stack's
+// too.
+func (gs *GsStackBlock) Reset() {
+	copy(gs.Stks, gs.Base)
+	gs.Frame = gs.FrameBase
+}
 
 // Close releases the block's regions.
 func (gs *GsStackBlock) Close() error {
@@ -79,7 +122,13 @@ func (gs *GsStackBlock) Close() error {
 			first = err
 		}
 	}
+	if gs.frame != nil {
+		if err := syscall.Munmap(gs.frame); err != nil && first == nil {
+			first = err
+		}
+	}
 	gs.regions, gs.Stks, gs.Base, gs.Cap = nil, nil, nil, nil
+	gs.frame, gs.Frame, gs.FrameBase, gs.FrameEnd = nil, nil, nil, nil
 	return first
 }
 
@@ -342,13 +391,13 @@ type GsPref struct {
 func GsStr(s string) GsSlice { return GsSlice{unsafe.Pointer(unsafe.StringData(s)), int64(len(s))} }
 
 // GsSub is the slice of the elements lo up to hi of the n at p, each es
-// bytes. One that is empty at the end of the run starts at p, which keeps
-// its address inside the storage it slices.
+// bytes. An empty one starts where it is, at the end of the run too, so
+// that two at different places are different slices (§3.10): what a slice
+// can point into is never the Go heap, where an address one past an
+// object's end would be no valid Go pointer.
 func GsSub(p unsafe.Pointer, lo, hi, n, es int64) GsSlice {
-	if lo < n {
-		return GsSlice{unsafe.Add(p, lo*es), hi - lo}
-	}
-	return GsSlice{p, 0}
+	_ = n
+	return GsSlice{unsafe.Add(p, lo*es), hi - lo}
 }
 
 // GsIdx is i, checked to be an index of an array of n elements (GS_IDX).

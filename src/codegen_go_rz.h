@@ -1286,6 +1286,7 @@ inline void CodeGenGo::EnterDst(int si, const GoDst &d) {
 inline void CodeGenGo::DeclareTop0(size_t at, int indent, const string &name, const string &stk) {
     string line((size_t)indent, '\t');
     Append(line, "var ", name, " unsafe.Pointer = ", Top(stk), DECLMARK, name, "\n");
+    NoteType(name, "unsafe.Pointer");
     if (at > body.size()) at = body.size();
     body.insert(at, line);
     // A label recorded here belongs in front of the statement that follows,

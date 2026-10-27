@@ -5,26 +5,28 @@
 // represented as (DESIGN.md §3.2), with its declaration, its structural
 // equality (§4.5) and its default value (§4.2).
 //
-// The Go representation of a type keeps its C layout byte for byte wherever
-// Go can hold it there:
-// * A struct, a variant or a static-capacity limited array whose every
-//   field lies at an offset its Go alignment divides, and whose size leaves
-//   Go no tail padding to add, is a native Go struct (GR_NATIVE), the pads
-//   blank fields: its fields are Go's own, which the Go compiler keeps in
-//   registers.
-// * One that does not, and holds no Go pointer, is the bytes of its layout,
-//   `[FixedSize]byte` (GR_BYTES), a field of it reached at its offset
-//   through unsafe.Add, which Go compiles to one unaligned load or store.
+// The Go representation of every fixed-size type is its C layout, byte for
+// byte: FixedSize bytes, each field at its LayoutFields offset, an ADT's
+// payloads overlapping behind its tag.
+// * A struct, a variant or a static-capacity limited array that holds no
+//   address, whose every field lies at an offset its Go alignment divides,
+//   and whose size leaves Go no tail padding to add, is a native Go struct
+//   (GR_NATIVE), the pads blank fields: its fields are Go's own, which the
+//   Go compiler keeps in registers.
+// * Any other is the bytes of its layout, `[FixedSize]byte` (GR_BYTES), a
+//   field of it reached at its offset through unsafe.Add, which Go compiles
+//   to one unaligned load or store -- one holding references or slices too.
 // * A payload-less ADT is its tag, a named integer (GR_TAG); any other
-//   fixed-mode ADT holding no Go pointer is the bytes of its tag and its
-//   largest payload (GR_BYTES), the payload behind the tag.
-// * A reference is a Go pointer and a slice a GsSlice, whose Data is one,
-//   so that the Go garbage collector sees every address the program holds
-//   into storage it manages: a value holding them that cannot keep its C
-//   layout (a misaligned reference, an ADT whose payloads hold one, which a
-//   union of bytes would hide) is a native Go struct of Go's own layout,
-//   which nothing the program can observe depends on. An ADT of that kind
-//   holds each variant's payload in a field of its own beside the tag.
+//   fixed-mode ADT is the bytes of its tag and its largest payload
+//   (GR_BYTES), the payloads overlapping behind the tag.
+// * A reference is a Go pointer (or an unsafe.Pointer, RefIsAddr) and a
+//   slice a GsSlice, whose Data is one. Every address the program holds
+//   points outside the Go heap and never moves: into a data stack, the
+//   fixed-frame stack its address-taken locals live on (gs.Frame,
+//   codegen_go_emit.h), a global or a literal. So the bytes of a value can
+//   hold one where the collector does not look, and a value holding Go
+//   pointers at an address that may be unaligned is reached byte for byte
+//   (GoLoc::unal), which checkptr accepts and needs no write barrier.
 #pragma once
 
 namespace goose {
@@ -268,7 +270,9 @@ inline string CodeGenGo::LocalT(TypeExpr *t, Line ln) {
         Unsupported(ln, cat("a local or temporary value of ", TypeText(t), " (", FixedSize(t),
                             " bytes: C holds one of more than ", NATIVE_VALUE_LIMIT,
                             " on a data stack)"));
-    return GoT(t, ln);
+    auto gt = GoT(t, ln);
+    if (IsLargeFixed(t)) largegts.insert(gt);
+    return gt;
 }
 
 // Whether the C backend makes a global of this initializer static data

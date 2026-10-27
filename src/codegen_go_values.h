@@ -107,9 +107,8 @@ inline bool CodeGenGo::TryPure(const function<string()> &gen, string &x) {
     // the stacks it claims and the tops it saves -- goes with its code.
     auto savenext = stknext, savemax = stkmax;
     auto saveopen = openat;
-    vector<size_t> nlocals, nsaves, ndefers;
+    vector<size_t> nsaves, ndefers;
     for (auto &s : scopes) {
-        nlocals.push_back(s.locals.size());
         nsaves.push_back(s.saves.size());
         ndefers.push_back(s.defers.size());
     }
@@ -120,8 +119,7 @@ inline bool CodeGenGo::TryPure(const function<string()> &gen, string &x) {
     stknext = savenext;
     stkmax = savemax;
     openat = std::move(saveopen);
-    for (size_t i = 0; i < nlocals.size() && i < scopes.size(); i++) {
-        scopes[i].locals.resize(nlocals[i]);
+    for (size_t i = 0; i < nsaves.size() && i < scopes.size(); i++) {
         scopes[i].saves.resize(nsaves[i]);
         scopes[i].defers.resize(ndefers[i]);
     }

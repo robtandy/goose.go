@@ -26,6 +26,10 @@ inline void CodeGenGo::CollectSpecs() {
     map<string_view, int> namecount;
     for (auto sp : livespecs) namecount[sp->sf->qname]++;
     for (auto sp : livespecs) {
+        specnum[sp] = (int)numspec.size();
+        numspec.push_back(sp);
+    }
+    for (auto sp : livespecs) {
         auto &si = sinfo[sp];
         auto base = Sanitize(sp->sf->ns, sp->sf->name);
         if (namecount[sp->sf->qname] > 1) Append(base, "_", sp->id);
@@ -181,6 +185,13 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
     auto add = [&](const string &p) { Append(params, params.empty() ? "" : ", ", p); };
     if (si.needssp) add("gs *GsStackBlock, gs_sp int64");
     else if (si.needsgs) add("gs *GsStackBlock");
+    else add(cat(GSPARAM, specnum.at(sp), GSPARAM));
+    // The parameters a body can take the address of (FinishBody).
+    ptypes.clear();
+    auto param = [&](const string &n, const string &gt) {
+        add(cat(n, " ", gt));
+        ptypes.push_back({ n, gt });
+    };
     if (sp->params.size() != sp->argtypes.size())
         Fail(sp->sf->line, "internal: parameter types");
     for (size_t i = 0; i < sp->params.size(); i++) {
@@ -192,17 +203,18 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
         auto pn = LocalName(vd);
         if (IsPoolParam(sp, i)) {
             GoT(pt, sp->sf->line);
-            add(cat(pn, " GsPref"));
+            param(pn, "GsPref");
         } else if (IsResz(pt)) {
             GoT(pt, sp->sf->line);
             auto sn = Unique2(cat(pn, "_stk"));
-            add(cat(pn, " ", RzGoT(pt, sp->sf->line), ", ", sn, " int64"));
+            param(pn, RzGoT(pt, sp->sf->line));
+            add(cat(sn, " int64"));
             vstk[vd] = sn;
         } else if (IsBytesT(pt)) {
             GoT(pt, sp->sf->line);
-            add(cat(pn, " unsafe.Pointer"));
+            param(pn, "unsafe.Pointer");
         } else {
-            add(cat(pn, " ", ParamT(pt, sp->sf->line)));
+            param(pn, ParamT(pt, sp->sf->line));
         }
     }
     for (auto fv : si.freevars) {
@@ -249,6 +261,7 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
                                           TypeText(rt), ")"));
         Append(rets, nrets++ ? ", " : "", ParamT(rt, sp->sf->line));
     }
+    curnres = nrets;
     if (nrets > 1) rets = cat("(", rets, ")");
     return cat("func ", emiter ? ernames[sp] : si.name, "(", params, ")", rets.empty() ? "" : " ", rets);
 }
@@ -284,6 +297,9 @@ inline void CodeGenGo::ResetFnState() {
     openat.clear();
     dsttop0.clear();
     dstcounts.clear();
+    ltypes.clear();
+    ptypes.clear();
+    curnres = 0;
 }
 
 // The identifiers a line reads, into uses: every one but the declared names
@@ -351,12 +367,70 @@ static void GoLineAddressed(string_view s, unordered_set<string> &addressed) {
     }
 }
 
+// A line's code with each identifier `ren` maps renamed, outside its string
+// literals and comments, but for a field selector's: the first of the pair
+// where it is used, the second where `&` takes its address (and nothing
+// selects a part of it after).
+static string GoRename(string_view s, const unordered_map<string, pair<string, string>> &ren) {
+    auto isid = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
+    string out;
+    out.reserve(s.size() + 16);
+    for (size_t p = 0; p < s.size();) {
+        auto c = s[p];
+        if (c == '"' || c == '\'') {
+            auto b = p;
+            for (p++; p < s.size() && s[p] != c; p++)
+                if (s[p] == '\\') p++;
+            p++;
+            out.append(s.substr(b, p - b));
+        } else if (c == '/' && p + 1 < s.size() && s[p + 1] == '/') {
+            out.append(s.substr(p));
+            break;
+        } else if (c == '&' && p + 1 < s.size() && (isalpha((unsigned char)s[p + 1]) || s[p + 1] == '_') &&
+                   (p == 0 || s[p - 1] != '&')) {
+            auto b = p + 1, e = b;
+            while (e < s.size() && isid(s[e])) e++;
+            auto it = ren.find(string(s.substr(b, e - b)));
+            if (it == ren.end()) {
+                out.append(s.substr(p, e - p));
+            } else if (e < s.size() && (s[e] == '.' || s[e] == '[')) {
+                Append(out, "&", it->second.first);
+            } else {
+                out += it->second.second;
+            }
+            p = e;
+        } else if (isalpha((unsigned char)c) || c == '_') {
+            auto b = p;
+            while (p < s.size() && isid(s[p])) p++;
+            auto id = s.substr(b, p - b);
+            auto it = b > 0 && s[b - 1] == '.' ? ren.end() : ren.find(string(id));
+            if (it == ren.end()) out.append(id);
+            else out += it->second.first;
+        } else if (isdigit((unsigned char)c)) {
+            auto b = p;
+            while (p < s.size() && isid(s[p])) p++;
+            out.append(s.substr(b, p - b));
+        } else {
+            out += c;
+            p++;
+        }
+    }
+    return out;
+}
+
 // A finished body's declarations without their markers (Decl), each local
 // nothing reads followed by a use of its own: Go rejects a local it never
 // sees read, and an optimized body may well leave one, or only assign it.
-// A local is kept alive where its scope is left (KEEPMARK) only where the
-// function takes its address.
-inline string CodeGenGo::FinishBody(const string &b) {
+//
+// Where `frames`, a body whose function takes the block (gs): each local or
+// parameter whose address it takes lives in the function's frame on the
+// fixed-frame stack instead of on Go's stack (codegen_go.h, ltypes). Its
+// declaration becomes a pointer to its slot, which every use dereferences;
+// the frame is taken as the body starts, its slots' offsets constants Go
+// works out from their types, and given back at every return (the values
+// returned read first) and where the body's end is reached (FRAMEEND).
+// `nres` is the function's count of Go results; `framed` reports a frame.
+inline string CodeGenGo::FinishBody(const string &b, bool frames, int nres, bool *framed) {
     unordered_map<string, int> uses;
     unordered_set<string> addressed;
     vector<string_view> lines;
@@ -366,32 +440,141 @@ inline string CodeGenGo::FinishBody(const string &b) {
         lines.push_back(string_view(b).substr(pos, nl - pos));
         pos = nl + 1;
     }
+    auto trimmed = [](string_view line) { return line.substr(std::min(line.size(), line.find_first_not_of('\t'))); };
     for (auto line : lines) {
-        if (line.find(KEEPMARK[0]) != string_view::npos) continue;
+        if (trimmed(line) == FRAMEEND) continue;
         GoLineUses(line.substr(0, line.find(DECLMARK[0])), uses);
         GoLineAddressed(line.substr(0, line.find(DECLMARK[0])), addressed);
     }
+    // The frame's slots: the address-taken locals the declarations name, in
+    // their order, then the parameters.
+    vector<pair<string, string>> slots;   // (name, Go type)
+    unordered_map<string, int> slotof;
+    unordered_map<string, pair<string, string>> ren;
+    if (frames) {
+        for (auto line : lines) {
+            auto m = line.find(DECLMARK[0]);
+            if (m == string_view::npos) continue;
+            auto names = line.substr(m + 1);
+            for (size_t p = 0; p <= names.size();) {
+                auto e = names.find(',', p);
+                if (e == string_view::npos) e = names.size();
+                auto n = string(names.substr(p, e - p));
+                p = e + 1;
+                auto t = ltypes.find(n);
+                if (n.empty() || t == ltypes.end() || slotof.count(n)) continue;
+                if (!addressed.count(n) && !largegts.count(t->second)) continue;
+                slotof[n] = (int)slots.size();
+                slots.push_back({ n, t->second });
+                ren[n] = { cat("(*", n, ")"), n };
+            }
+        }
+        for (auto &[n, t] : ptypes) {
+            if (!addressed.count(n) || slotof.count(n)) continue;
+            auto pn = cat("gs_p", slots.size());
+            slotof[n] = (int)slots.size();
+            slots.push_back({ n, t });
+            ren[n] = { cat("(*", pn, ")"), pn };
+        }
+    }
+    if (framed) *framed = !slots.empty();
     string out;
     out.reserve(b.size());
+    auto slotptr = [&](int k, const string &t) { return cat("(*", t, ")(unsafe.Add(gs_fr, gs_fo", k, "))"); };
+    if (!slots.empty()) {
+        // Each slot 8-aligned, and of a byte at least, so that no two
+        // variables share an address (§3.8).
+        out += "\tconst (\n\t\tgs_fo0 = 0\n";
+        for (size_t k = 0; k < slots.size(); k++)
+            Append(out, "\t\tgs_fo", k + 1, " = gs_fo", k, " + (max(unsafe.Sizeof(*new(", slots[k].second,
+                   ")), 1)+7)&^7\n");
+        Append(out, "\t)\n\tgs_fr := gs.Frame\n\tif uintptr(gs.FrameEnd)-uintptr(gs_fr) < gs_fo", slots.size(),
+               " {\n\t\tGsFrameOverflow()\n\t}\n\tgs.Frame = unsafe.Add(gs_fr, gs_fo", slots.size(), ")\n");
+        for (auto &[n, t] : ptypes) {
+            auto it = slotof.find(n);
+            if (it == slotof.end()) continue;
+            auto pn = ren[n].second;
+            Append(out, "\t", pn, " := ", slotptr(it->second, t), "\n\t*", pn, " = ", n, "\n");
+        }
+    }
     for (auto line : lines) {
-        if (auto k = line.find(KEEPMARK[0]); k != string_view::npos) {
-            auto n = string(line.substr(k + 1));
-            if (addressed.count(n)) Append(out, line.substr(0, k), "runtime.KeepAlive(&", n, ")\n");
+        auto indent = line.substr(0, line.find_first_not_of('\t'));
+        if (trimmed(line) == FRAMEEND) {
+            if (!slots.empty()) Append(out, indent, "gs.Frame = gs_fr\n");
             continue;
         }
         auto m = line.find(DECLMARK[0]);
-        if (m == string_view::npos) {
-            Append(out, line, "\n");
-            continue;
+        auto code = line.substr(0, m);
+        auto body = trimmed(code);
+        string marks = m == string_view::npos ? string() : string(line.substr(m + 1));
+        if (!slots.empty()) {
+            string done;
+            if (body.compare(0, 4, "var ") == 0) {
+                // var NAME TYPE [= INIT]
+                auto ne = body.find(' ', 4);
+                auto n = string(body.substr(4, ne == string_view::npos ? string_view::npos : ne - 4));
+                if (auto it = slotof.find(n); it != slotof.end() && ne != string_view::npos) {
+                    auto rest = body.substr(ne + 1);
+                    auto eq = rest.find(" = ");
+                    auto t = string(rest.substr(0, eq));
+                    Append(done, indent, n, " := ", slotptr(it->second, t), "\n", indent, "*", n, " = ",
+                           eq == string_view::npos ? cat("*new(", t, ")") : GoRename(rest.substr(eq + 3), ren), "\n");
+                }
+            } else if (auto as = body.find(" := "); as != string_view::npos && m != string_view::npos) {
+                // N1, N2 := X: a slot's name receives through a temporary.
+                auto lhs = body.substr(0, as);
+                string nl, after;
+                auto any = false;
+                for (size_t p = 0; p <= lhs.size();) {
+                    auto e = lhs.find(", ", p);
+                    if (e == string_view::npos) e = lhs.size();
+                    auto n = string(lhs.substr(p, e - p));
+                    p = e + 2;
+                    if (auto it = slotof.find(n); it != slotof.end()) {
+                        auto v = cat("gs_v", it->second);
+                        Append(after, indent, n, " := ", slotptr(it->second, slots[it->second].second), "\n",
+                               indent, "*", n, " = ", v, "\n");
+                        for (size_t q = 0; (q = marks.find(n, q)) != string::npos;) {
+                            auto endq = q + n.size();
+                            if ((q == 0 || marks[q - 1] == ',') && (endq == marks.size() || marks[endq] == ',')) {
+                                marks.replace(q, n.size(), v);
+                                break;
+                            }
+                            q = endq;
+                        }
+                        n = v;
+                        any = true;
+                    }
+                    Append(nl, nl.empty() ? "" : ", ", n);
+                }
+                if (any) Append(done, indent, nl, " := ", GoRename(body.substr(as + 4), ren), "\n", after);
+            }
+            if (done.empty()) {
+                auto rc = GoRename(body, ren);
+                if (rc == "return" || rc.compare(0, 7, "return ") == 0) {
+                    // The values first, then the frame given back.
+                    if (rc == "return" || nres == 0) {
+                        Append(done, indent, "gs.Frame = gs_fr\n", indent, rc, "\n");
+                    } else {
+                        string rs;
+                        for (int i = 0; i < nres; i++) Append(rs, i ? ", " : "", "gs_r", i);
+                        Append(done, indent, "{\n", indent, "\t", rs, " := ", rc.substr(7), "\n", indent,
+                               "\tgs.Frame = gs_fr\n", indent, "\treturn ", rs, "\n", indent, "}\n");
+                    }
+                } else {
+                    Append(done, indent, rc, "\n");
+                }
+            }
+            out += done;
+        } else {
+            Append(out, code, "\n");
         }
-        Append(out, line.substr(0, m), "\n");
-        auto indent = line.substr(0, line.find_first_not_of('\t'));
-        auto names = line.substr(m + 1);
-        for (size_t p = 0; p <= names.size();) {
-            auto e = names.find(',', p);
-            if (e == string_view::npos) e = names.size();
-            auto n = string(names.substr(p, e - p));
-            if (!n.empty() && !uses[n]) Append(out, indent, "_ = ", n, "\n");
+        if (m == string_view::npos) continue;
+        for (size_t p = 0; p <= marks.size();) {
+            auto e = marks.find(',', p);
+            if (e == string::npos) e = marks.size();
+            auto n = marks.substr(p, e - p);
+            if (!n.empty() && !uses[n] && !slotof.count(n)) Append(out, indent, "_ = ", n, "\n");
             p = e + 1;
         }
     }
@@ -436,11 +619,15 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
         dead = true;
     }
     PopSc();
+    L(FRAMEEND);
     if (stkmax > 0 && !curinfo->needssp)
         Fail(sp->sf->line, cat("internal: ", curinfo->name, " uses data stacks without gs_sp"));
     stackown[sp] = std::max(stackown[sp], stkmax);
+    auto framed = false;
+    auto fb = FinishBody(body, true, curnres, &framed);
+    if (framed) hasframe.insert(sp);
     Append(code, "// ", sp->sf->qname, ", line ", sp->sf->line.line, er ? ", its element-run twin" : "", "\n",
-           sig, " {\n", FinishBody(body), "}\n\n");
+           sig, " {\n", fb, "}\n\n");
     curspec = nullptr;
     curinfo = nullptr;
     emiter = false;
@@ -625,9 +812,10 @@ inline void CodeGenGo::EmitGlobalInit() {
         PopSc();
     }
     PopSc();
+    L(FRAMEEND);
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
     Append(code, "// The globals' initializers, in declaration order (§11.1).\n"
-                 "func gsInitGlobals(gs *GsStackBlock) {\n\t_ = gs\n", FinishBody(body), "}\n\n");
+                 "func gsInitGlobals(gs *GsStackBlock) {\n\t_ = gs\n", FinishBody(body, true, 0), "}\n\n");
 }
 
 // A global's dedicated stack, and its pool's freelist's, set up where its
@@ -668,8 +856,9 @@ inline void CodeGenGo::EmitProgram() {
     CheckStackLimitOf(*this, "the main program", mainstacks, mainsf ? mainsf->line : Line {});
     string call;
     if (!opts.library && mainsf && !mainsf->specs.empty() && sinfo.count(mainsf->specs[0])) {
-        auto &mi = sinfo[mainsf->specs[0]];
-        call = cat("\t", mi.name, "(", mi.needssp ? "gs, 0" : mi.needsgs ? "gs" : "", ")\n");
+        auto msp = mainsf->specs[0];
+        auto &mi = sinfo[msp];
+        call = cat("\t", mi.name, "(", mi.needssp ? "gs, 0" : mi.needsgs ? "gs" : GsArgPh(msp), ")\n");
     }
     // The globals' dedicated stacks follow the main program's in its block.
     if (!gstkorder.empty()) {
@@ -691,6 +880,59 @@ inline void CodeGenGo::EmitProgram() {
            "\tgsInitGlobals(gs)\n", call, stats, "}\n");
 }
 
+// The place of a call's block argument where the callee may yet take it.
+inline string CodeGenGo::GsArgPh(FnSpec *sp) {
+    phcalls[curspec].insert(sp);
+    return cat(GSARG, specnum.at(sp), GSARG);
+}
+
+// Once every body is emitted: a specialization takes the block where it
+// did already, where its frame holds a local, and where it calls one that
+// takes it; every call's and signature's place for it is filled.
+inline void CodeGenGo::ResolveGsArgs() {
+    vector<char> needs(numspec.size(), 0);
+    for (size_t i = 0; i < numspec.size(); i++)
+        needs[i] = sinfo[numspec[i]].needsgs || hasframe.count(numspec[i]);
+    for (auto changed = true; changed;) {
+        changed = false;
+        for (auto &[sp, callees] : phcalls) {
+            if (!sp || !specnum.count(sp) || needs[specnum[sp]]) continue;
+            for (auto k : callees)
+                if (needs[specnum[k]]) {
+                    needs[specnum[sp]] = 1;
+                    changed = true;
+                    break;
+                }
+        }
+    }
+    auto fill = [&](string &text) {
+        if (text.find(GSARG[0]) == string::npos && text.find(GSPARAM[0]) == string::npos) return;
+        string out;
+        out.reserve(text.size());
+        for (size_t p = 0; p < text.size();) {
+            auto c = text[p];
+            if (c != GSARG[0] && c != GSPARAM[0]) {
+                out += c;
+                p++;
+                continue;
+            }
+            auto e = text.find(c, p + 1);
+            auto n = stoi(text.substr(p + 1, e - p - 1));
+            p = e + 1;
+            auto rest = text.compare(p, 2, ", ") == 0;
+            if (needs[n]) {
+                out += c == GSARG[0] ? "gs" : "gs *GsStackBlock";
+            } else if (rest) {
+                p += 2;
+            }
+        }
+        text = std::move(out);
+    };
+    fill(code);
+    fill(bcode);
+    fill(eqcode);
+}
+
 // The whole file: a header Go tools know generated code by, the package,
 // the runtime configuration and the runtime, then the program.
 inline string CodeGenGo::Source(const string &srcname) {
@@ -706,7 +948,6 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "// ns_x_g followed by the namespace's length.\n\n"
                    "package ", opts.package, "\n\n"
                    "import (\n\t\"math\"\n\t\"os\"\n",
-                   (code + bcode).find("runtime.KeepAlive(") != string::npos ? "\t\"runtime\"\n" : "",
                    "\t\"runtime/debug\"\n\t\"strconv\"\n\t\"syscall\"\n\t\"unsafe\"\n)\n\n"
                    "// The runtime configuration the program was compiled with (--stack-reserve,\n"
                    "// -D GS_STACK_RESERVE, -D GS_STACK_GAP).\n"

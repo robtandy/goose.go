@@ -57,7 +57,7 @@ inline string CodeGenGo::StackArgs(FnSpec *sp, Line ln) {
         NoteStackCall(sp, ln);
         return cat("gs, ", SpTop());
     }
-    return ki.needsgs ? "gs" : "";
+    return ki.needsgs ? "gs" : GsArgPh(sp);
 }
 
 // The Go call of a specialization, its arguments evaluated: the data stack
@@ -207,6 +207,8 @@ inline vector<string> CodeGenGo::EmitSpecCall(Call *c, FnSpec *sp, const GoDst &
         auto run = i == 0 && !ername.empty();
         if (IsBytesT(rt) && !IsResz(rt) && !run) continue;
         auto t = T();
+        NoteType(t, run || (!IsFrameObj(rt) && IsResz(rt)) ? string("int64")
+                    : IsFrameObj(rt) ? RzGoT(rt, c->line) : GoT(rt, c->line));
         Append(names, names.empty() ? "" : ", ", t);
         Append(marks, marks.empty() ? "" : ",", t);
         if (IsResz(rt) || run) assigns.push_back({ counts[i], t });
@@ -317,6 +319,7 @@ inline vector<string> CodeGenGo::GenCallVals(Call *c, const GoDst &d0, vector<Go
         string names, marks;
         for (size_t i = 0; i < sp->rets.size(); i++) {
             auto t = T();
+            NoteType(t, GoT(sp->rets[i], c->line));
             res.push_back(t);
             Append(names, i ? ", " : "", t);
             Append(marks, i ? "," : "", t);
@@ -495,7 +498,7 @@ inline string CodeGenGo::GenCall(Call *c) {
     auto t = T();
     if (sp->rets.size() > 1) {
         // A call in an ordinary value context yields its first result.
-        GoT(sp->rets[0], c->line);
+        NoteType(t, GoT(sp->rets[0], c->line));
         L(FirstResult(t, sp->rets.size()), " := ", call, DECLMARK, t);
     } else {
         Decl(t, LocalT(sp->rets[0], c->line), call);
@@ -557,6 +560,7 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
     string r = call;
     if (sp->rets.size() > 1) {
         r = T();
+        NoteType(r, GoT(sp->rets[0], c->line));
         L(FirstResult(r, sp->rets.size()), " := ", call, DECLMARK, r);
     }
     if (IsRelRef(want)) {
@@ -621,6 +625,7 @@ inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
     vector<string> temps;
     for (size_t i = 0; i < defs.size(); i++) {
         auto n = same ? LocalName(defs[i]) : T();
+        NoteType(n, GoT(sp->rets[i], c->line));
         temps.push_back(n);
         Append(names, i ? ", " : "", n);
         Append(marks, i ? "," : "", n);
