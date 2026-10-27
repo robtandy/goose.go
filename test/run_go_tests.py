@@ -674,6 +674,30 @@ class Runner:
         if code == 0:
             vc, vo, ve = self.gotool("vet", gofile.name)
             check("--library vets", vc == 0 and not (vo + ve).strip(), vo + ve)
+        # A Go program that imports a library: the package's init
+        # initializes the globals, and the library's fn main() never runs.
+        host = self.work / "cli-host"
+        shutil.rmtree(host, ignore_errors=True)
+        (host / "goose").mkdir(parents=True)
+        libsrc = self.work / "cli-library.goose"
+        tc.write_text(libsrc, 'fn noisy() -> i64 {\n    print("library global initialized");\n    7\n}\n'
+                              'let answer = noisy();\n'
+                              'fn main() {\n    print("library main ran: ", answer);\n    exit(3);\n}\n')
+        tc.write_text(host / "main.go", 'package main\n\nimport (\n\t"fmt"\n\n\t_ "gooshost/goose"\n)\n\n'
+                                        'func main() { fmt.Println("host main ran") }\n')
+        code, o, e = self.goose("--target=go", "--library", "-o", host / "goose" / "goose.go", libsrc)
+        detail = o + e
+        ok = False
+        if code == 0:
+            # The module's go line is the toolchain's own.
+            r = subprocess.run([self.go, "mod", "init", "gooshost"], cwd=host, env=go_env(),
+                               capture_output=True)
+            if r.returncode == 0:
+                r = subprocess.run([self.go, "run", "."], cwd=host, env=go_env(), capture_output=True)
+            detail = f"exit {r.returncode}\n{tc.decode(r.stdout)}{tc.decode(r.stderr)}"
+            ok = r.returncode == 0 and \
+                tc.decode(r.stdout) == "library global initialized\nhost main ran\n"
+        check("a Go program imports a --library package, whose init runs no fn main", ok, detail)
         code, o, e = self.goose("--target=rust", hello)
         check("--target=rust is refused", code == 1 and "--target takes c or go" in e, o + e)
         code, o, e = self.goose("--go-package", "geese", "-o", self.work / "cli.c", hello)

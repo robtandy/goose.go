@@ -524,7 +524,8 @@ supported, 64-bit only. The design is in [DESIGN.md](../DESIGN.md).
 * `--go-package name` is the file's package: `main` by default, and `goose`
   for a library. `--library`, or `export fn`s in a program without `main`,
   writes a library: a package with no `func main`, whose `init` initializes
-  the globals.
+  the globals and does nothing else. A `fn main()` the program has is not
+  run: the Go program that imports the package runs instead.
 * `--debug` (or `-DGS_DEBUG=1`) turns on the overflow and `as` range checks,
   and `--stack-reserve`, `-DGS_STACK_RESERVE` and `-DGS_STACK_GAP` size the
   data stacks, as they do for C. The other `-D` macros are C's, and do not

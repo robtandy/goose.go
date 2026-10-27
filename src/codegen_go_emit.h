@@ -348,7 +348,8 @@ inline void CodeGenGo::EmitGlobalInit() {
 // The program's entry: once every function is emitted, the counts are
 // final, and main reserves the main program's data stacks, initializes the
 // globals and runs fn main(). A library has no main: its package's init
-// does the same.
+// initializes the globals, and only those. The Go program that imports it
+// runs instead of its fn main(), if it has one.
 inline void CodeGenGo::EmitProgram() {
     for (auto sf : ast.functions)
         if (sf->isexport) Unsupported(sf->line, "export fn");
@@ -357,7 +358,7 @@ inline void CodeGenGo::EmitProgram() {
     auto mainsf = ast.MainFunction();
     CheckStackLimitOf(*this, "the main program", mainstacks, mainsf ? mainsf->line : Line {});
     string call;
-    if (mainsf && !mainsf->specs.empty() && sinfo.count(mainsf->specs[0])) {
+    if (!opts.library && mainsf && !mainsf->specs.empty() && sinfo.count(mainsf->specs[0])) {
         auto &mi = sinfo[mainsf->specs[0]];
         call = cat("\t", mi.name, "(", mi.needssp ? "gs, 0" : "", ")\n");
     }
