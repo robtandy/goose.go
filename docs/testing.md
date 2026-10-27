@@ -565,4 +565,7 @@ checks follow: `-o out.go` implying the target, `--go-package`, `--library`,
 `--sweep` also runs the fixtures of this suite (`test/<category>/`) through
 the Go backend. The ones it compiles must vet, build and print what
 `test/expected/` holds for them, as a C run must; the ones it refuses as not
-supported yet are counted, not failed.
+supported yet are counted, not failed. `--fuzz N` generates `N` programs of
+random arithmetic, shifts, conversions and comparisons at every scalar type
+(from `--fuzz-seed` on, every other one built with `--debug`), each of which
+both backends must run alike.
