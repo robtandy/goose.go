@@ -621,6 +621,42 @@ func TestZeroAllocPushPop(t *testing.T) {
 	}
 }
 
+func TestZeroAllocSlicePool(t *testing.T) {
+	gs := NewStackBlock(2, 64<<20, 64<<10)
+	defer gs.Close()
+	p := newTestPool(gs, 0, 1, 8)
+	var runs [200][2]int64 // (index, length)
+	if n := testing.AllocsPerRun(20, func() {
+		// Runs enough for free spans in several leaves under a root...
+		for k := range runs {
+			cnt := int64(1 + k%7)
+			runs[k] = [2]int64{p.alloc(cnt), cnt}
+		}
+		// ...made by freeing every other run, which splits nodes...
+		for k := 0; k < len(runs); k += 2 {
+			p.free(runs[k][0], runs[k][1])
+		}
+		// ...placing and moving runs among them...
+		for k := 1; k < len(runs); k += 4 {
+			runs[k][0] = p.realloc(runs[k][0], runs[k][1], runs[k][1]+3)
+			runs[k][1] += 3
+		}
+		for k := 0; k < len(runs); k += 2 {
+			runs[k] = [2]int64{p.alloc(2), 2}
+		}
+		// ...and freeing it all, which merges the spans and empties nodes.
+		for k := range runs {
+			p.free(runs[k][0], runs[k][1])
+		}
+	}); n != 0 {
+		t.Fatalf("slice pool operations: %v allocations a run, want 0", n)
+	}
+	idx, cnt := checkSpans(t, p)
+	if len(idx) != 1 || idx[0] != 0 || cnt[0] != p.elems.Len {
+		t.Fatalf("after freeing everything the spans are %v %v, want one span of %d", idx, cnt, p.elems.Len)
+	}
+}
+
 func TestZeroAllocReset(t *testing.T) {
 	gs := NewStackBlock(8, 1<<20, 64<<10)
 	defer gs.Close()
@@ -660,6 +696,30 @@ func BenchmarkPushPop(b *testing.B) {
 			b.Fatal("popped another element than pushed")
 		}
 	}
+}
+
+func BenchmarkSlicePoolAllocFree(b *testing.B) {
+	gs := NewStackBlock(2, 64<<20, 64<<10)
+	defer gs.Close()
+	p := newTestPool(gs, 0, 1, 8)
+	// A freelist of a few hundred spans, which runs come and go among.
+	var keep []int64
+	for k := 0; k < 600; k++ {
+		i := p.alloc(int64(1 + k%5))
+		if k%2 == 0 {
+			p.free(i, int64(1+k%5))
+		} else {
+			keep = append(keep, i)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cnt := int64(1 + i%4)
+		at := p.alloc(cnt)
+		p.free(at, cnt)
+	}
+	_ = keep
 }
 
 func BenchmarkReset(b *testing.B) {
