@@ -1,0 +1,1 @@
+goose runtime error: resize growth requires a fill value (test/go/programs/resize_abort.goose:3)

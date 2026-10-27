@@ -1,0 +1,1 @@
+goose runtime error: limited array capacity exceeded (test/go/programs/capacity_abort.goose:3)

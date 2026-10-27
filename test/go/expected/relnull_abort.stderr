@@ -1,0 +1,1 @@
+goose runtime error: non-null relative reference encodes as null (test/go/programs/relnull_abort.goose:11)
