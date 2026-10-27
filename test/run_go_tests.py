@@ -441,9 +441,12 @@ class Runner:
 
     # --- the steps -----------------------------------------------------------
 
-    def go_program(self, src, name, flags, out):
+    def go_program(self, src, name, flags, out, checkptr=False):
         """Compiles src to Go, vets and builds it: the executable, or None
-        after saying why in `out`."""
+        after saying why in `out`. With checkptr, the executable built with
+        Go's checks of every unsafe.Pointer conversion and arithmetic, which
+        `go test -race` turns on as well (-d=checkptr), is returned too, as
+        (exe, checked)."""
         gofile = self.work / f"{name}.go"
         exe = self.work / f"{name}-go{tc.EXE_SUFFIX}"
         gofile.unlink(missing_ok=True)
@@ -459,7 +462,15 @@ class Runner:
         if code != 0:
             out.append(("fail", f"go build {name}", o + e))
             return None
-        return exe
+        if not checkptr:
+            return exe
+        checked = self.work / f"{name}-go-checkptr{tc.EXE_SUFFIX}"
+        code, o, e = self.gotool("build", "-gcflags=all=-d=checkptr", "-o", checked.name,
+                                 gofile.name)
+        if code != 0:
+            out.append(("fail", f"go build -d=checkptr {name}", o + e))
+            return None
+        return exe, checked
 
     def c_run(self, src, name, flags, out, timeout=None):
         """The C backend's run of src: (exit code, stdout, stderr), or None
@@ -515,20 +526,24 @@ class Runner:
             label = f"{name} -O{level}"
             lflags = flags + [f"-O{level}"]
             ref = refs[level] = self.c_run(src, f"{name}-O{level}", lflags, out)
-            exe = self.go_program(src, f"{name}-O{level}", lflags, out)
-            if exe is None or ref is None:
+            # At -O2, the build with Go's unsafe.Pointer checks runs too.
+            exes = self.go_program(src, f"{name}-O{level}", lflags, out, checkptr=level == "2")
+            if exes is None or ref is None:
                 continue
-            got = tc.run_capture([exe])
-            same = True
-            for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
-                               ("stderr", got[2], ref[2])):
-                if g != c:
-                    same = False
-                    out.append(("fail", f"parity {label}: {what}",
-                                f"--- go:\n{g}\n--- c:\n{c}" if what != "exit code"
-                                else f"go {g}, c {c}"))
-            if same:
-                out.append(("ok", f"run {label}", None))
+            if not isinstance(exes, tuple):
+                exes = (exes,)
+            for exe, kind in zip(exes, ("", " -d=checkptr")):
+                got = tc.run_capture([exe])
+                same = True
+                for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
+                                   ("stderr", got[2], ref[2])):
+                    if g != c:
+                        same = False
+                        out.append(("fail", f"parity {label}{kind}: {what}",
+                                    f"--- go:\n{g}\n--- c:\n{c}" if what != "exit code"
+                                    else f"go {g}, c {c}"))
+                if same:
+                    out.append(("ok", f"run {label}{kind}", None))
         # What test/go/expected/ holds is the C run at -O2.
         ref = refs["2"]
         if ref is None:
