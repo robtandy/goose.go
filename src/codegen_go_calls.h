@@ -301,6 +301,12 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
             continue;
         }
         auto pt = sp0->argtypes[i];
+        // By the convention an ordinary call passes them (EmitArg).
+        if (IsPoolParam(sp0, i)) {
+            args[i] = GenPrefVal(an[i]);
+            continue;
+        }
+        if (IsBytesT(pt)) Unsupported(an[i]->line, "a case-function dispatch with a non-fixed argument");
         auto x = Coerce(GenX(an[i]), an[i]->exprtype, pt, an[i]->line);
         if (!IsGoConst(x) && x != "nil") x = Snapshot(pt, x);
         args[i] = x;
@@ -329,12 +335,7 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
             auto pt = sp->argtypes[pos];
             if (pt->kind == TY_REF) Fail(ln, "internal: a fixed-mode payload dispatched by reference");
             auto varg = ti.voffs.empty() || ti.voffs[vi] < 0 ? ZeroOf(vt, ln) : PayloadLoc(e, (int)vi, ln).lv;
-            string list;
-            if (ki.needssp) {
-                NoStackAcrossCycleCall(sp, ln);
-                NoteStackCall(sp, ln);
-                list = cat("gs, ", SpTop());
-            }
+            auto list = StackArgs(sp, ln);
             for (size_t i = 0; i < an.size(); i++)
                 Append(list, list.empty() ? "" : ", ", (int)i == pos ? Coerce(varg, vt, pt, ln) : args[i]);
             for (auto fv : ki.freevars) Append(list, list.empty() ? "" : ", ", FreeVarArg(c->FreeVarArg(fv)));

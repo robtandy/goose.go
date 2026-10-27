@@ -101,6 +101,20 @@ inline CodeGenGo::GoLoc CodeGenGo::FieldLocAt(const GoLoc &base, int fi, Line ln
         r = AtAddr(AddOff(AddrOf(base), ti.offs[fi]), ft);
     }
     r.viaref = base.viaref || ft->kind == TY_REF;
+    // A part of a frame object lives on its stack: its tail is a header (or
+    // a nested frame object) of its own (C.2).
+    r.stk = base.stk;
+    r.fl = base.fl;
+    r.flstk = base.flstk;
+    if (IsResz(ft)) {
+        r.hdr = r.lv;
+        if (!IsFrameObj(ft)) {
+            r.addr = cat(r.lv, ".Base");
+            r.lenlv = cat(r.lv, ".Len");
+            r.lv.clear();
+            r.ptr.clear();
+        }
+    }
     return r;
 }
 

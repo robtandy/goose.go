@@ -216,6 +216,7 @@ struct CodeGenGo {
                          const vector<TypeExpr *> &ftypes, const Layout &lo, int64_t csize,
                          bool bitwise, Line ln);
     void BuildEnum(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
+    void BuildFrameObj(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
     void BuildLimited(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
     static string VariantField(EnumInst *ei, int vi);
     void EmitTypeDecls();
@@ -415,6 +416,7 @@ struct CodeGenGo {
     void GenArrayFromLoc(GoLoc l, TypeExpr *et, const string &stk, Line ln, const string &lenlv);
     void EmitRzCopy(GoLoc l, TypeExpr *et, const string &stk, const string &lenlv, Line ln);
     void GenArrayLitAt(ArrayLit *al, const string &stk, const string &lenlv, TypeExpr *as);
+    void GenFrameObjLit(StructLit *sl, const string &stk, const string &obj);
     void EmitArrayCount(const string &stk, TypeExpr *at, const string &lenlv, const string &n);
     void EnterDst(int si, const GoDst &d);
     string ScopeTop0(int si);

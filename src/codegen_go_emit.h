@@ -219,7 +219,8 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
             GoT(fv->type, fv->line);
             add(cat(fn, " unsafe.Pointer"));
         } else {
-            add(cat(fn, " *", GoT(fv->type, fv->line)));
+            // A pool-shaped reference variable is a GsPref (PrefVar).
+            add(cat(fn, " *", PrefVar(fv) ? string("GsPref") : GoT(fv->type, fv->line)));
             fvptr.insert(fv);
         }
     }

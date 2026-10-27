@@ -66,8 +66,9 @@ inline TypeExpr *CodeGenGo::GrowU8() {
 // destination's for a named result, and returns where its value is built
 // (CodeGen::DeclStackLocal).
 inline GoDst CodeGenGo::DeclStackLocal(VarDef *d, bool forlocal) {
-    auto name = LocalName(d);
     auto t = d->type;
+    GoT(t, d->line);
+    auto name = LocalName(d);
     auto resz = IsResz(t);
     string stk;
     auto nit = nrvo.find(d);
@@ -122,6 +123,7 @@ inline string CodeGenGo::BytesTemp(string &stk) {
 // named by the result, on a fresh statement-scoped stack returned in
 // `stk`; the elements are built there next.
 inline string CodeGenGo::RzTemp(TypeExpr *t, string &stk) {
+    GoT(t, t->line);
     stk = AllocStk(false);
     auto h = T();
     if (IsFrameObj(t)) {
@@ -432,7 +434,13 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
             return;
         }
     }
-    if (Is<StructLit>(n)) Unsupported(n->line, cat("a literal of type ", TypeText(et)));
+    if (auto sl = Is<StructLit>(n)) {
+        if (et->kind == TY_STRUCT && IsFrameObj(et)) {
+            GenFrameObjLit(sl, stk, lenlv);
+            return;
+        }
+        Unsupported(n->line, cat("a literal of type ", TypeText(et)));
+    }
     if (auto se = Is<SliceExpr>(n); se && et->kind == TY_ARRAY) {
         // A slice expression constructing an array copies the range.
         auto sv = Snapshot(ast.SliceOf(et->arr->sub, n->line), GenSlice(se));
@@ -441,6 +449,10 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
     }
     // Every other node denotes an existing value: the location, copied or
     // adapted.
+    auto dot = Is<Dot>(n);
+    auto path = Is<Ident>(n) || Is<Index>(n) || (dot && dot->IsField()) ||
+                (Is<Unary>(n) && ((Unary *)n)->op == T_BITAND);
+    if (!path) Unsupported(n->line, cat("constructing a value of type ", TypeText(et), " from this expression"));
     ConstructFromLoc(GenLoc(n), et, stk, lenlv, n->line);
 }
 
@@ -524,6 +536,44 @@ inline void CodeGenGo::EmitRzCopy(GoLoc l, TypeExpr *et, const string &stk, cons
     auto dh = FoTailHdr(et, lenlv), sh = FoTailHdr(et, src);
     L(dh, ".Base = ", Top(stk));
     EmitCopyElems(stk, FoTailArr(et)->arr->sub, cat(sh, ".Base"), cat(sh, ".Len"));
+}
+
+// A frame object literal (CodeGen::GenFrameObjLit): its fixed fields as
+// members of the receiving object `obj`, the tail's header pointed at the
+// stack's top before its elements are built there.
+inline void CodeGenGo::GenFrameObjLit(StructLit *sl, const string &stk, const string &obj) {
+    if (obj.empty()) Fail(sl->line, "internal: a frame object built without its header");
+    auto si = SI(sl->exprtype);
+    auto &fields = si->st->fields;
+    for (size_t i = 0; i < fields.size(); i++) {
+        if (fields[i].ispad) continue;
+        if (Unreached()) return;
+        auto init = sl->InitFor((int)i);
+        auto ft = si->ftypes[i];
+        auto flv = cat(obj, ".", Sanitize(fields[i].name));
+        if (IsResz(ft)) {
+            if (!init) Fail(sl->line, "internal: a frame object's tail without an initializer");
+            if (IsFrameObj(ft)) {
+                GenConstruct(init, stk, ft, flv);
+            } else {
+                L(flv, ".Base = ", Top(stk));
+                L(flv, ".Len = 0");
+                GenConstruct(init, stk, ft, cat(flv, ".Len"));
+            }
+            continue;
+        }
+        if (!init || Is<NullLit>(init)) {
+            L(flv, " = ", ZeroOf(ft, sl->line));
+            continue;
+        }
+        // Only the `in pool` form can be a frame object's field (C.2), so
+        // the offset does not depend on where the object is built.
+        if (IsRelRef(ft)) {
+            GenRelStore(AtVar(flv, ft), init, false);
+            continue;
+        }
+        GenAny(init, GoDst { GD_LVALUE, flv, ft });
+    }
 }
 
 // An array literal at stk's top, as `as` where that is given (GenConstruct's

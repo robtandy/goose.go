@@ -445,6 +445,12 @@ inline void CodeGenGo::CheckRepresentable(TypeExpr *t, Line ln) {
             if (Cls(t->sub) != SC_FIXED) Unsupported(ln, cat("a value of type ", TypeText(t)));
             return;
         case TY_ARRAY: case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
+            // A frame object (C.2): its fixed fields and its tail's header.
+            if (t->kind == TY_STRUCT && IsFrameObj(t)) {
+                for (auto ft : SI(t)->ftypes)
+                    if (ft) CheckRepresentable(ft, ln);
+                return;
+            }
             // A resizable array of fixed-size elements: its header (GsRhdr),
             // the elements on a data stack.
             if (t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK)) {
@@ -570,6 +576,10 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
     switch (t->kind) {
         case TY_STRUCT: {
             auto si = SI(t);
+            if (IsFrameObj(t)) {
+                BuildFrameObj(ti, decl, t, ln);
+                break;
+            }
             BuildStructLike(ti, decl, si->st->fields, si->ftypes, StructLayout(si),
                             EmptyLayout(si->st->fields) ? 1 : StructLayout(si).size, BitwiseEq(t), ln);
             break;
@@ -585,9 +595,13 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
         case TY_ENUM: BuildEnum(ti, decl, t, ln); break;
         default: BuildLimited(ti, decl, t, ln); break;
     }
-    Append(tdecls, "// ", TypeText(t), ": ", FixedSize(t), " bytes",
-           ti.exact ? "" : cat(" in its C layout, ", ti.size, " in this one"), ".\n", "type ",
-           gt, " ", decl, "\n\n");
+    if (IsFix(t))
+        Append(tdecls, "// ", TypeText(t), ": ", FixedSize(t), " bytes",
+               ti.exact ? "" : cat(" in its C layout, ", ti.size, " in this one"), ".\n", "type ",
+               gt, " ", decl, "\n\n");
+    else
+        Append(tdecls, "// ", TypeText(t), ": a frame object, its fixed fields and its tail's header\n",
+               "// (the tail's elements on a data stack).\ntype ", gt, " ", decl, "\n\n");
     ti.building = false;
     return typeinfo[m] = ti;
 }
@@ -671,6 +685,40 @@ inline void CodeGenGo::BuildStructLike(GoTypeInfo &ti, string &decl, const vecto
         ti.offs[i] = off;
         Append(decl, "\t", Sanitize(fields[i].name), " ", f.name, "\n");
         off += f.size;
+    }
+    ti.align = maxalign;
+    ti.size = (off + maxalign - 1) / maxalign * maxalign;
+    decl += "}";
+}
+
+// A frame object (C.2): the Go struct of its fixed fields, its tail's
+// header (or nested frame object) last, in Go's own layout, which nothing
+// the program can observe depends on.
+inline void CodeGenGo::BuildFrameObj(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln) {
+    auto si = SI(t);
+    auto &fields = si->st->fields;
+    ti.rep = GR_NATIVE;
+    ti.exact = false;
+    ti.ptrs = true;
+    ti.goeq = false;
+    ti.offs.assign(fields.size(), 0);
+    decl = "struct {\n";
+    int64_t off = 0, maxalign = 8;
+    for (size_t i = 0; i < fields.size(); i++) {
+        if (fields[i].ispad) {
+            ti.offs[i] = off;
+            if (fields[i].padsize > 0) {
+                Append(decl, "\t_ [", fields[i].padsize, "]byte\n");
+                off += fields[i].padsize;
+            }
+            continue;
+        }
+        auto &f = TI(si->ftypes[i], ln);
+        off = (off + f.align - 1) / f.align * f.align;
+        ti.offs[i] = off;
+        Append(decl, "\t", Sanitize(fields[i].name), " ", f.name, "\n");
+        off += f.size;
+        maxalign = std::max(maxalign, f.align);
     }
     ti.align = maxalign;
     ti.size = (off + maxalign - 1) / maxalign * maxalign;

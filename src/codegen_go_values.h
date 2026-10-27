@@ -824,7 +824,10 @@ inline void CodeGenGo::LeafAny(Node *n, const GoDst &d) {
     // path's checks still run: a path's is where it is stored, anything
     // else is built on a temporary stack the enclosing scope releases.
     if (IsBytesT(n->exprtype)) {
-        GenLoc(n);
+        // Its address read, for the checks on the path (C's `(void)(loc)`).
+        auto l = GenLoc(n);
+        auto x = !l.addr.empty() ? l.addr : !l.hdr.empty() ? cat("&", l.hdr) : l.lv;
+        if (!x.empty() && !IsGoName(x)) L("_ = ", x);
         return;
     }
     // A constant or a variable read has no effect to keep.
