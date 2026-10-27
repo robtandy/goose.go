@@ -110,7 +110,7 @@ Test fixtures are grouped by category; `run_tests.py` stays at the root of `test
 | `lsp/` | Language-server fixtures driven by `lsp_protocol.py` over the protocol, not compiled as programs. `basics.goose` declares queries and expected answers in `// lsp:` lines and imports `helper.goose`. `complete.goose` ends with `p.` to test completion. `recovery.goose` has errors in two functions; `// lsp: error` lines specify their locations, and queries use the code checked so far. `broken_decls.goose` has errors inside a struct, an enum, and functions, plus an unresolved import. `exemplar.goose` tests queries on uncalled generic functions using exemplar checks (`docs/design/language_server.md` §11). `roots_lib.goose` contains an error and is opened and closed alongside its importers, `roots_app.goose` and `roots_app2.goose`. `source_index.goose` tests globals whose initializers omit defaults or expand a `const for`, a generic function matching a `const for` arm list, and calls containing commas in literals and comments. `two_a.goose` and `two_b.goose` import `two_shared.goose`; only the second instantiates its generic function. `ufcs_ns.goose` makes UFCS calls on a namespaced type from the global namespace, one of which matches no overload. |
 | `expected/` | Shared output and runtime-diagnostic expectations. |
 | `run_tests.py` | The Python test runner. |
-| `go/` | The Go backend's suite, which `run_go_tests.py` runs ([below](#the-go-backends-suite)): its programs (`go/programs/`, with the modules they import in `programs/modules/`), what they print (`go/expected/`), and programs it refuses (`go/unsupported/`). Two levels down, they are none of this runner's fixtures. |
+| `go/` | The Go backend's suite, which `run_go_tests.py` runs ([below](#the-go-backends-suite)): its programs (`go/programs/`, with the modules they import in `programs/modules/`), what they print (`go/expected/`), programs that never end, which it only builds (`go/build_only/`), and programs it refuses (`go/unsupported/`). Two levels down, they are none of this runner's fixtures. |
 | `run_go_tests.py` | The Go backend's runner. |
 | `toolchain_selection.py` | Which compiler the runners use (`find_goose` in `scripts/toolchain.py`). An `--exe` path is used as given, made absolute, even when there are other compilers in `build/`. Without `--exe`, the runners use the first of `build/Release/`, `build/RelWithDebInfo/`, `build/` itself (for a single-configuration generator) and `build/Debug/`, so that a routine run uses an optimized compiler and an assertion build has to be chosen with `--exe`. If there is no compiler in any of these, or the `--exe` path does not exist, the run stops rather than using another compiler. A unittest, run by the main runner. |
 | `compiler_roots.cpp` | Root-set join laws, feedback on weakening, order-independent equality and the deliberate comparison projections; compiled and run in both native profiles. |
@@ -554,6 +554,11 @@ the C run to match `test/go/expected/` (`<name>.out`, and `<name>.stderr` and
 for both compiles, `// goose-flags: --debug`. It also requires `goose --check
 --stacks` to print the same report for both targets, which share the data
 stack analysis.
+
+The programs in `test/go/build_only/` never end, as a program whose loop only
+stopping it leaves: each is written as Go at both levels, which must vet and
+build, and as C, which must compile, and reported on with `--stacks` as
+above, but neither is run.
 
 Each program in `test/go/unsupported/` uses something this version of the
 backend does not compile, and must stop the Go compile with every message its

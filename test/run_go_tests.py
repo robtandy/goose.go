@@ -20,6 +20,11 @@ import are in programs/modules/), is
    levels, which must agree: both backends count data stacks with the same
    analysis (BoundStacks, src/codegen_stacks.h).
 
+The programs of test/go/build_only/ never end (a loop that only stopping
+them leaves): each is compiled to Go at both levels, vetted and built, and
+with the C backend, as above, and reported on with --stacks, but neither is
+run.
+
 The programs of test/go/unsupported/ use what this version of the Go backend
 does not compile yet. Each must stop the compile with every `// error:`
 message its source names, where the C backend compiles it.
@@ -239,6 +244,12 @@ class Runner:
             if warnings and e.startswith(warnings):
                 e = e[len(warnings):]
             return code, o, e
+        exe = self.c_build(src, name, flags, out)
+        return None if exe is None else tc.run_capture([exe])
+
+    def c_build(self, src, name, flags, out):
+        """The C backend's executable for src, built with the C compiler at
+        -O2, or None after saying why."""
         cfile = self.work / f"{name}.c"
         exe = self.work / f"{name}-c{tc.EXE_SUFFIX}"
         code, o, e = self.goose(*flags, "-O2", "--standalone", "-o", cfile, src)
@@ -249,7 +260,19 @@ class Runner:
         if not ok:
             out.append(("fail", f"cc {name}.c", "\n".join(log.splitlines()[:8])))
             return None
-        return tc.run_capture([exe])
+        return exe
+
+    def stacks(self, src, name, flags, out):
+        """The data stack counts, from the analysis both backends share,
+        which must agree at both levels."""
+        for level in ("2", "0"):
+            c = self.goose(*flags, f"-O{level}", "--check", "--stacks", src)
+            g = self.goose(*flags, f"-O{level}", "--check", "--stacks", "--target=go", src)
+            if c != g or c[0] != 0:
+                out.append(("fail", f"--stacks {name} -O{level}",
+                            f"--- go:\n{g[1]}{g[2]}\n--- c:\n{c[1]}{c[2]}"))
+            else:
+                out.append(("ok", f"--stacks {name} -O{level}", None))
 
     def program(self, src):
         name = src.stem
@@ -294,15 +317,28 @@ class Runner:
                 elif want != text:
                     out.append(("fail", f"expected {name}.{ext}",
                                 f"--- got:\n{text}\n--- want:\n{want}"))
-        # The data stack counts, from the analysis both backends share.
+        self.stacks(src, name, flags, out)
+        return out
+
+    def build_only(self, src):
+        """A program that never ends: its Go must vet and build at both
+        levels and its C compile, neither of them run, and the two report
+        the same data stacks."""
+        name = src.stem
+        flags = goose_flags(src)
+        out = []
         for level in ("2", "0"):
-            c = self.goose(*flags, f"-O{level}", "--check", "--stacks", src)
-            g = self.goose(*flags, f"-O{level}", "--check", "--stacks", "--target=go", src)
-            if c != g or c[0] != 0:
-                out.append(("fail", f"--stacks {name} -O{level}",
-                            f"--- go:\n{g[1]}{g[2]}\n--- c:\n{c[1]}{c[2]}"))
-            else:
-                out.append(("ok", f"--stacks {name} -O{level}", None))
+            label = f"build-{name}-O{level}"
+            if self.go_program(src, label, flags + [f"-O{level}"], out) is not None:
+                out.append(("ok", f"build {name} -O{level}", None))
+        if self.cc is None:
+            # TinyCC would run it: the C backend's check is all there is.
+            code, o, e = self.goose(*flags, "--check", src)
+            if code != 0:
+                out.append(("fail", f"build {name}: the C backend's check fails", o + e))
+        elif self.c_build(src, f"build-{name}", flags, out) is not None:
+            out.append(("ok", f"build {name} (C)", None))
+        self.stacks(src, name, flags, out)
         return out
 
     def fuzz(self, seed):
@@ -451,7 +487,8 @@ def main():
                     help="run the C reference in the compiler's process (TinyCC)")
     ap.add_argument("--workdir", help="where the generated files go (default build/go-tests)")
     ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("names", nargs="*", help="run only these programs of test/go/programs")
+    ap.add_argument("names", nargs="*",
+                    help="run only these programs of test/go/programs and test/go/build_only")
     args = ap.parse_args()
     r = Runner(args)
     if not r.go:
@@ -462,10 +499,13 @@ def main():
     print(f"go: {gover.strip()}")
     print(f"C reference: {r.cc.desc if r.cc else 'TinyCC (goose --jit)'}")
     programs = sorted((HERE / "go" / "programs").glob("*.goose"))
+    build_only = sorted((HERE / "go" / "build_only").glob("*.goose"))
     if args.names:
         programs = [p for p in programs if p.stem in args.names]
-        if not programs:
-            ap.error(f"no program named {' '.join(args.names)} in test/go/programs")
+        build_only = [p for p in build_only if p.stem in args.names]
+        if not programs and not build_only:
+            ap.error(f"no program named {' '.join(args.names)} in test/go/programs or "
+                     "test/go/build_only")
     unsupported = [] if args.names else sorted((HERE / "go" / "unsupported").glob("*.goose"))
     sweep = []
     if args.sweep:
@@ -476,6 +516,7 @@ def main():
                  not error_markers(f) and "parse-only" not in first_line(f)]
     with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:
         futures = [pool.submit(r.program, p) for p in programs]
+        futures += [pool.submit(r.build_only, p) for p in build_only]
         futures += [pool.submit(r.unsupported, p) for p in unsupported]
         futures += [pool.submit(r.sweep, p) for p in sweep]
         futures += [pool.submit(r.fuzz, seed)
