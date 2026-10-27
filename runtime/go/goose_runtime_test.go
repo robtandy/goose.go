@@ -206,6 +206,44 @@ func TestEnsureStacksAndReset(t *testing.T) {
 	}
 }
 
+// The fixed-frame stack: reserved with the block, written and read through
+// its slots, rewound by Reset and released by Close; the zero block gets
+// one from EnsureFrame.
+func TestFixedFrame(t *testing.T) {
+	gs := NewStackBlock(1, 1<<20, 64<<10)
+	if gs.Frame == nil || gs.Frame != gs.FrameBase {
+		t.Fatal("a new block's frame is not empty")
+	}
+	if n := int64(uintptr(gs.FrameEnd) - uintptr(gs.FrameBase)); n > GsFrameReserve || n < gsRegionMin {
+		t.Fatalf("the frame reserves %d bytes", n)
+	}
+	fr := gs.Frame
+	gs.Frame = unsafe.Add(fr, 32)
+	*(*int64)(unsafe.Add(fr, 8)) = 42
+	if *(*int64)(unsafe.Add(fr, 8)) != 42 {
+		t.Fatal("a frame slot does not hold its value")
+	}
+	gs.Reset()
+	if gs.Frame != gs.FrameBase {
+		t.Fatal("Reset did not rewind the frame")
+	}
+	if err := gs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if gs.Frame != nil || gs.FrameBase != nil || gs.FrameEnd != nil {
+		t.Fatal("a closed block still has a frame")
+	}
+	if err := gs.Close(); err != nil {
+		t.Fatalf("Close of a closed block: %v", err)
+	}
+	var z GsStackBlock
+	z.EnsureFrame()
+	defer z.Close()
+	if z.Frame == nil || z.Frame != z.FrameBase {
+		t.Fatal("the zero block's frame")
+	}
+}
+
 func TestZeroBlockEnsureStacks(t *testing.T) {
 	var gs GsStackBlock
 	gs.EnsureStacks(1)

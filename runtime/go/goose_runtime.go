@@ -158,11 +158,24 @@ type GsStackBlock struct {
 	Base []unsafe.Pointer
 	// Cap holds how many bytes each stack holds before its guard gap.
 	Cap []int64
+	// Frame is the top of the block's fixed-frame stack (DESIGN.md §3.6):
+	// the address-taken fixed-size locals of the functions running, each
+	// function's frame above its caller's, taken as it starts and given
+	// back as it returns. FrameBase and FrameEnd bound its region. Outside
+	// the Go heap, the locals never move, so a value's bytes may hold their
+	// addresses where the collector does not look.
+	Frame, FrameBase, FrameEnd unsafe.Pointer
 
 	reserve int64    // usable bytes asked of each new region
 	gap     int64    // guard bytes behind each region
 	regions [][]byte // each region's mapping, guard gap included
+	frame   []byte   // the fixed-frame stack's mapping
 }
+
+// GsFrameReserve is the address space a block's fixed-frame stack
+// reserves, whatever its data stacks reserve: C keeps those locals on its
+// native stack.
+const GsFrameReserve = 1 << 30
 
 // NewStackBlock reserves a block of numStacks data stacks, each a region
 // of reserve bytes (rounded down to whole pages, and halved where the
@@ -196,8 +209,38 @@ func NewStackBlock(numStacks int, reserve, gap int64) *GsStackBlock {
 	}
 	runtime.SetFinalizer(gs, (*GsStackBlock).Close)
 	gs.EnsureStacks(numStacks)
+	gs.EnsureFrame()
 	return gs
 }
+
+// EnsureFrame reserves the block's fixed-frame stack where it has none
+// (the zero block, or a closed one), halving the reservation where the
+// platform refuses that much address space. The frame starts empty.
+func (gs *GsStackBlock) EnsureFrame() {
+	if gs.frame != nil {
+		return
+	}
+	n := int64(GsFrameReserve)
+	for {
+		mem, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
+			syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+		if err == nil {
+			gs.frame = mem
+			gs.FrameBase = unsafe.Pointer(unsafe.SliceData(mem))
+			gs.Frame = gs.FrameBase
+			gs.FrameEnd = unsafe.Add(gs.FrameBase, n)
+			return
+		}
+		if n <= gsRegionMin {
+			GsPanic("cannot reserve the fixed-frame stack's address space")
+		}
+		n /= 2
+	}
+}
+
+// GsFrameOverflow reports a function's frame that does not fit what is
+// left of the fixed-frame stack, as C reports its native stack's overflow.
+func GsFrameOverflow() { GsPanic("native call stack overflow") }
 
 // EnsureStacks gives the block at least n data stacks, reserving regions
 // for the ones it lacks: each new stack is empty. A block's stack count
@@ -227,6 +270,7 @@ func (gs *GsStackBlock) Reset() {
 	for i := range gs.Stks {
 		gs.Stks[i] = gs.Base[i]
 	}
+	gs.Frame = gs.FrameBase
 }
 
 // Close releases every region of the block, which is then empty again:
@@ -247,6 +291,13 @@ func (gs *GsStackBlock) Close() error {
 	gs.Stks = gs.Stks[:0]
 	gs.Base = gs.Base[:0]
 	gs.Cap = gs.Cap[:0]
+	if gs.frame != nil {
+		if e := syscall.Munmap(gs.frame); e != nil && err == nil {
+			err = e
+		}
+		gs.frame = nil
+		gs.Frame, gs.FrameBase, gs.FrameEnd = nil, nil, nil
+	}
 	return err
 }
 
