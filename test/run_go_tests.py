@@ -764,6 +764,12 @@ class Runner:
                                     hello)
             check(f"--stacks {' '.join(target + ['-DGS_STACK_RESERVE=(1ull << 16)'])}",
                   code == 0 and (o + e).startswith("data stacks: 64 KB reserved per stack"), o + e)
+        # Less than a page, on every platform: the runtime starts no program.
+        for target in ([], ["--target=go"]):
+            code, o, e = self.goose(*target, "-DGS_STACK_RESERVE=0x100", hello)
+            check(f"{' '.join(target + ['-DGS_STACK_RESERVE=0x100'])} stops the program",
+                  code == 1 and not o and e == "goose runtime error: the data stack reservation "
+                  "(GS_STACK_RESERVE) is less than a page\n", f"exit {code}\n{o}{e}")
         code, o, e = self.goose("--target=go", "-DGS_STACK_RESERVE=lots", hello)
         check("--target=go refuses a -DGS_STACK_RESERVE it cannot read",
               code == 1 and "reads GS_STACK_RESERVE as an integer constant" in e, f"exit {code}\n{o}{e}")
