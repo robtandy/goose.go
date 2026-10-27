@@ -179,6 +179,84 @@ inline string CodeGenGo::CondText(const string &x) {
     return x.substr(1, x.size() - 2);
 }
 
+// x without any of the parentheses around the whole of it.
+inline string CodeGenGo::GoUnparen(string x) {
+    for (;;) {
+        auto y = CondText(x);
+        if (y == x) return x;
+        x = std::move(y);
+    }
+}
+
+// The parts of x that op joins outside every bracket and string literal:
+// x alone where it joins none.
+inline vector<string> CodeGenGo::GoSplitTop(const string &x, const string &op) {
+    vector<string> parts;
+    int depth = 0;
+    size_t from = 0;
+    for (size_t i = 0; i < x.size(); i++) {
+        auto c = x[i];
+        if (c == '"') {
+            for (i++; i < x.size() && x[i] != '"'; i++)
+                if (x[i] == '\\') i++;
+        } else if (c == '(' || c == '[' || c == '{') {
+            depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            depth--;
+        } else if (depth == 0 && x.compare(i, op.size(), op) == 0) {
+            parts.push_back(x.substr(from, i - from));
+            from = i + op.size();
+            i = from - 1;
+        }
+    }
+    parts.push_back(x.substr(from));
+    return parts;
+}
+
+// The operands Go's vet takes a chain of `&&`s (or of `||`s) to have: the
+// ones the operator joins, through parentheses, and theirs in turn. One
+// whose top level `||` joins is a single operand of a chain of `&&`s, which
+// bind more tightly.
+inline void CodeGenGo::GoChainOperands(const string &x, bool andand, vector<string> &out) {
+    auto s = GoUnparen(x);
+    auto parts = GoSplitTop(s, andand ? " && " : " || ");
+    if (parts.size() == 1 || (andand && GoSplitTop(s, " || ").size() > 1)) {
+        out.push_back(s);
+        return;
+    }
+    for (auto &p : parts) GoChainOperands(p, andand, out);
+}
+
+// Whether `l && r` (or `l || r`) has what Go's vet reports as a mistake,
+// and Goose takes as written: an operand of the chain twice (`c && c`), or
+// two comparisons of one value with different constants (`n != 1 || n !=
+// 2`, `n == 1 && n == 2`). Any side two such comparisons share is taken for
+// that value, constant or not. l and r have neither of their own.
+inline bool CodeGenGo::VetBoolClash(const string &l, const string &r, bool andand) {
+    vector<string> ops;
+    GoChainOperands(l, andand, ops);
+    auto nl = ops.size();
+    GoChainOperands(r, andand, ops);
+    auto key = [](const string &s) {
+        string k;
+        for (auto c : GoUnparen(s)) if (c != ' ') k += c;
+        return k;
+    };
+    auto cmp = andand ? " == " : " != ";
+    for (size_t i = 0; i < nl; i++) {
+        auto a = GoSplitTop(ops[i], cmp);
+        for (auto j = nl; j < ops.size(); j++) {
+            if (key(ops[i]) == key(ops[j])) return true;
+            auto b = GoSplitTop(ops[j], cmp);
+            if (a.size() != 2 || b.size() != 2) continue;
+            for (auto &x : a)
+                for (auto &y : b)
+                    if (key(x) == key(y)) return true;
+        }
+    }
+    return false;
+}
+
 // A constant held in a variable, so that an operation on it is computed as
 // the program computes it, wrapping and rounding at run time, rather than
 // exactly by the Go compiler, which rejects a result its type cannot hold
@@ -485,6 +563,8 @@ inline string CodeGenGo::GenBinary(Binary *b) {
         auto l = GenTruth(b->left);
         if (!HasStmts(b->right)) {
             auto r = GenTruth(b->right);
+            // A call is an operand vet compares with none (GsBool).
+            if (VetBoolClash(l, r, op == T_ANDAND)) r = cat("GsBool(", r, ")");
             return cat("(", l, op == T_ANDAND ? " && " : " || ", r, ")");
         }
         // Short circuit: the right operand's statements run only where the

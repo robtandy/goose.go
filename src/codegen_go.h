@@ -256,6 +256,10 @@ struct CodeGenGo {
     static bool IsGoName(const string &x);
     static bool GoConstInt(const string &x, int64_t &v, bool &uns);
     static bool IsGoConst(const string &x);
+    static string GoUnparen(string x);
+    static vector<string> GoSplitTop(const string &x, const string &op);
+    static void GoChainOperands(const string &x, bool andand, vector<string> &out);
+    static bool VetBoolClash(const string &l, const string &r, bool andand);
     static string CondText(const string &x);
     string Materialize(TypeExpr *t, const string &x);
     string Coerce(const string &x, TypeExpr *from, TypeExpr *to, Line ln);

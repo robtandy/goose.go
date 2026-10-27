@@ -199,6 +199,11 @@ func GsUnreachable(file string, line int) *GsError {
 	return &GsError{Msg: "unreachable code reached", File: file, Line: line}
 }
 
+// GsBool is b, as a call. Go's vet takes `c && c` and `n != 1 || n != 2`
+// for mistakes, which a Goose program may write: it leaves an operand that
+// is a call out of the comparisons.
+func GsBool(b bool) bool { return b }
+
 func GsDivFail(file string, line int) {
 	panic(&GsError{Msg: "division by zero", File: file, Line: line})
 }
