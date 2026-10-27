@@ -1,0 +1,14 @@
+6.0 3.0 0.0 6.0
+Rect { 2.0, 3.0 } Shape.Point Color.Green Tri { -1, 0, 1 }
+2 1 true false Color.Blue
+Color.Green 2
+Circle { 8.0 } true false
+Circle { 32.0 }
+Rect { 5.0, 1.0 } true false
+Sprite { Rect { 1.0, 1.0 }, Color.Blue, 7 } true
+2.75 [Shape.Point, Circle { 0.5 }, Rect { 1.0, 2.0 }]
+green
+Circle { 2.5 } Circle { 2.5 } 18.75 2.5
+40 Push { 6 } Op.Mul
+42 -1 Some { 41 } Opt.None false
+1.5 Some { 1.5 }

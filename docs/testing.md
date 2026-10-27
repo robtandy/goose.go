@@ -555,7 +555,16 @@ match `test/go/expected/` (`<name>.out`, and `<name>.stderr` and
 `--bless` writes those from the C run. A program's first line may name flags
 for both compiles, `// goose-flags: --debug`. It also requires `goose --check
 --stacks` to print the same report for both targets, which share the data
-stack analysis.
+stack analysis. At `-O2` each program is built a second time with
+`-gcflags=all=-d=checkptr`, Go's checks of every `unsafe.Pointer` conversion
+and of the arithmetic on one (which `go test -race` turns on, and which need
+no cgo this way), and that build must run as the C one does too. The
+programs cover the scalar core and the fixed-size values: structs packed and
+aligned, fixed and limited arrays, ADTs with `match` and case functions,
+slices and string literals, plain, optional and self-relative references,
+elementwise arithmetic and large globals, with one program per runtime check
+those make (`index_abort`, `slice_abort`, `capacity_abort`, `pop_abort`,
+`popn_abort`, `resize_abort`, `reloff_abort`, `relnull_abort`).
 
 The programs in `test/go/build_only/` never end, as a program whose loop only
 stopping it leaves: each is written as Go at both levels, which must vet and
@@ -578,7 +587,10 @@ checks follow: `-o out.go` implying the target, `--go-package`, `--library`,
 `--sweep` also runs the fixtures of this suite (`test/<category>/`) through
 the Go backend. The ones it compiles must vet, build and print what
 `test/expected/` holds for them, as a C run must; the ones it refuses as not
-supported yet are counted, not failed. `--fuzz N` generates `N` programs of
+supported yet are counted, not failed, and so are the few that differ by
+design (`SWEEP_KNOWN`, with the reason): a recursion that exhausts the native
+stack is a Goose abort in C, and a fatal error of the Go runtime, which grows
+a goroutine's stack to 1 GB first. `--fuzz N` generates `N` programs of
 random arithmetic, shifts, conversions and comparisons at every scalar type
 (from `--fuzz-seed` on, every other one built with `--debug`), each of which
 both backends must run alike. `--fuzz-flow N` generates `N` programs of

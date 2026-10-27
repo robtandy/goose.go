@@ -538,13 +538,29 @@ supported, 64-bit only. The design is in [DESIGN.md](../DESIGN.md).
 
 The Go toolchain is `go` on `PATH`, or the one `GOOSE_GO` names.
 
-This version compiles the scalar core of the language: integers, floats and
-`bool` with their operators and conversions, globals, locals, every control
-construct, `defer`, calls (recursive ones and tail recursion turned into
-loops included), nested functions and function values, and `print`,
-`assert`, `abort` and `exit`. A program using anything else -- arrays,
-slices and strings held in variables, structs, enums, references, `return
-... from` across a call, threads, `extern fn` and `export fn` -- stops with
-an error at the first such construct, naming it: `... is not supported by
---target=go yet`. `test/run_go_tests.py` checks what it compiles against
-the C backend ([testing.md](testing.md)).
+This version compiles the language's single-threaded core: integers,
+floats and `bool` with their operators and conversions, structs (with `pad`
+and `pad n`), fixed and limited arrays, fixed-mode ADTs with `match` and
+case functions, slices and string literals, plain, optional and relative
+references (`in pool` ones included), elementwise arithmetic, globals,
+locals, every control construct, `defer`, calls (recursive ones and tail
+recursion turned into loops included), `return ... from` across calls,
+nested functions and function values, and `print`, `str`, `format` (with
+user format overloads), `assert`, `abort` and `exit`; the values on data
+stacks: resizable arrays `T[>..]` and `T[>..<]` with their builtins, frame
+objects, variable-size values (`T[]`, `T[..]`, structs holding them,
+variable-mode ADTs with `match` and case functions), `reusable` pools and
+`to_bytes`, `bytes_of` and `from_bytes`; and the extern fns of std the C
+runtime implements (`popcount`, `clz`, `ctz`, `find_any`, `find_pair`,
+`frexp`, `ldexp`). Every fixed-size value keeps its exact C layout: a
+struct Go aligns as C packs it, holding no reference, is a Go struct, any
+other the bytes of its layout, read and written at each field's offset, a
+reference or a slice in them byte for byte; a local whose address is taken
+lives on the fixed-frame stack (`gs.Frame`, DESIGN.md §3.6), so nothing a
+value's bytes hold is Go-heap memory. A program using anything else --
+threads, fixed-size locals and temporaries of more than 4096 bytes outside
+a recursive cycle (which C holds on a data stack; such globals are
+supported), index types, other `extern fn`s and `export fn` among them --
+stops with an error at the first such construct, naming it: `... is not
+supported by --target=go yet`. `test/run_go_tests.py` checks what it
+compiles against the C backend ([testing.md](testing.md)).

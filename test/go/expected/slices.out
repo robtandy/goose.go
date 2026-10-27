@@ -1,0 +1,12 @@
+hello, world 12 104 2 3
+world|hello|world|llo, wor||
+true true true true
+26 13 [6, 7] []
+[5, 6, 70, 80] [6, 70] 76
+[-1, 70, 80] 3 [5, -1, 70, 80]
+149
+[1, 2, 3] 5 true
+42 Pt { 5, 6 } [Pt { 1, 2 }, Pt { 3, 4 }, Pt { 5, 6 }] true
+true false false View { "v", [5, -1, 70, 80] }
+true true
+["tab\there", "quote\"d"] tab	here 7

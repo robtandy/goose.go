@@ -1,0 +1,1 @@
+goose runtime error: index 4 out of bounds (length 4) (test/go/programs/index_abort.goose:3)

@@ -1,10 +1,11 @@
 // Goose compiler — the runtime the Go backend writes into every file it
 // generates (CodeGenGo::Source, codegen_go.h), after the package clause, the
-// imports (math, os, strconv, syscall, unsafe, each of which it uses) and the
-// configuration constants gsStackReserve and gsStackGap. It is Go source as
-// it is written out, in pieces under the 16 KB a string literal may have in
-// MSVC; edit it here, and check the result with go vet on a generated file
-// (test/run_go_tests.py does, for every program it compiles).
+// imports (math, os, runtime/debug, strconv, syscall, unsafe, each of which
+// it uses) and the configuration constants gsStackReserve and gsStackGap. It
+// is Go source as it is written out, in pieces under the 16 KB a string
+// literal may have in MSVC; edit it here, and check the result with go vet
+// on a generated file (test/run_go_tests.py does, for every program it
+// compiles).
 #pragma once
 
 namespace goose {
@@ -26,10 +27,23 @@ type GsStackBlock struct {
 	Stks    []unsafe.Pointer // Current stack tops, indexed by gs_sp + k.
 	Base    []unsafe.Pointer // Where each stack's region starts.
 	Cap     []int64          // Each region's usable bytes, its guard gap not included.
-	regions [][]byte
-	reserve int64
-	gap     int64
+	// The fixed-frame stack: the address-taken fixed-size locals of the
+	// functions running, each function's frame above its caller's, taken as
+	// it starts and given back at its every return, as a native stack's
+	// frame is. Outside the Go heap, they never move, so the bytes of a
+	// value may hold their addresses where the collector does not look.
+	Frame     unsafe.Pointer
+	FrameBase unsafe.Pointer
+	FrameEnd  unsafe.Pointer
+	frame     []byte
+	regions   [][]byte
+	reserve   int64
+	gap       int64
 }
+
+// The fixed-frame stack's reservation: address space only, as the data
+// stacks' is, whatever their own (C's frames are on its native stack).
+const gsFrameReserve = 1 << 30
 
 // The smallest a region gets before a refusal is fatal, and the usable size
 // new regions currently get: it halves, in whole pages, each time the
@@ -52,8 +66,34 @@ func NewStackBlock(numStacks int, reserve, gap int64) *GsStackBlock {
 	gs := &GsStackBlock{reserve: reserve, gap: gap}
 	gsBlocks = append(gsBlocks, gs)
 	gs.EnsureStacks(numStacks)
+	gs.reserveFrame()
 	return gs
 }
+
+// reserveFrame maps the fixed-frame stack, halving its reservation where
+// the platform refuses one.
+func (gs *GsStackBlock) reserveFrame() {
+	n := int64(gsFrameReserve)
+	for {
+		r, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
+			syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+		if err == nil {
+			gs.frame = r
+			gs.FrameBase = unsafe.Pointer(unsafe.SliceData(r))
+			gs.Frame = gs.FrameBase
+			gs.FrameEnd = unsafe.Add(gs.FrameBase, n)
+			return
+		}
+		if n <= gsRegionMin {
+			GsPanic("cannot reserve the fixed-frame stack's address space")
+		}
+		n /= 2
+	}
+}
+
+// GsFrameOverflow is a function's frame that does not fit what is left of
+// the fixed-frame stack, which C reports as its native stack's overflow.
+func GsFrameOverflow() { GsPanic("native call stack overflow") }
 
 // EnsureStacks reserves stacks until the block has at least n.
 func (gs *GsStackBlock) EnsureStacks(n int) {
@@ -67,8 +107,12 @@ func (gs *GsStackBlock) EnsureStacks(n int) {
 	}
 }
 
-// Reset rewinds every stack of the block to empty.
-func (gs *GsStackBlock) Reset() { copy(gs.Stks, gs.Base) }
+// Reset rewinds every stack of the block to empty, its fixed-frame stack's
+// too.
+func (gs *GsStackBlock) Reset() {
+	copy(gs.Stks, gs.Base)
+	gs.Frame = gs.FrameBase
+}
 
 // Close releases the block's regions.
 func (gs *GsStackBlock) Close() error {
@@ -78,7 +122,13 @@ func (gs *GsStackBlock) Close() error {
 			first = err
 		}
 	}
+	if gs.frame != nil {
+		if err := syscall.Munmap(gs.frame); err != nil && first == nil {
+			first = err
+		}
+	}
 	gs.regions, gs.Stks, gs.Base, gs.Cap = nil, nil, nil, nil
+	gs.frame, gs.Frame, gs.FrameBase, gs.FrameEnd = nil, nil, nil, nil
 	return first
 }
 
@@ -98,14 +148,32 @@ func gsOverflow(end unsafe.Pointer) {
 			}
 		}
 	}
+	panic(&GsError{Msg: gsOverflowText(usable, reserve)})
+}
+
+func gsOverflowText(usable, reserve int64) string {
 	reserve -= reserve % int64(syscall.Getpagesize())
 	msg := "data stack overflow: a value on main's data stacks grew past the " + gsSize(usable) +
 		" reserved for it"
 	if usable < reserve {
 		msg += " (halved from " + gsSize(reserve) + " when the platform ran out of address space)"
 	}
-	panic(&GsError{Msg: msg + "; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, " +
-		"up to 256 TB"})
+	return msg + "; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, up to 256 TB"
+}
+
+// gsFault is the report of a fault at addr, where it lies in a region's
+// guard gap: a data stack grown past its region with no check on the way,
+// as a push grows it (gs_fault_handler). "" for any other address.
+func gsFault(addr uintptr) string {
+	for _, b := range gsBlocks {
+		for k, r := range b.regions {
+			base := uintptr(unsafe.Pointer(unsafe.SliceData(r)))
+			if addr-base < uintptr(len(r)) {
+				return "goose runtime error: " + gsOverflowText(b.Cap[k], b.reserve)
+			}
+		}
+	}
+	return ""
 }
 
 // gsSize is a size as the C runtime writes one (gs_size): a whole number of
@@ -118,6 +186,21 @@ func gsSize(n int64) string {
 		u++
 	}
 	return strconv.FormatInt(n, 10) + units[u]
+}
+
+// gsStackStats is the report a program compiled with GS_STACK_STATS gives on
+// stderr as it ends (gs_stack_stats): its indexed data stacks, the regions
+// of its block, what each reserves, and the budget.
+func gsStackStats(gs *GsStackBlock, stacks, budget int64) {
+	per := gsRegionUsable + gs.gap
+	n := int64(0)
+	if per > 0 {
+		n = budget / per
+	}
+	os.Stderr.WriteString("goose stack stats: main: " + strconv.FormatInt(stacks, 10) + " data stacks, " +
+		strconv.Itoa(len(gs.regions)) + " regions (reserving " + gsSize(gsRegionUsable) + " each); budget " +
+		gsSize(budget) + " for " + strconv.FormatInt(n, 10) + ", main program " +
+		strconv.Itoa(len(gs.regions)) + ", no workers\n")
 }
 
 // gsReserveRegion maps one region: address space only, committed by the OS
@@ -212,12 +295,21 @@ func (e *GsError) Error() string {
 
 // GsExitOnAbort, deferred by the program's main, ends the process as the C
 // runtime does when a Goose runtime error panics: the message on stderr and
-// exit status 1. Any other panic goes on.
+// exit status 1. So does a fault in a data stack's guard gap, which the
+// program's main has the runtime panic with (debug.SetPanicOnFault): a stack
+// that grew past its region, as C's fault handler reports it. Any other
+// panic goes on.
 func GsExitOnAbort() {
 	if r := recover(); r != nil {
 		if e, ok := r.(*GsError); ok {
 			os.Stderr.WriteString(e.Error() + "\n")
 			os.Exit(1)
+		}
+		if f, ok := r.(interface{ Addr() uintptr }); ok {
+			if msg := gsFault(f.Addr()); msg != "" {
+				os.Stderr.WriteString(msg + "\n")
+				os.Exit(1)
+			}
 		}
 		panic(r)
 	}
@@ -250,6 +342,118 @@ func GsUnreachable(file string, line int) *GsError {
 // for mistakes, which a Goose program may write: it leaves an operand that
 // is a call out of the comparisons.
 func GsBool(b bool) bool { return b }
+
+)GSGO",
+R"GSGO(// GsTagError is a debug build's failed check of an ADT's tag, which no
+// variant has (GS_E_TAG): a compiler bug if it ever fails.
+func GsTagError(file string, line int) *GsError {
+	return &GsError{Msg: gsErrMsgs[GsETag], File: file, Line: line}
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-size values (§3). A slice is the address of its first element and
+// their count; Data is a Go pointer, so that the collector sees a slice of
+// a Go variable as it sees a reference to one.
+
+// GsSlice is a slice T[:] of any element type (§3.10).
+type GsSlice struct {
+	Data unsafe.Pointer
+	Len  int64
+}
+
+// GsRhdr is the header of a resizable value (§5.1, §5.2, C.2): Len elements
+// from Base, which sit on top of the header's data stack, so that pushing an
+// element writes it at the stack's top, moves the top past it and counts
+// it. The base never moves.
+type GsRhdr struct {
+	Base unsafe.Pointer
+	Len  int64
+}
+
+// GsRref is a fat reference to a resizable value (C's gs_rref): its header,
+// and the index in the GsStackBlock of the data stack its elements top, so
+// that a callee can grow the value it was handed.
+type GsRref struct {
+	Hdr *GsRhdr
+	Stk int64
+}
+
+// GsPref is a reference to a reusable[] pool (C's gs_pref): the element
+// array as a GsRref, and the freelist's header and data stack.
+type GsPref struct {
+	Hdr     *GsRhdr
+	Stk     int64
+	FreeHdr *GsRhdr
+	FreeStk int64
+}
+
+// GsStr is the slice of a string literal's bytes, which are read-only.
+func GsStr(s string) GsSlice { return GsSlice{unsafe.Pointer(unsafe.StringData(s)), int64(len(s))} }
+
+// GsSub is the slice of the elements lo up to hi of the n at p, each es
+// bytes. An empty one starts where it is, at the end of the run too, so
+// that two at different places are different slices (§3.10): what a slice
+// can point into is never the Go heap, where an address one past an
+// object's end would be no valid Go pointer.
+func GsSub(p unsafe.Pointer, lo, hi, n, es int64) GsSlice {
+	_ = n
+	return GsSlice{unsafe.Add(p, lo*es), hi - lo}
+}
+
+// GsIdx is i, checked to be an index of an array of n elements (GS_IDX).
+func GsIdx(i, n int64, file string, line int) int64 {
+	if uint64(i) >= uint64(n) {
+		gsIdxFail(i, n, file, line)
+	}
+	return i
+}
+
+func gsIdxFail(i, n int64, file string, line int) {
+	panic(&GsError{Msg: "index " + strconv.FormatInt(i, 10) + " out of bounds (length " +
+		strconv.FormatInt(n, 10) + ")", File: file, Line: line})
+}
+
+// GsMemEq says whether the n bytes at a and b are the same.
+func GsMemEq(a, b unsafe.Pointer, n int64) bool {
+	return n == 0 || a == b ||
+		string(unsafe.Slice((*byte)(a), n)) == string(unsafe.Slice((*byte)(b), n))
+}
+
+// GsRelLoad is the address an optional relative reference at slot holding
+// off encodes: null where off is 0 (§3.9).
+func GsRelLoad(slot unsafe.Pointer, off int64) unsafe.Pointer {
+	if off == 0 {
+		return nil
+	}
+	return unsafe.Add(slot, off)
+}
+
+// GsPoolLoad is the address an optional `in pool` reference holding off
+// encodes, from its pool's base: null where off is 0 (§3.9).
+func GsPoolLoad(base unsafe.Pointer, off int64) unsafe.Pointer {
+	if off == 0 {
+		return nil
+	}
+	return unsafe.Add(base, off-1)
+}
+
+// GsPoolOff is what an optional `in pool` reference to p stores: its
+// distance from its pool's base plus one, or 0 for null.
+func GsPoolOff(p, base unsafe.Pointer) uint64 {
+	if p == nil {
+		return 0
+	}
+	return uint64(uintptr(p)-uintptr(base)) + 1
+}
+
+// GsRelOff is the offset from slot the address p stores as in an optional
+// relative reference: 0 for null.
+func GsRelOff(p, slot unsafe.Pointer) int64 {
+	if p == nil {
+		return 0
+	}
+	return int64(uintptr(p) - uintptr(slot))
+}
 
 func GsDivFail(file string, line int) {
 	panic(&GsError{Msg: "division by zero", File: file, Line: line})
@@ -716,6 +920,43 @@ func gsPutBytes(p, end unsafe.Pointer, b []byte) unsafe.Pointer {
 	return unsafe.Add(p, len(b))
 }
 
+// gsPutQuoted writes the n bytes at s quoted, as a u8 array inside an
+// aggregate renders (gs_fmt_quoted): `"`, `\` and the line breaks and tabs
+// escaped.
+func gsPutQuoted(p, end unsafe.Pointer, s unsafe.Pointer, n int64) unsafe.Pointer {
+	b := unsafe.Slice((*byte)(s), n)
+	size := 2
+	for _, c := range b {
+		switch c {
+		case '"', '\\', '\n', '\r', '\t':
+			size += 2
+		default:
+			size++
+		}
+	}
+	if uintptr(size) > uintptr(end)-uintptr(p) {
+		gsOverflow(end)
+	}
+	d := unsafe.Slice((*byte)(p), size)[:0]
+	d = append(d, '"')
+	for _, c := range b {
+		switch c {
+		case '"', '\\':
+			d = append(d, '\\', c)
+		case '\n':
+			d = append(d, '\\', 'n')
+		case '\r':
+			d = append(d, '\\', 'r')
+		case '\t':
+			d = append(d, '\\', 't')
+		default:
+			d = append(d, c)
+		}
+	}
+	d = append(d, '"')
+	return unsafe.Add(p, len(d))
+}
+
 // gsOut writes the bytes from base up to end to stdout, in one write.
 func gsOut(base, end unsafe.Pointer) {
 	_, _ = os.Stdout.Write(unsafe.Slice((*byte)(base), uintptr(end)-uintptr(base)))
@@ -807,6 +1048,777 @@ func gsAppendFloat(dst []byte, v float64, f32 bool) []byte {
 		dst = append(dst, ".0"...)
 	}
 	return dst
+}
+)GSGO",
+R"GSGO(// ---------------------------------------------------------------------------
+// Slice pools (goose_spec.md §5.4, reusable[]), ported from the gs_spans_*
+// functions of src/runtime/runtime_impl.h, as runtime/go/goose_spans.go has
+// them (keep the two the same). A pool's freelist holds its
+// free (index, count) spans, no two of them touching, in a B+ tree ordered
+// by index: leaves hold spans, and every inner entry holds the first index
+// and the largest count in the subtree under it, which is what lets first
+// fit, the span at or before an index, and the last span each be found by
+// one descent.
+//
+// The tree lives on a data stack of its own, in nodes of GsSpanNode bytes
+// numbered from the freelist's base: node 0 is the header, and the others
+// come off a chain of emptied nodes or past the last one, so the node count
+// is the freelist's length, and the tree, in node numbers, can be copied
+// whole. A freelist starts empty, without a header, until a span is freed.
+// Every span comes from a slice of the pool, so spans stay inside the
+// pool's length whatever the program frees: freeing a slice twice leaves
+// overlapping spans that hand the same elements out twice, never anything
+// outside the pool.
+//
+// The generated code keeps the element array's length and top and fills
+// in elements; these functions keep only the spans. Each takes the
+// freelist's base, a pointer to its node count (its header's Len) and a
+// pointer to its stack's top, which stays past the last node: the stack's
+// slot in GsStackBlock.Stks, or a local the generated code caches it in.
+// Indices and counts are in elements.
+
+// GsSpanNode is the size of a freelist node in bytes (GS_SPAN_NODE).
+const GsSpanNode = 512
+
+const (
+	gsSpanLeaf = (GsSpanNode - 16) / 16 // spans in a leaf
+	gsSpanFan  = (GsSpanNode - 16) / 24 // children of an inner node
+	// A full node splits into halves and an empty one leaves its parent,
+	// so every level a tree gains takes about gsSpanFan / 2 times the
+	// insertions of the one before: no freelist gets this deep.
+	gsSpanDepth = 24
+)
+
+// The nodes as they lie on the stack; link chains emptied nodes.
+type gsSpLeaf struct {
+	n, link int64
+	idx     [gsSpanLeaf]int64
+	cnt     [gsSpanLeaf]int64
+}
+
+type gsSpInner struct {
+	n, link int64
+	key     [gsSpanFan]int64
+	max     [gsSpanFan]int64
+	child   [gsSpanFan]int64
+}
+
+type gsSpHead struct {
+	root, height, chain int64
+}
+
+// gsSpans is a freelist as the functions are handed it.
+type gsSpans struct {
+	base unsafe.Pointer
+	n    *int64
+	top  *unsafe.Pointer
+}
+
+// gsSpPath is a path down a freelist: the node and the entry taken at
+// each level, the leaf's last.
+type gsSpPath struct {
+	h    int64
+	node [gsSpanDepth]int64
+	pos  [gsSpanDepth]int64
+}
+
+func (f *gsSpans) head() *gsSpHead { return (*gsSpHead)(f.base) }
+
+func (f *gsSpans) leaf(i int64) *gsSpLeaf {
+	return (*gsSpLeaf)(unsafe.Add(f.base, i*GsSpanNode))
+}
+
+func (f *gsSpans) inner(i int64) *gsSpInner {
+	return (*gsSpInner)(unsafe.Add(f.base, i*GsSpanNode))
+}
+
+func (f *gsSpans) newNode() int64 {
+	hd := f.head()
+	if i := hd.chain; i != 0 {
+		hd.chain = f.leaf(i).link
+		return i
+	}
+	*f.top = unsafe.Add(*f.top, GsSpanNode)
+	i := *f.n
+	*f.n = i + 1
+	return i
+}
+
+func (f *gsSpans) dropNode(i int64) {
+	hd := f.head()
+	f.leaf(i).link = hd.chain
+	hd.chain = i
+}
+
+// gsSpOpen moves a leaf's entries from position s on up one, making room
+// at s; gsSpClose moves those after s down onto it. Loops over the arrays
+// together rather than copies of each: a node holds a few entries, and the
+// calls cost more than moving them.
+func gsSpOpen(lf *gsSpLeaf, s int64) {
+	for j := lf.n; j > s; j-- {
+		lf.idx[j] = lf.idx[j-1]
+		lf.cnt[j] = lf.cnt[j-1]
+	}
+	lf.n++
+}
+
+func gsSpClose(lf *gsSpLeaf, s int64) {
+	lf.n--
+	for j := s; j < lf.n; j++ {
+		lf.idx[j] = lf.idx[j+1]
+		lf.cnt[j] = lf.cnt[j+1]
+	}
+}
+
+func gsSpOpenIn(in *gsSpInner, s int64) {
+	for j := in.n; j > s; j-- {
+		in.key[j] = in.key[j-1]
+		in.max[j] = in.max[j-1]
+		in.child[j] = in.child[j-1]
+	}
+	in.n++
+}
+
+func gsSpCloseIn(in *gsSpInner, s int64) {
+	in.n--
+	for j := s; j < in.n; j++ {
+		in.key[j] = in.key[j+1]
+		in.max[j] = in.max[j+1]
+		in.child[j] = in.child[j+1]
+	}
+}
+
+// gsSpMost is the largest of the counts v, or stop as soon as one reaches
+// it.
+func gsSpMost(v []int64, stop int64) int64 {
+	m := int64(0)
+	for k := 0; k < len(v) && m < stop; k++ {
+		if v[k] > m {
+			m = v[k]
+		}
+	}
+	return m
+}
+
+// max is the largest count under node i, a leaf or an inner node, or stop
+// as soon as one reaches it.
+func (f *gsSpans) max(i int64, leaf bool, stop int64) int64 {
+	if leaf {
+		lf := f.leaf(i)
+		return gsSpMost(lf.cnt[:lf.n], stop)
+	}
+	in := f.inner(i)
+	return gsSpMost(in.max[:in.n], stop)
+}
+
+func (f *gsSpans) key(i int64, leaf bool) int64 {
+	if leaf {
+		return f.leaf(i).idx[0]
+	}
+	return f.inner(i).key[0]
+}
+
+// fix brings the entries above level l of the path (the leaf being level
+// h) up to date with the node below each, after one count in the node at
+// level l went from was to now (0 for an entry added or removed), stopping
+// at the first entry that is unchanged. A node's largest count is rescanned
+// only where the count that held it shrank, and only until another as large
+// turns up; a was of math.MaxInt64 rescans the node at level l whole,
+// whatever changed in it.
+func (f *gsSpans) fix(p *gsSpPath, l, was, now int64) {
+	for ; l > 0; l-- {
+		in := f.inner(p.node[l-1])
+		k, c := p.pos[l-1], p.node[l]
+		m := in.max[k]
+		leaf := l == p.h
+		key := f.key(c, leaf)
+		var nm int64
+		switch {
+		case now >= m:
+			nm = now
+		case was < m:
+			nm = m
+		default:
+			nm = f.max(c, leaf, was)
+		}
+		if in.key[k] == key && nm == m {
+			return
+		}
+		in.key[k] = key
+		in.max[k] = nm
+		was = m
+		now = nm
+	}
+}
+
+// find descends to the leaf holding the last span that starts at or before
+// idx, and returns its position there, or -1 where no span does.
+func (f *gsSpans) find(p *gsSpPath, idx int64) int64 {
+	hd := f.head()
+	i := hd.root
+	p.h = hd.height
+	for l := int64(0); l < p.h; l++ {
+		in := f.inner(i)
+		k := int64(1)
+		for k < in.n && in.key[k] <= idx {
+			k++
+		}
+		p.node[l] = i
+		p.pos[l] = k - 1
+		i = in.child[k-1]
+	}
+	p.node[p.h] = i
+	lf := f.leaf(i)
+	k := int64(0)
+	for k < lf.n && lf.idx[k] <= idx {
+		k++
+	}
+	p.pos[p.h] = k - 1
+	return k - 1
+}
+
+// newRoot puts a node full at the root, split into a and b, under a new
+// root of the two halves.
+func (f *gsSpans) newRoot(a, b int64, leaf bool) {
+	r := f.newNode()
+	rn := f.inner(r)
+	rn.n = 2
+	rn.key[0] = f.key(a, leaf)
+	rn.max[0] = f.max(a, leaf, math.MaxInt64)
+	rn.child[0] = a
+	rn.key[1] = f.key(b, leaf)
+	rn.max[1] = f.max(b, leaf, math.MaxInt64)
+	rn.child[1] = b
+	hd := f.head()
+	hd.root = r
+	hd.height++
+}
+
+// addChild puts the entry for node child at position k of the inner node
+// at level l of the path, splitting full nodes on the way up.
+func (f *gsSpans) addChild(p *gsSpPath, l, k, child int64, leaf bool) {
+	for {
+		in := f.inner(p.node[l])
+		o := in
+		key, max := f.key(child, leaf), f.max(child, leaf, math.MaxInt64)
+		s, nn := k, int64(0)
+		if in.n == gsSpanFan {
+			const half = gsSpanFan / 2
+			nn = f.newNode()
+			r := f.inner(nn)
+			r.n = in.n - half
+			copy(r.key[:r.n], in.key[half:])
+			copy(r.max[:r.n], in.max[half:])
+			copy(r.child[:r.n], in.child[half:])
+			in.n = half
+			if k > half {
+				o = r
+				s = k - half
+			}
+		}
+		gsSpOpenIn(o, s)
+		o.key[s] = key
+		o.max[s] = max
+		o.child[s] = child
+		if nn == 0 {
+			f.fix(p, l, 0, max)
+			return
+		}
+		if l == 0 {
+			f.newRoot(p.node[0], nn, false)
+			return
+		}
+		// The node keeps its place above, and its new right half goes
+		// after it.
+		f.fix(p, l, math.MaxInt64, 0)
+		child = nn
+		leaf = false
+		k = p.pos[l-1] + 1
+		l--
+	}
+}
+
+// insert puts span (idx, cnt) at position k of the path's leaf.
+func (f *gsSpans) insert(p *gsSpPath, k, idx, cnt int64) {
+	lf := f.leaf(p.node[p.h])
+	o := lf
+	s, nn := k, int64(0)
+	if lf.n == gsSpanLeaf {
+		const half = gsSpanLeaf / 2
+		nn = f.newNode()
+		r := f.leaf(nn)
+		r.n = lf.n - half
+		copy(r.idx[:r.n], lf.idx[half:])
+		copy(r.cnt[:r.n], lf.cnt[half:])
+		lf.n = half
+		if k > half {
+			o = r
+			s = k - half
+		}
+	}
+	gsSpOpen(o, s)
+	o.idx[s] = idx
+	o.cnt[s] = cnt
+	switch {
+	case nn == 0:
+		f.fix(p, p.h, 0, cnt)
+	case p.h == 0:
+		f.newRoot(p.node[0], nn, true)
+	default:
+		f.fix(p, p.h, math.MaxInt64, 0)
+		f.addChild(p, p.h-1, p.pos[p.h-1]+1, nn, true)
+	}
+}
+
+// delete removes the span at position k of the path's leaf. An emptied
+// node leaves its parent, and a root left with one child hands the root
+// down.
+func (f *gsSpans) delete(p *gsSpPath, k int64) {
+	lf := f.leaf(p.node[p.h])
+	c := lf.cnt[k]
+	gsSpClose(lf, k)
+	if lf.n > 0 || p.h == 0 {
+		f.fix(p, p.h, c, 0)
+		return
+	}
+	f.dropNode(p.node[p.h])
+	for l := p.h - 1; ; l-- {
+		in := f.inner(p.node[l])
+		e := p.pos[l]
+		m := in.max[e]
+		gsSpCloseIn(in, e)
+		if in.n > 0 {
+			f.fix(p, l, m, 0)
+			break
+		}
+		// Never the root: a root of one child is handed down below, so
+		// every root has two or more.
+		f.dropNode(p.node[l])
+	}
+	hd := f.head()
+	for hd.height > 0 && f.inner(hd.root).n == 1 {
+		r := hd.root
+		hd.root = f.inner(r).child[0]
+		hd.height--
+		f.dropNode(r)
+	}
+}
+
+// take takes cnt elements off the front of the span at position k of the
+// path's leaf, or the whole span where it holds no more.
+func (f *gsSpans) take(p *gsSpPath, k, cnt int64) {
+	lf := f.leaf(p.node[p.h])
+	c := lf.cnt[k]
+	if c <= cnt {
+		f.delete(p, k)
+		return
+	}
+	lf.idx[k] += cnt
+	lf.cnt[k] = c - cnt
+	f.fix(p, p.h, c, c-cnt)
+}
+
+)GSGO",
+R"GSGO(// GsSpansAlloc is where a run of cnt elements goes in a pool of length
+// elements, taken off the freelist (gs_spans_alloc): for alloc_slice, and
+// for a slice realloc_slice moves. That is the front of the first free span
+// that holds cnt, in index order, else the end of the array, where a free
+// span that reaches the end starts the run. The caller grows the array to
+// the returned index plus cnt. First fit rather than best: in index order
+// it packs runs toward the start and leaves the end free.
+func GsSpansAlloc(base unsafe.Pointer, n *int64, top *unsafe.Pointer, length, cnt int64) int64 {
+	if cnt == 0 || *n == 0 {
+		return length
+	}
+	f := gsSpans{base, n, top}
+	var p gsSpPath
+	var before [gsSpanDepth]int64
+	var lf *gsSpLeaf
+	var l, k, m int64
+	hd := f.head()
+	p.h = hd.height
+	i := hd.root
+	// Down the first entry at each level whose largest count holds cnt,
+	// noting the largest count of the ones before it, all smaller than
+	// cnt, for bringing the entries up to date once the span is taken
+	// from. Where the root holds none, down to the last span.
+	for l = 0; l < p.h; l++ {
+		in := f.inner(i)
+		for k, m = 0, 0; k < in.n && in.max[k] < cnt; k++ {
+			if in.max[k] > m {
+				m = in.max[k]
+			}
+		}
+		if k == in.n {
+			break
+		}
+		p.node[l] = i
+		p.pos[l] = k
+		before[l] = m
+		i = in.child[k]
+	}
+	if l == p.h {
+		lf = f.leaf(i)
+		for k, m = 0, 0; k < lf.n && lf.cnt[k] < cnt; k++ {
+			if lf.cnt[k] > m {
+				m = lf.cnt[k]
+			}
+		}
+		before[l] = m
+	}
+	if l < p.h || k == lf.n {
+		for l, i = 0, hd.root; l < p.h; l++ {
+			in := f.inner(i)
+			p.node[l] = i
+			p.pos[l] = in.n - 1
+			i = in.child[in.n-1]
+		}
+		p.node[p.h] = i
+		lf = f.leaf(i)
+		k = lf.n - 1
+		if k < 0 || lf.idx[k]+lf.cnt[k] != length {
+			return length
+		}
+		idx := lf.idx[k]
+		f.take(&p, k, cnt)
+		return idx
+	}
+	p.node[p.h] = i
+	p.pos[p.h] = k
+	idx, c := lf.idx[k], lf.cnt[k]
+	var now, j int64
+	switch {
+	case c > cnt:
+		now = c - cnt
+		lf.idx[k] = idx + cnt
+		lf.cnt[k] = now
+		j = k + 1
+	case lf.n > 1 || p.h == 0:
+		gsSpClose(lf, k)
+		now = 0
+		j = k
+	default:
+		f.delete(&p, k)
+		return idx
+	}
+	// As fix, with what the descent noted: the count on the path at level
+	// l went from c to now, and the node's other entries are the ones
+	// before, smaller than cnt, and those from j on, which need scanning
+	// only where c was the node's largest.
+	for l = p.h; l > 0; l-- {
+		in := f.inner(p.node[l-1])
+		e := p.pos[l-1]
+		mx := in.max[e]
+		nm := mx
+		key := f.key(p.node[l], l == p.h)
+		if c == mx {
+			var v []int64
+			if l == p.h {
+				v = lf.cnt[:lf.n]
+			} else {
+				below := f.inner(p.node[l])
+				v = below.max[:below.n]
+			}
+			nm = before[l]
+			if now > nm {
+				nm = now
+			}
+			for ; j < int64(len(v)) && nm < c; j++ {
+				if v[j] > nm {
+					nm = v[j]
+				}
+			}
+		}
+		if in.key[e] == key && nm == mx {
+			break
+		}
+		in.key[e] = key
+		in.max[e] = nm
+		c = mx
+		now = nm
+		j = e + 1
+	}
+	return idx
+}
+
+// gsSpNear is the spans around a run [idx, end): the leaf holding the last
+// span that starts at or before idx (at position k, or -1), and the span
+// after that one, where it follows in the same leaf, or where it starts
+// the next leaf and at end (nl and nk, nl nil where there is none). Where
+// that span is in the next leaf, the path to it is the other path near
+// fills (inQ).
+type gsSpNear struct {
+	lf, nl *gsSpLeaf
+	k, nk  int64
+	inQ    bool
+}
+
+// near finds the spans around the run [idx, end), with the path to the one
+// before it in p. A next leaf's first index is the key of the entry that
+// leads to it, so a path to it, in q, is only made where its first span
+// touches the run.
+func (f *gsSpans) near(p, q *gsSpPath, idx, end int64) gsSpNear {
+	var s gsSpNear
+	s.k = f.find(p, idx)
+	s.lf = f.leaf(p.node[p.h])
+	s.nk = -1
+	if s.k+1 < s.lf.n {
+		s.nl = s.lf
+		s.nk = s.k + 1
+		return s
+	}
+	l := p.h - 1
+	for l >= 0 && p.pos[l]+1 >= f.inner(p.node[l]).n {
+		l--
+	}
+	if l < 0 || f.inner(p.node[l]).key[p.pos[l]+1] != end {
+		return s
+	}
+	q.h = p.h
+	copy(q.node[:l+1], p.node[:l+1])
+	copy(q.pos[:l+1], p.pos[:l+1])
+	for q.pos[l]++; l < q.h; l++ {
+		q.node[l+1] = f.inner(q.node[l]).child[q.pos[l]]
+		q.pos[l+1] = 0
+	}
+	s.inQ = true
+	s.nl = f.leaf(q.node[q.h])
+	s.nk = 0
+	return s
+}
+
+// release puts [idx, idx + cnt) back on the freelist beside the spans near
+// found around it, merged with the ones it touches.
+func (f *gsSpans) release(p, q *gsSpPath, s *gsSpNear, idx, cnt int64) {
+	lf, nl := s.lf, s.nl
+	k, nk := s.k, s.nk
+	np := p
+	if s.inQ {
+		np = q
+	}
+	prev := k >= 0 && lf.idx[k]+lf.cnt[k] == idx
+	next := nl != nil && idx+cnt == nl.idx[nk]
+	switch {
+	case prev:
+		c := lf.cnt[k]
+		m := c + cnt
+		if next {
+			m += nl.cnt[nk]
+		}
+		lf.cnt[k] = m
+		// The merged count is larger than both it replaces, so one fix
+		// covers the span after leaving the leaf as well.
+		if next && nl == lf {
+			gsSpClose(lf, nk)
+		}
+		f.fix(p, p.h, c, m)
+		if next && nl != lf {
+			f.delete(np, nk)
+		}
+	case next:
+		c := nl.cnt[nk]
+		nl.idx[nk] = idx
+		nl.cnt[nk] = c + cnt
+		f.fix(np, np.h, c, c+cnt)
+	default:
+		f.insert(p, k+1, idx, cnt)
+	}
+}
+
+// GsSpansFree puts [idx, idx + cnt) back on the freelist, merged with the
+// spans it touches (gs_spans_free): free_slice, and what realloc_slice lets
+// go of. The first span freed lays out the freelist's header.
+func GsSpansFree(base unsafe.Pointer, n *int64, top *unsafe.Pointer, idx, cnt int64) {
+	if cnt <= 0 {
+		return
+	}
+	f := gsSpans{base, n, top}
+	if *n == 0 {
+		hd := f.head()
+		*n = 1
+		*top = unsafe.Add(base, GsSpanNode)
+		hd.chain = 0
+		hd.height = 0
+		hd.root = f.newNode()
+		f.leaf(hd.root).n = 0
+	}
+	var p, q gsSpPath
+	s := f.near(&p, &q, idx, idx+cnt)
+	f.release(&p, &q, &s, idx, cnt)
+}
+
+// GsSpansRegrow is where the non-empty slice [idx, idx + ol), which does
+// not end the array, starts once realloc_slice grows it to cnt elements
+// (gs_spans_regrow). That is in place where a free span starts where the
+// slice ends and holds the difference or reaches the end of the array;
+// otherwise the slice's elements go back on the freelist and the run goes
+// where GsSpansAlloc places one of cnt elements, and the caller copies the
+// elements there. The span after the slice is the one after the last span
+// before it, so one descent finds both what growth takes from and what the
+// elements merge with.
+func GsSpansRegrow(base unsafe.Pointer, n *int64, top *unsafe.Pointer, length, idx, ol, cnt int64) int64 {
+	if *n == 0 {
+		GsSpansFree(base, n, top, idx, ol)
+		return GsSpansAlloc(base, n, top, length, cnt)
+	}
+	f := gsSpans{base, n, top}
+	end := idx + ol
+	var p, q gsSpPath
+	s := f.near(&p, &q, idx, end)
+	if s.nl != nil && s.nl.idx[s.nk] == end &&
+		(s.nl.cnt[s.nk] >= cnt-ol || end+s.nl.cnt[s.nk] == length) {
+		np := &p
+		if s.inQ {
+			np = &q
+		}
+		f.take(np, s.nk, cnt-ol)
+		return idx
+	}
+	f.release(&p, &q, &s, idx, ol)
+	return GsSpansAlloc(base, n, top, length, cnt)
+}
+)GSGO",
+R"GSGO(// ---------------------------------------------------------------------------
+// Variable-size values (§3.6, docs/implementation.md §6.1): a length prefix
+// or a varint is ULEB128, a signed varint value zigzag-encoded on top, as
+// runtime/go/goose_bytes.go has them (keep the two the same).
+
+// GsUlebRead is the ULEB128 at p (GS_ULEB_READ).
+func GsUlebRead(p unsafe.Pointer) int64 {
+	var v uint64
+	for shift := uint(0); ; shift += 7 {
+		b := *(*byte)(p)
+		v |= uint64(b&0x7f) << shift
+		if b < 0x80 {
+			return int64(v)
+		}
+		p = unsafe.Add(p, 1)
+	}
+}
+
+// GsUlebSize is the size in bytes of the ULEB128 at p (GS_ULEB_SIZE).
+func GsUlebSize(p unsafe.Pointer) int64 {
+	n := int64(1)
+	for *(*byte)(unsafe.Add(p, n-1)) >= 0x80 {
+		n++
+	}
+	return n
+}
+
+// GsUlebWrite writes v as a ULEB128 at p, returning its size in bytes,
+// at most 10.
+func GsUlebWrite(p unsafe.Pointer, v uint64) int64 {
+	n := int64(0)
+	for v >= 0x80 {
+		*(*byte)(unsafe.Add(p, n)) = byte(v) | 0x80
+		v >>= 7
+		n++
+	}
+	*(*byte)(unsafe.Add(p, n)) = byte(v)
+	return n + 1
+}
+
+// GsZigRead is the zigzag-encoded varint at p (gs_zig_read).
+func GsZigRead(p unsafe.Pointer) int64 {
+	u := uint64(GsUlebRead(p))
+	return int64(u>>1) ^ -int64(u&1)
+}
+
+// GsZigWrite writes v as a zigzag-encoded varint at p, returning its size
+// in bytes (gs_zig_write).
+func GsZigWrite(p unsafe.Pointer, v int64) int64 {
+	return GsUlebWrite(p, uint64(v)<<1^uint64(v>>63))
+}
+
+// GsLenCheck is the check of a count that goes into a length field: it
+// must fit the field's storage (EmitLenCheck).
+func GsLenCheck(n int64, max uint64) {
+	if uint64(n) > max {
+		GsPanic("array length exceeds storage range")
+	}
+}
+
+// gsUlebCheck reads the ULEB128 at byte q of the n bytes at p, for the
+// verifier (gs_uleb_check): the value and its size in bytes, which is 0
+// where the varint runs past n or past ten bytes, carries payload bits
+// above the 64th, or is not in its shortest form. Nothing past the n bytes
+// is formed into an address.
+func gsUlebCheck(p unsafe.Pointer, q, n int64) (v uint64, k int64) {
+	for shift := uint(0); ; shift += 7 {
+		if q+k >= n {
+			return 0, 0
+		}
+		b := *(*byte)(unsafe.Add(p, q+k))
+		k++
+		if shift > 63 || (shift == 63 && b&0x7e != 0) {
+			return 0, 0
+		}
+		v |= uint64(b&0x7f) << shift
+		if b < 0x80 {
+			if shift != 0 && b == 0 { // A redundant high zero group.
+				return 0, 0
+			}
+			return v, k
+		}
+	}
+}
+
+// gsZigCheck is gsUlebCheck for a zigzag-encoded varint (gs_zig_check).
+func gsZigCheck(p unsafe.Pointer, q, n int64) (int64, int64) {
+	u, k := gsUlebCheck(p, q, n)
+	return int64(u>>1) ^ -int64(u&1), k
+}
+
+// The verifier's element starts, one bit per image byte (GS_BM_SET,
+// GS_BM_GET), in scratch on a data stack.
+func gsBmSet(bm unsafe.Pointer, i int64) {
+	*(*byte)(unsafe.Add(bm, i>>3)) |= 1 << (i & 7)
+}
+
+func gsBmGet(bm unsafe.Pointer, i int64) bool {
+	return *(*byte)(unsafe.Add(bm, i>>3))>>(i&7)&1 != 0
+}
+
+// gsIsLE says whether the host is little-endian, which serialization needs
+// (gs_is_le).
+func gsIsLE() bool {
+	x := uint16(1)
+	return *(*byte)(unsafe.Pointer(&x)) == 1
+}
+
+// ---------------------------------------------------------------------------
+// The C functions std binds as extern fns (runtime_ext.h), where Go's own
+// library has no equivalent. A ByteSet's members, a bool[256], lead it.
+
+// gsFindAny is std's find_any: the first i with s[i] in set, -1 if none
+// (gs_find_any).
+func gsFindAny(s GsSlice, set unsafe.Pointer) int64 {
+	m := (*[256]bool)(set)
+	for i := int64(0); i < s.Len; i++ {
+		if m[*(*byte)(unsafe.Add(s.Data, i))] {
+			return i
+		}
+	}
+	return -1
+}
+
+// gsFindPair is std's byte_set_pair: the first i with s[i] in a and
+// s[i+d] in b, of those with i + d < s.Len; -1 if none (gs_find_pair).
+func gsFindPair(s GsSlice, a unsafe.Pointer, d int64, b unsafe.Pointer) int64 {
+	ma, mb := (*[256]bool)(a), (*[256]bool)(b)
+	for i := int64(0); i+d < s.Len; i++ {
+		if ma[*(*byte)(unsafe.Add(s.Data, i))] && mb[*(*byte)(unsafe.Add(s.Data, i+d))] {
+			return i
+		}
+	}
+	return -1
+}
+
+// gsFrexp is C's frexp: the fraction, its exponent through e.
+func gsFrexp(x float64, e *int32) float64 {
+	f, n := math.Frexp(x)
+	*e = int32(n)
+	return f
 }
 )GSGO",
 };

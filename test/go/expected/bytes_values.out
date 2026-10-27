@@ -1,0 +1,31 @@
+goose 7 2 6 7000
+13
+7 7000 ["goose", "x"]
+16
+ann 31 2 4 31000
+bob 42 0 0 -5
+55 9 2 3 9000
+89
+bob [] 3
+true false false 
+5 300 200 114
+4 111
+3 101
+130 122
+2 50
+zero,one,22,33,
+one
+33
+abc
+["44", "44", "44"]
+say ann 2
+quit
+pair one+abcd
+4 49 1
+true 4 true
+wild false 0
+cut false 0
+true 3 true
+ann 31 ["ann", "x"] 31000
+bob 42 [] -5
+55 9 ["55", "x"] 9000

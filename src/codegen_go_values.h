@@ -70,27 +70,9 @@ inline string CodeGenGo::TypeText(TypeExpr *t) {
     return cat("`", s, "`");
 }
 
-// The Go type of a scalar type. The other types -- arrays, slices, structs,
-// enums, references -- are not represented yet.
-inline string CodeGenGo::GoT(TypeExpr *t, Line ln) {
-    if (!t) Fail(ln, "internal: a value without a type");
-    switch (t->kind) {
-        case TY_INT:
-            if (t->ix) Unsupported(ln, cat("the index type ", TypeText(t)));
-            if (t->intstorage == IS_VARINT) Unsupported(ln, "varint");
-            return IntGoT(t->intstorage);
-        case TY_FLT: return t->fltstorage == FS_F32 ? "float32" : "float64";
-        case TY_BOOL: return "bool";
-        case TY_ARRAY: case TY_SLICE: case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
-        case TY_REF:
-            Unsupported(ln, cat("a value of type ", TypeText(t)));
-        case TY_FN: Unsupported(ln, "a function value outside a call");
-        default: Fail(ln, cat("internal: no Go type for ", TypeText(t)));
-    }
-}
-
 inline bool CodeGenGo::SameGoT(TypeExpr *a, TypeExpr *b) {
-    if (!IsScalarT(a) || !IsScalarT(b)) return a == b;
+    if (!a || !b) return a == b;
+    if (!IsScalarT(a) || !IsScalarT(b)) return a == b || (a->kind == b->kind && TEq(a, b));
     if (a->kind != b->kind) return false;
     if (a->kind == TY_INT) return a->intstorage == b->intstorage;
     if (a->kind == TY_FLT) return a->fltstorage == b->fltstorage;
@@ -110,6 +92,38 @@ inline bool CodeGenGo::HasStmts(Node *n) {
     auto found = false;
     RunChildren(n, [&](Node *c) { found = found || HasStmts(c); });
     return found;
+}
+
+// x = gen(), where generating it emits no statement: a value that can sit in
+// a `for`'s condition or on the right of a `&&`, which runs only where the
+// left side lets it. Where it would emit statements, nothing of it is kept
+// and the caller takes the form with statements. HasStmts says which nodes
+// call or run constructs; some others (a struct's ==, a literal) still emit
+// statements of their own, which this finds.
+inline bool CodeGenGo::TryPure(const function<string()> &gen, string &x) {
+    auto mark = body.size();
+    auto savetmp = tmpn;
+    // What the attempt takes in the open scopes -- the locals it declares,
+    // the stacks it claims and the tops it saves -- goes with its code.
+    auto savenext = stknext, savemax = stkmax;
+    auto saveopen = openat;
+    vector<size_t> nsaves, ndefers;
+    for (auto &s : scopes) {
+        nsaves.push_back(s.saves.size());
+        ndefers.push_back(s.defers.size());
+    }
+    x = gen();
+    if (body.size() == mark) return true;
+    body.resize(mark);
+    tmpn = savetmp;
+    stknext = savenext;
+    stkmax = savemax;
+    openat = std::move(saveopen);
+    for (size_t i = 0; i < nsaves.size() && i < scopes.size(); i++) {
+        scopes[i].saves.resize(nsaves[i]);
+        scopes[i].defers.resize(ndefers[i]);
+    }
+    return false;
 }
 
 inline bool CodeGenGo::IsGoName(const string &x) {
@@ -264,14 +278,18 @@ inline bool CodeGenGo::VetBoolClash(const string &l, const string &r, bool andan
 inline string CodeGenGo::Materialize(TypeExpr *t, const string &x) {
     if (!IsGoConst(x)) return x;
     auto v = T();
-    Decl(v, GoT(t, Line {}), x);
+    Decl(v, LocalT(t, Line {}), x);
     return v;
 }
 
 // x, a value of type `from`, as a value of type `to`: Go converts nothing
 // implicitly, where C converts a scalar to the type of the slot it lands in.
 inline string CodeGenGo::Coerce(const string &x, TypeExpr *from, TypeExpr *to, Line ln) {
+    // A varint as a Go value is the i64 it encodes (§3.6).
+    if (to && IsVarintT(to)) to = ast.inttypes[IS_I64];
+    if (from && IsVarintT(from)) from = ast.inttypes[IS_I64];
     if (!to || !from || SameGoT(from, to)) return x;
+    if (!IsScalarT(from) || !IsScalarT(to)) return CoerceVal(x, from, to, ln);
     auto gt = GoT(to, ln);
     if (to->kind == TY_BOOL || from->kind == TY_BOOL)
         Fail(ln, cat("internal: no conversion from ", TypeText(from), " to ", TypeText(to)));
@@ -291,7 +309,7 @@ inline string CodeGenGo::Coerce(const string &x, TypeExpr *from, TypeExpr *to, L
 // Materialize a read now, before a later operand can change what it reads.
 inline string CodeGenGo::Snapshot(TypeExpr *t, const string &x) {
     auto v = T();
-    Decl(v, GoT(t, Line {}), x);
+    Decl(v, LocalT(t, Line {}), x);
     return v;
 }
 
@@ -479,6 +497,9 @@ inline string CodeGenGo::GenX(Node *n) {
         GenUnreached([&] { GenX(n); });
         return "0";
     }
+    if (auto it = fillvalues.find(n); it != fillvalues.end())
+        return LoadLoc(it->second, n->exprtype, n->line);
+    if (n->line.line > 0) curline = n->line;
     switch (n->nkind) {
         case NK_IntLit: {
             auto i = (IntLit *)n;
@@ -493,6 +514,8 @@ inline string CodeGenGo::GenX(Node *n) {
             auto id = (Ident *)n;
             if (!id->vdef) Unsupported(n->line, "a named function used as a value outside a call");
             GoT(id->vdef->type, n->line);
+            if (!IsScalarT(id->vdef->type))
+                return LoadLoc(VarLoc(id->vdef, n->line), n->exprtype, n->line);
             // A named constant or a literal parameter (§7.7) is read at the
             // type its use adapted it to.
             return Coerce(VarRef(id->vdef, n->line), id->vdef->type, n->exprtype, n->line);
@@ -501,20 +524,16 @@ inline string CodeGenGo::GenX(Node *n) {
         case NK_Binary: return GenBinary((Binary *)n);
         case NK_AsCast: return GenCast((AsCast *)n);
         case NK_Call: return GenCall((Call *)n);
-        case NK_StrLit:
-            Unsupported(n->line, "a string literal outside print and abort");
-        case NK_ArrayLit: Unsupported(n->line, "an array literal");
-        case NK_StructLit: Unsupported(n->line, "a struct literal");
-        case NK_NullLit: Unsupported(n->line, "null");
-        case NK_SelfRef: Unsupported(n->line, "self");
-        case NK_Dot: {
-            auto d = (Dot *)n;
-            if (d->variantconst) Unsupported(n->line, "an enum variant");
-            if (d->member >= 0) Unsupported(n->line, cat("the .", d->name, " property"));
-            Unsupported(n->line, "a field access");
-        }
-        case NK_Index: Unsupported(n->line, "indexing");
-        case NK_SliceExpr: Unsupported(n->line, "slicing");
+        case NK_StrLit: return GenStrLit((StrLit *)n);
+        case NK_ArrayLit: case NK_StructLit: return GenLitVal(n);
+        case NK_NullLit:
+            GoT(n->exprtype, n->line);
+            if (n->exprtype->kind != TY_REF) Fail(n->line, "internal: null of no reference type");
+            return IsFatRef(n->exprtype) ? "GsRref{}" : "nil";
+        case NK_SelfRef: Fail(n->line, "internal: self outside a literal's field");
+        case NK_Dot: return GenDot((Dot *)n);
+        case NK_Index: return LoadLoc(GenLoc(n), n->exprtype, n->line);
+        case NK_SliceExpr: return GenSlice((SliceExpr *)n);
         case NK_Block: case NK_IfExpr: case NK_MatchExpr: case NK_EarlyBlock: case NK_LoopExpr:
         case NK_InlineBlock:
             return CtlValX(n);
@@ -527,11 +546,28 @@ inline string CodeGenGo::GenUnary(Unary *u) {
     auto t = u->exprtype;
     if (u->op == T_BITAND) {
         // Where the checker decayed the reference, `&x` reads as its
-        // pointee (§3.8).
-        if (t && t->kind != TY_REF) return Coerce(GenX(u->child), u->child->exprtype, t, u->line);
-        Unsupported(u->line, "a reference");
+        // pointee (§3.8), or a whole array as a slice of it (§3.10).
+        if (t && t->kind != TY_REF) {
+            if (IsScalarT(t) && IsScalarT(u->child->exprtype))
+                return Coerce(GenX(u->child), u->child->exprtype, t, u->line);
+            return LoadLoc(GenLoc(u->child), t, u->line);
+        }
+        GoT(t, u->line);
+        return GenRefVal(u->child, u->line);
+    }
+    if (u->op == T_MINUS && t && (t->kind == TY_STRUCT || t->kind == TY_ARRAY)) {
+        auto x = Snapshot(t, CoerceVal(GenX(u->child), u->child->exprtype, t, u->line));
+        auto v = T();
+        Decl(v, LocalT(t, u->line));
+        ElemwiseNegInto(t, u->line, x, AtVar(v, t));
+        return v;
     }
     auto ct = u->child->exprtype;
+    if (u->op == T_NOT && ct && ct->kind == TY_REF) {
+        // The null test of an optional (§3.8).
+        GoT(ct, u->line);
+        return cat("(", NullTestOperand(u->child), " == nil)");
+    }
     auto x = GenX(u->child);
     switch (u->op) {
         case T_MINUS: {
@@ -559,11 +595,33 @@ inline string CodeGenGo::GenUnary(Unary *u) {
 
 inline string CodeGenGo::GenBinary(Binary *b) {
     auto op = b->op;
-    if (op == T_DOTEQ || op == T_DOTNEQ) Unsupported(b->line, "reference identity (.==)");
+    if (op == T_DOTEQ || op == T_DOTNEQ) {
+        // Reference identity (§3.8): the addresses, null the null one; a
+        // reference to a resizable value (a fat or a pool reference) is its
+        // header's. A reference variable reads as the reference it holds.
+        auto addr = [&](const string &x, TypeExpr *t) {
+            if (t && t->kind == TY_REF && t->ref->lenstorage < 0 && IsResz(t->ref->sub))
+                return cat("unsafe.Pointer(", x, ".Hdr)");
+            return cat("unsafe.Pointer(", x, ")");
+        };
+        auto side = [&](Node *n) -> string {
+            if (Is<NullLit>(n)) return "nil";
+            if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type->kind == TY_REF) {
+                GoT(id->vdef->type, n->line);
+                auto l = VarLoc(id->vdef, n->line);
+                return addr(LoadLoc(l, l.t, n->line), l.t);
+            }
+            return addr(GenX(n), n->exprtype);
+        };
+        auto l = T();
+        Decl(l, "unsafe.Pointer", side(b->left));
+        auto r = side(b->right);
+        return cat("(", l, op == T_DOTEQ ? " == " : " != ", r, ")");
+    }
     if (op == T_ANDAND || op == T_OROR) {
         auto l = GenTruth(b->left);
-        if (!HasStmts(b->right)) {
-            auto r = GenTruth(b->right);
+        string r;
+        if (!HasStmts(b->right) && TryPure([&] { return GenTruth(b->right); }, r)) {
             // A call is an operand vet compares with none (GsBool).
             if (VetBoolClash(l, r, op == T_ANDAND)) r = cat("GsBool(", r, ")");
             return cat("(", l, op == T_ANDAND ? " && " : " || ", r, ")");
@@ -579,7 +637,7 @@ inline string CodeGenGo::GenBinary(Binary *b) {
         L("if ", op == T_ANDAND ? t : cat("!", t), " {");
         ind++;
         PushSc(SC_PLAIN);
-        auto r = GenTruth(b->right);
+        r = GenTruth(b->right);
         L(t, " = ", r);
         PopSc();
         ind--;
@@ -587,10 +645,29 @@ inline string CodeGenGo::GenBinary(Binary *b) {
         dead = false;
         return t;
     }
-    if (Is<NullLit>(b->left) || Is<NullLit>(b->right)) Unsupported(b->line, "null");
+    if ((op == T_EQ || op == T_NEQ) && (Is<NullLit>(b->left) || Is<NullLit>(b->right))) {
+        // The null test of an optional (§3.8), which reads the reference.
+        auto lnull = Is<NullLit>(b->left) != nullptr, rnull = Is<NullLit>(b->right) != nullptr;
+        if (lnull && rnull) return op == T_EQ ? "true" : "false";
+        auto x = NullTestOperand(lnull ? b->right : b->left);
+        return cat("(", x, op == T_EQ ? " == nil)" : " != nil)");
+    }
     auto lt = b->left->exprtype;
     if (lt && IsPlainRef(lt)) lt = lt->ref->sub;
-    if (!IsScalarT(lt) || (b->exprtype && !IsScalarT(b->exprtype)))
+    if (b->exprtype && (b->exprtype->kind == TY_STRUCT || b->exprtype->kind == TY_ARRAY)) {
+        // Elementwise arithmetic (§6.1).
+        string l, r;
+        bool ls, rs;
+        ElemwiseOperands(b, l, ls, r, rs);
+        auto v = T();
+        Decl(v, LocalT(b->exprtype, b->line));
+        ElemwiseInto(b->exprtype, op, b->line, l, ls, r, rs, AtVar(v, b->exprtype));
+        return v;
+    }
+    // A varint operand or result is the i64 it encodes (§3.6).
+    if (lt && IsVarintT(lt)) lt = ast.inttypes[IS_I64];
+    if ((op == T_EQ || op == T_NEQ) && lt && !IsScalarT(lt)) return GenEquality(b);
+    if (!IsScalarT(lt) || (b->exprtype && !IsScalarT(b->exprtype) && !IsVarintT(b->exprtype)))
         Unsupported(b->line, cat("the operator on ", TypeText(lt)));
     // Left to right (§2): the left operand is read into a temporary first
     // where the right one runs statements.
@@ -666,17 +743,43 @@ inline string CodeGenGo::GenCast(AsCast *c) {
     return Coerce(out, tt, c->exprtype, c->line);
 }
 
-// A control construct as a value: built into a temporary of its type.
+// The reference a null test reads: a narrowed optional variable's own, not
+// the pointee its use may have decayed to.
+inline string CodeGenGo::NullTestOperand(Node *n) {
+    if (auto id = Is<Ident>(n); id && id->vdef && IsOptional(id->vdef->type)) {
+        GoT(id->vdef->type, n->line);
+        auto l = VarLoc(id->vdef, n->line);
+        auto x = LoadLoc(l, l.t, n->line);
+        // A fat reference is null where its header is.
+        return IsFatRef(l.t) ? cat(x, ".Hdr") : x;
+    }
+    auto x = GenX(n);
+    return n->exprtype && IsFatRef(n->exprtype) ? cat(x, ".Hdr") : x;
+}
+
+// A condition's Go bool: a reference's null test where it is one (§3.8).
+inline string CodeGenGo::GenTruth(Node *n) {
+    auto t = n->exprtype;
+    if (t && t->kind == TY_REF) return cat("(", NullTestOperand(n), " != nil)");
+    return GenX(n);
+}
+
+// A control construct as a value: built into a temporary of its type. One
+// typed as a relative reference (a branch's value for such a slot) is the
+// plain reference it encodes.
 inline string CodeGenGo::CtlValX(Node *n) {
     auto vt = n->exprtype;
+    if (vt && IsRelRef(vt)) vt = ast.RefTo(vt->ref->sub, n->line, vt->ref->optional);
     auto t = T();
-    Decl(t, GoT(vt, n->line));
+    Decl(t, LocalT(vt, n->line));
     GenAny(n, GoDst { GD_LVALUE, t, vt });
     return t;
 }
 
 inline void CodeGenGo::GenAny(Node *n, const GoDst &d) {
     if (Unreached()) return GenUnreached([&] { GenAny(n, d); });
+    // A fill's value, evaluated once already (FreezeFill).
+    if (fillvalues.count(n)) return LeafAny(n, d);
     switch (n->nkind) {
         case NK_Block: GenBlock((Block *)n, d); return;
         case NK_IfExpr: GenIf((IfExpr *)n, d); return;
@@ -700,18 +803,61 @@ inline void CodeGenGo::GenAny(Node *n, const GoDst &d) {
 // effect, given to Go's blank identifier, which is how Go evaluates an
 // expression that is no call.
 inline void CodeGenGo::LeafAny(Node *n, const GoDst &d) {
+    if (d.k == GD_STACK) {
+        GenConstruct(n, d.s, d.t, d.lenlv);
+        return;
+    }
+    if (d.k == GD_LVALUE && d.pool) {
+        L(d.s, " = ", GenPrefVal(n));
+        return;
+    }
     if (d.k == GD_LVALUE) {
-        auto x = GenX(n);
-        if (d.t) x = Coerce(x, n->exprtype, d.t, n->line);
+        if (d.t && IsRelRef(d.t)) {
+            GenRelStore(AtVar(d.s, d.t), n, false);
+            return;
+        }
+        // A literal holding relative references is built where it stays:
+        // its offsets are measured from there (§3.9).
+        if (d.t && (Is<StructLit>(n) || Is<ArrayLit>(n)) && HasRelRef(d.t) &&
+            n->exprtype->kind != TY_SLICE) {
+            LitInto(n, AtVar(d.s, d.t), false);
+            return;
+        }
+        // A slice or an array of another kind into a limited array goes
+        // straight into its slots.
+        if (d.t && IsStaticLimited(d.t) && n->exprtype && !TEq(n->exprtype, d.t) &&
+            (n->exprtype->kind == TY_SLICE || n->exprtype->kind == TY_ARRAY ||
+             (IsPlainRef(n->exprtype) && n->exprtype->ref->sub->kind == TY_ARRAY))) {
+            auto l = GenLoc(n);
+            while (l.t->kind == TY_REF) DerefLoc(l);
+            if (l.t->kind == TY_SLICE || !TEq(l.t, d.t)) {
+                CopyIntoLimited(l, d.t, n->line, AtVar(d.s, d.t));
+                return;
+            }
+            L(d.s, " = ", Ld(l));
+            return;
+        }
+        auto x = d.t ? GenXD(n, d.t) : GenX(n);
         // Go's vet reports an assignment of a variable to itself.
         if (x != d.s) L(d.s, " = ", x);
         return;
     }
     if (IsVoidT(n->exprtype)) Fail(n->line, "internal: valueless leaf");
+    // A resizable or bytes value is reached through its location, whose
+    // path's checks still run: a path's is where it is stored, anything
+    // else is built on a temporary stack the enclosing scope releases.
+    if (IsBytesT(n->exprtype)) {
+        // Its address read, for the checks on the path (C's `(void)(loc)`).
+        auto l = GenLoc(n);
+        auto x = !l.addr.empty() ? l.addr : !l.hdr.empty() ? cat("&", l.hdr) : l.lv;
+        if (!x.empty() && !IsGoName(x)) L("_ = ", x);
+        return;
+    }
     // A constant or a variable read has no effect to keep.
-    if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n)) return;
+    if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) || Is<NullLit>(n))
+        return;
     auto x = GenX(n);
-    if (IsGoConst(x)) return;
+    if (IsGoConst(x) || x == "nil") return;
     L("_ = ", x);
 }
 

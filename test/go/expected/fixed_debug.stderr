@@ -1,0 +1,1 @@
+goose runtime error: integer overflow (debug): 2147483647 + 1 at i32 (test/go/programs/fixed_debug.goose:28)
