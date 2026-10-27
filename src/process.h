@@ -21,6 +21,13 @@ struct ProcessResult {
 // live line (progress.h) sees it.
 ProcessResult RunProcess(const vector<string> &argv, const string &cwd = "", bool echo = false);
 
+// Runs argv as RunProcess does, but on this process's own stdin, stdout and
+// stderr, and waits for it: a program the compiler built and now runs
+// (`goose run --target=go`). Its exit code, 128 plus the signal's number
+// where a signal ended it, or -1 with `err` saying why where it could not be
+// run.
+int RunInheritingStdio(const vector<string> &argv, string &err);
+
 // The full path of the program `name` on PATH, or on `path` (a list in PATH's
 // form) where that is given, or "" when there is none. On Windows a name
 // without an extension is tried with the ones PATHEXT lists (.exe, .cmd,

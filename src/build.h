@@ -36,6 +36,30 @@ inline string ProgramBuildDir(const string &rootfile) {
     return cat(GooseHome(), "/build/prog/", PathStem(rootfile), "-", Hex8(abs));
 }
 
+// Runs `argv`, `what` being what it does ("compiling the runtime"), with its
+// output kept in `logfile`, printing the command as -v and --dry-run ask and
+// a failed one with what it printed. False when it failed, after saying so.
+inline bool RunBuildStep(const BuildOptions &opts, FILE *msgs, const vector<string> &argv,
+                         const string &what, const string &logfile) {
+    if (opts.dryrun || opts.verbose) fprintf(msgs, "%s\n", CommandLineText(argv).c_str());
+    if (opts.dryrun) return true;
+    fflush(msgs);
+    ProcessResult r;
+    {
+        ProgressStep step(what);
+        r = RunProcess(argv, "", opts.verbose);
+    }
+    if (!logfile.empty()) WriteFileMakingDirs(logfile, r.output);
+    if (r.started && r.code == 0) return true;
+    auto msg = cat(what, " failed", r.started ? cat(" (exit ", r.code, ")") : string(), ":\n    ",
+                   CommandLineText(argv), "\n");
+    if (!opts.verbose) msg += r.output;
+    if (!logfile.empty())
+        Append(msg, msg.back() == '\n' ? "" : "\n", "(the output is in ", logfile, ")");
+    ProgressPrint(msg);
+    return false;
+}
+
 // Runs the toolchain's commands, printing them as -v and --dry-run ask, and
 // a failed one with what it printed.
 struct Builder {
@@ -77,23 +101,7 @@ struct Builder {
     // Runs `argv`, `what` being what it does ("compiling the runtime"), with
     // its output kept in `logfile`. False when it failed, after saying so.
     bool Run(const vector<string> &argv, const string &what, const string &logfile) const {
-        if (opts.dryrun || opts.verbose) fprintf(msgs, "%s\n", CommandLineText(argv).c_str());
-        if (opts.dryrun) return true;
-        fflush(msgs);
-        ProcessResult r;
-        {
-            ProgressStep step(what);
-            r = RunProcess(argv, "", opts.verbose);
-        }
-        if (!logfile.empty()) WriteFileMakingDirs(logfile, r.output);
-        if (r.started && r.code == 0) return true;
-        auto msg = cat(what, " failed", r.started ? cat(" (exit ", r.code, ")") : string(), ":\n    ",
-                       CommandLineText(argv), "\n");
-        if (!opts.verbose) msg += r.output;
-        if (!logfile.empty())
-            Append(msg, msg.back() == '\n' ? "" : "\n", "(the output is in ", logfile, ")");
-        ProgressPrint(msg);
-        return false;
+        return RunBuildStep(opts, msgs, argv, what, logfile);
     }
 
     // A system library by name, as the style's linker takes it.
@@ -207,6 +215,19 @@ inline string RuntimeObject(const Builder &b) {
     return obj;
 }
 
+// The executable `goose build` makes of a program: -o's, else beside the
+// root source, as the program's sidecar (`output`) or the root file names it.
+inline string BuildExePath(const string &rootfile, const BuildOptions &opts, const string &output) {
+    auto exe = opts.exe;
+    if (exe.empty()) {
+        exe = cat(DirOf(rootfile), output.empty() ? PathStem(rootfile) : output);
+        #ifdef _WIN32
+            if (exe.size() < 4 || exe.compare(exe.size() - 4, 4, ".exe") != 0) exe += ".exe";
+        #endif
+    }
+    return exe;
+}
+
 // What `goose build` does once the compiler has written the program's C to
 // `cfile` in `builddir`: finds the runtime object for the toolchain `tc`,
 // which built the native parts whose response files are `nativersps`
@@ -224,19 +245,56 @@ inline int BuildExecutable(const string &rootfile, const string &cfile, const st
         if (obj.empty()) return 1;
         objects.push_back(obj);
     }
-    auto exe = opts.exe;
-    if (exe.empty()) {
-        exe = cat(DirOf(rootfile), output.empty() ? PathStem(rootfile) : output);
-        #ifdef _WIN32
-            if (exe.size() < 4 || exe.compare(exe.size() - 4, 4, ".exe") != 0) exe += ".exe";
-        #endif
-    }
+    auto exe = BuildExePath(rootfile, opts, output);
     if (!opts.dryrun) {
         std::error_code ec;
         auto exedirpath = filesystem::path(exe).parent_path();
         if (!exedirpath.empty()) filesystem::create_directories(exedirpath, ec);
     }
     if (!b.Link(cfile, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"))) return 1;
+    if (!opts.dryrun) fprintf(msgs, "built %s\n", exe.c_str());
+    return 0;
+}
+
+// The Go toolchain --target=go builds with: GOOSE_GO, else `go` on PATH; ""
+// where there is none.
+inline string FindGoTool() {
+    if (auto env = getenv("GOOSE_GO"); env && *env) return env;
+    return FindOnPath("go");
+}
+
+constexpr const char *NO_GO_TOOL =
+    "cannot find the Go toolchain, which --target=go builds with: put `go` on PATH, or set "
+    "GOOSE_GO to it";
+
+// Builds the Go file the compiler wrote (--target=go) into the executable
+// `exe` with `go build`: the file needs nothing but the Go standard library.
+// --debug builds it for a debugger, without the Go compiler's optimizations
+// and inlining. False when it failed, after saying why.
+inline bool GoBuild(const string &gofile, const string &exe, const BuildOptions &opts, FILE *msgs,
+                    const string &logfile) {
+    auto go = FindGoTool();
+    if (go.empty()) {
+        fprintf(stderr, "%s\n", NO_GO_TOOL);
+        return false;
+    }
+    vector<string> argv = { go, "build" };
+    if (opts.debug) argv.push_back("-gcflags=-N -l");
+    for (auto a : { string("-o"), exe, gofile }) argv.push_back(a);
+    if (!opts.dryrun) {
+        std::error_code ec;
+        auto exedir = filesystem::path(exe).parent_path();
+        if (!exedir.empty()) filesystem::create_directories(exedir, ec);
+    }
+    return RunBuildStep(opts, msgs, argv, cat("building ", exe), logfile);
+}
+
+// `goose build --target=go`, once the compiler has written the program's Go
+// to `gofile` in `builddir`. The exit code.
+inline int BuildGoExecutable(const string &rootfile, const string &gofile, const string &builddir,
+                             const BuildOptions &opts, FILE *msgs, const string &output) {
+    auto exe = BuildExePath(rootfile, opts, output);
+    if (!GoBuild(gofile, exe, opts, msgs, cat(builddir, "/go-build.log"))) return 1;
     if (!opts.dryrun) fprintf(msgs, "built %s\n", exe.c_str());
     return 0;
 }
