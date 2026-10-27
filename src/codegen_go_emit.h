@@ -88,6 +88,9 @@ inline void CodeGenGo::CollectSpecs() {
                 for (auto &fs : c->fmtspecs) add(fs.second);
                 // print renders its line on a data stack.
                 if (c->builtin == B_PRINT) si.needssp = true;
+                // An extern fn appending to a builder is handed the block.
+                if (c->builtin < 0 && c->spec && c->spec->sf->isextern && ExternTakesGs(c->spec))
+                    si.needsgs = true;
                 // A result is built as the call's own type (str() passed as
                 // a slice, say) before it is fitted.
                 for (auto rt : c->rettypes) si.needssp |= typed(rt) && NeedsStack(rt);
@@ -106,6 +109,7 @@ inline void CodeGenGo::CollectSpecs() {
         };
         walk(sp->body);
         if (si.needssp) si.needsgs = true;
+        for (auto [k, via] : calls) calleesof[sp].push_back(k);
     }
     for (auto changed = true; changed;) {
         changed = false;
@@ -324,24 +328,37 @@ static void GoLineUses(string_view s, unordered_map<string, int> &uses) {
     auto i = s.find_first_not_of('\t');
     if (i == string_view::npos) return;
     s = s.substr(i);
-    // The identifiers a list of them at p spells, `a, b`, and where it ends.
-    auto names = [&](size_t p) {
+    // The identifiers a list of them at p spells, `a, b`, and where it ends;
+    // with bases, a target selecting a field (`h.Len`, `h.a.b`) as well,
+    // whose variable Go counts as used, into bases.
+    auto names = [&](size_t p, vector<string_view> *bases) {
         for (;;) {
             if (p >= s.size() || !(isalpha((unsigned char)s[p]) || s[p] == '_')) return p;
+            auto b = p;
             while (p < s.size() && isid(s[p])) p++;
+            auto e = p;
+            while (bases && p + 1 < s.size() && s[p] == '.' &&
+                   (isalpha((unsigned char)s[p + 1]) || s[p + 1] == '_')) {
+                for (p++; p < s.size() && isid(s[p]);) p++;
+            }
+            if (bases && p != e) bases->push_back(s.substr(b, e - b));
             if (s.compare(p, 2, ", ") != 0) return p;
             p += 2;
         }
     };
     size_t from = 0;
     if (s.compare(0, 4, "var ") == 0) {
-        from = names(4);
+        from = names(4, nullptr);
     } else if (s.compare(0, 4, "for ") == 0) {
-        auto e = names(4);
+        auto e = names(4, nullptr);
         if (s.compare(e, 4, " := ") == 0) from = e;
     } else {
-        auto e = names(0);
-        if (e > 0 && (s.compare(e, 3, " = ") == 0 || s.compare(e, 4, " := ") == 0)) from = e;
+        vector<string_view> bases;
+        auto e = names(0, &bases);
+        if (e > 0 && (s.compare(e, 3, " = ") == 0 || s.compare(e, 4, " := ") == 0)) {
+            from = e;
+            for (auto b : bases) uses[string(b)]++;
+        }
     }
     for (auto p = from; p < s.size();) {
         auto c = s[p];
@@ -659,6 +676,7 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
     auto framed = false;
     auto fb = FinishBody(body, true, curgorets, &framed);
     if (framed) hasframe.insert(sp);
+    if (fb.find("gsGStk_") != string::npos) gstkusers.insert(sp);
     Append(code, "// ", sp->sf->qname, ", line ", sp->sf->line.line, er ? ", its element-run twin" : "", "\n",
            sig, " {\n", fb, "}\n\n");
     curspec = nullptr;
@@ -881,8 +899,6 @@ inline void CodeGenGo::InitGlobalStack(VarDef *d) {
 // initializes the globals, and only those. The Go program that imports it
 // runs instead of its fn main(), if it has one.
 inline void CodeGenGo::EmitProgram() {
-    for (auto sf : ast.functions)
-        if (sf->isexport) Unsupported(sf->line, "export fn");
     BoundStacksOf(*this);
     auto mainstacks = ProgramStacksOf(*this, MainRootsOf(*this));
     auto mainsf = ast.MainFunction();
@@ -911,6 +927,10 @@ inline void CodeGenGo::EmitProgram() {
            "\tdebug.SetPanicOnFault(true)\n"
            "\tgs := NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n"
            "\tgsInitGlobals(gs)\n", call, stats, "}\n");
+    // Every body is emitted, and the counts are final: the export fns' entry
+    // points can say what they hand on.
+    ComputeGsNeeds();
+    EmitExports();
 }
 
 // The place of a call's block argument where the callee may yet take it.
@@ -919,11 +939,12 @@ inline string CodeGenGo::GsArgPh(FnSpec *sp) {
     return cat(GSARG, specnum.at(sp), GSARG);
 }
 
-// Once every body is emitted: a specialization takes the block where it
+// Once every specialization's body is emitted: one takes the block where it
 // did already, where its frame holds a local, and where it calls one that
-// takes it; every call's and signature's place for it is filled.
-inline void CodeGenGo::ResolveGsArgs() {
-    vector<char> needs(numspec.size(), 0);
+// takes it.
+inline void CodeGenGo::ComputeGsNeeds() {
+    auto &needs = gsneeds;
+    needs.assign(numspec.size(), 0);
     for (size_t i = 0; i < numspec.size(); i++)
         needs[i] = sinfo[numspec[i]].needsgs || hasframe.count(numspec[i]);
     for (auto changed = true; changed;) {
@@ -938,6 +959,13 @@ inline void CodeGenGo::ResolveGsArgs() {
                 }
         }
     }
+}
+
+// Every call's and signature's place for the block is filled, as
+// ComputeGsNeeds found.
+inline void CodeGenGo::ResolveGsArgs() {
+    if (gsneeds.size() != numspec.size()) ComputeGsNeeds();
+    auto &needs = gsneeds;
     auto fill = [&](string &text) {
         if (text.find(GSARG[0]) == string::npos && text.find(GSPARAM[0]) == string::npos) return;
         string out;
@@ -974,21 +1002,54 @@ inline string CodeGenGo::Source(const string &srcname) {
     string name = srcname;
     for (auto &c : name)
         if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
+    // The imports: the runtime's, the OS layer's where the program calls it,
+    // and the --include files' (incimports), each package once.
+    vector<pair<string, string>> imports;
+    auto add = [&](const string &n, const string &path) {
+        // A name that is the package's own is no name.
+        auto own = path.substr(path.find_last_of('/') + 1);
+        auto nm = n == own ? string() : n;
+        for (auto &[in, ip] : imports)
+            if (ip == path && in == nm) return;
+        imports.push_back({ nm, path });
+    };
+    for (auto p : { "math", "os", "runtime", "runtime/debug", "strconv", "sync", "syscall", "unsafe" }) add("", p);
+    if (usesbits) add("", "math/bits");
+    if (usesos)
+        for (auto p : { "bytes", "io", "path/filepath", "strings", "time" }) add("", p);
+    sort(imports.begin(), imports.end(), [](auto &a, auto &b) { return a.second < b.second; });
+    for (auto &[n, p] : incimports) add(n, p);
+    string imps;
+    for (auto &[n, p] : imports) Append(imps, "\t", n, n.empty() ? "" : " ", GoStr(p), "\n");
     string s = cat("// Code generated by the Goose compiler from ", name, ". DO NOT EDIT.\n"
                    "//\n"
                    "// Names from the program carry a _g suffix, which keeps them clear of Go's\n"
                    "// keywords and of the runtime's gs and Gs names; a namespaced name ns::x is\n"
                    "// ns_x_g followed by the namespace's length.\n\n"
                    "package ", opts.package, "\n\n"
-                   "import (\n\t\"math\"\n", usesbits ? "\t\"math/bits\"\n" : "", "\t\"os\"\n",
-                   "\t\"runtime/debug\"\n\t\"strconv\"\n\t\"syscall\"\n\t\"unsafe\"\n)\n\n"
+                   "import (\n", imps, ")\n\n"
                    "// The runtime configuration the program was compiled with (--stack-reserve,\n"
                    "// -D GS_STACK_RESERVE, -D GS_STACK_GAP).\n"
                    "const (\n\tgsStackReserve = ", opts.stacks.reserve,
                    "\n\tgsStackGap     = ", opts.stacks.gap, "\n)\n\n");
     for (auto part : go_runtime_prologue) s += part;
+    if (usesos) {
+        Append(s, "\n// os.resource_dir's directory where it is not the executable's: the entry\n"
+                  "// source's, for goose run.\nconst gsJitResourceDir = ", GoStr(opts.resourcedir), "\n");
+        for (auto part : go_runtime_os) s += part;
+    }
     Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, gdecls,
-           gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code, eqcode, bcode, ldstcode);
+           gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code,
+           xcode.empty() ? "" : "// ---- export fns' entry points ----\n\n", xcode, eqcode, bcode, ldstcode);
+    // The --include files, last, so that the //line directive naming each
+    // holds to the end.
+    for (auto &[iname, ibody] : incbodies) {
+        string n = iname;
+        for (auto &c : n)
+            if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
+        Append(s, "\n// ---- --include ", n, " ----\n\n//line ", n, ":1\n", ibody,
+               ibody.empty() || ibody.back() != '\n' ? "\n" : "");
+    }
     return s;
 }
 

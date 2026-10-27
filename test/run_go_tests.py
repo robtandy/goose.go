@@ -737,9 +737,11 @@ class Runner:
             return None
         return exe, checked
 
-    def c_run(self, src, name, flags, out, timeout=None):
+    def c_run(self, src, name, flags, out, timeout=None, cwd=None):
         """The C backend's run of src: (exit code, stdout, stderr), or None
-        after saying why. The exit code is None where it ran past timeout."""
+        after saying why. The exit code is None where it ran past timeout.
+        A compiled program runs in cwd where given (a TinyCC run in the
+        compiler's process, from the repository's root)."""
         if self.cc is None:
             # TinyCC in the compiler's process: what the compile itself
             # prints to stderr (its warnings) comes before the program's.
@@ -749,7 +751,7 @@ class Runner:
                 e = e[len(warnings):]
             return code, o, e
         exe = self.c_build(src, name, flags, out)
-        return None if exe is None else run_capture([exe], timeout=timeout)
+        return None if exe is None else run_capture([exe], cwd=cwd, timeout=timeout)
 
     def c_build(self, src, name, flags, out):
         """The C backend's executable for src, at the Goose level flags name
@@ -987,6 +989,118 @@ class Runner:
             out.append(("fail", f"unsupported {src.name}: the C backend's check fails", o + e))
         return out
 
+    def stdlib(self, src):
+        """A fixture of the C suite's test/stdlib/ (issue #5): compiled by
+        both backends at -O2 and at -O0, and with --debug at -O2 where its
+        first line asks run_tests.py for a GS_DEBUG run (`runtime-debug`),
+        each run in a directory of its own, since the os fixtures write
+        files where they run. The Go must vet, build (at -O2 with
+        -d=checkptr as well) and run as the C does, its -O2 run print what
+        test/expected/ holds, as run_tests.py judges a C run, and the two
+        report the same data stacks."""
+        out = []
+        name = f"stdlib-{src.stem}"
+        flags = runtime_defines(src)
+        builds = [["-O2"], ["-O0"]]
+        if "runtime-debug" in first_line(src):
+            builds.append(["--debug", "-O2"])
+        gotrun = None
+        for b in builds:
+            tag = "-".join(x.strip("-") for x in b)
+            label = f"stdlib/{src.name} {' '.join(b)}"
+            rundir = self.work / f"{name}-{tag}-run"
+            rundir.mkdir(parents=True, exist_ok=True)
+            ref = self.c_run(src, f"{name}-{tag}", flags + b, out, cwd=rundir)
+            exes = self.go_program(src, f"{name}-{tag}", flags + b, out, checkptr=b == ["-O2"])
+            if exes is None or ref is None:
+                continue
+            if not isinstance(exes, tuple):
+                exes = (exes,)
+            for exe, kind in zip(exes, ("", " -d=checkptr")):
+                got = run_capture([exe], cwd=rundir)
+                if b == ["-O2"] and not kind:
+                    gotrun = got
+                same = True
+                for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
+                                   ("stderr", got[2], ref[2])):
+                    if g != c:
+                        same = False
+                        out.append(("fail", f"parity {label}{kind}: {what}",
+                                    f"--- go:\n{g}\n--- c:\n{c}" if what != "exit code"
+                                    else f"go {g}, c {c}"))
+                if same:
+                    out.append(("ok", f"run {label}{kind}", None))
+        if gotrun is not None:
+            code, o, e = gotrun
+            exp = HERE / "expected"
+            bad = []
+            if (exp / f"{src.stem}.aborts").exists() != (code != 0):
+                bad.append(f"exit {code}")
+            stderr_file = exp / f"{src.stem}.stderr"
+            if stderr_file.exists():
+                markers = [m.strip() for m in tc.decode(stderr_file.read_bytes()).splitlines()
+                           if m.strip()]
+                if any(m not in e for m in markers):
+                    bad.append("stderr")
+            outfile = exp / f"{src.stem}.out"
+            if not outfile.exists():
+                bad.append("no test/expected .out")
+            elif o.rstrip("\n") != tc.decode(outfile.read_bytes()).rstrip("\n"):
+                bad.append("stdout")
+            if bad:
+                out.append(("fail", f"expected stdlib/{src.name} (Go -O2): {', '.join(bad)}",
+                            f"--- stdout:\n{o}\n--- stderr:\n{e}"))
+            else:
+                out.append(("ok", f"expected stdlib/{src.name}", None))
+        self.stacks(src, name, flags, out)
+        return out
+
+    def export(self, d):
+        """A library of export fns (test/go/export/<name>/, issue #5):
+        <name>.goose compiled with --target=go --library at -O2 and at -O0,
+        each other non-test .go file there spliced in with --include, into
+        a module of its own with the directory's _test.go files, which must
+        vet and pass `go test`, built with -d=checkptr as well: their
+        checks of what the Go entry points give, and testing.AllocsPerRun's
+        that calling them in a loop allocates nothing on Go's heap."""
+        out = []
+        name = d.name
+        src = d / f"{name}.goose"
+        includes = sorted(p for p in d.glob("*.go") if not p.name.endswith("_test.go"))
+        tests = sorted(d.glob("*_test.go"))
+        if not src.exists() or not tests:
+            out.append(("fail", f"export {name}: no {name}.goose or no _test.go", None))
+            return out
+        for level in ("2", "0"):
+            label = f"export {name} -O{level}"
+            mod = self.work / f"export-{name}-O{level}"
+            shutil.rmtree(mod, ignore_errors=True)
+            mod.mkdir(parents=True)
+            args = [f"-O{level}", "--target=go", "--library", "-o", mod / f"{name}.go"]
+            for inc in includes:
+                args += ["--include", inc]
+            code, o, e = self.goose(*args, src)
+            if code != 0:
+                out.append(("fail", f"{label}: goose --target=go", o + e))
+                continue
+            for t in tests:
+                shutil.copy(t, mod / t.name)
+            r = subprocess.run([self.go, "mod", "init", f"goosetest/{name}"], cwd=mod, env=go_env(),
+                               capture_output=True)
+            if r.returncode != 0:
+                out.append(("fail", f"{label}: go mod init", tc.decode(r.stderr)))
+                continue
+            for what, cmd in (("go vet", ["vet", "./..."]),
+                              ("go test", ["test", "-count=1", "./..."]),
+                              ("go test -d=checkptr", ["test", "-count=1", "-gcflags=all=-d=checkptr", "./..."])):
+                r = subprocess.run([self.go] + cmd, cwd=mod, env=go_env(), capture_output=True)
+                text = tc.decode(r.stdout) + tc.decode(r.stderr)
+                if r.returncode != 0 or (what == "go vet" and text.strip()):
+                    out.append(("fail", f"{label}: {what}", text))
+                    break
+                out.append(("ok", f"{label}: {what}", None))
+        return out
+
     def sweep(self, src):
         """A C suite fixture: skipped where the Go backend refuses it, judged
         by its blessed output otherwise."""
@@ -1106,6 +1220,53 @@ class Runner:
               code == 1 and "reads GS_STACK_RESERVE as an integer constant" in e, f"exit {code}\n{o}{e}")
         code, o, e = self.goose("--target=rust", hello)
         check("--target=rust is refused", code == 1 and "--target takes c or go" in e, o + e)
+        # export fns and no main make a library, with each export's Go entry
+        # points (issue #5).
+        libsrc = self.work / "cli-exports.goose"
+        tc.write_text(libsrc, 'export fn twice(x: i64) -> i64 { x * 2 }\n'
+                              'export "parse_count" fn count(s: const u8[:]) -> i64 { s.len }\n')
+        code, o, e = self.goose("--target=go", "-o", gofile, libsrc)
+        text = gofile.read_text(encoding="utf-8") if gofile.exists() else ""
+        check("export fns without main make a library with their Go entry points",
+              code == 0 and "\npackage goose\n" in text and "\nfunc main()" not in text and
+              "\nfunc Twice(x int64) int64 {" in text and
+              "\nfunc TwiceWithStack(gs *GsStackBlock, x int64) int64 {" in text and
+              "\nfunc ParseCount[T0 GsBytes](s T0) int64 {" in text, o + e)
+        if code == 0:
+            vc, vo, ve = self.gotool("vet", gofile.name)
+            check("the export library vets", vc == 0 and not (vo + ve).strip(), vo + ve)
+        # --include with --target=go is Go: a file whose extern fn the
+        # program calls, its imports merged, its errors named in its own
+        # lines (//line).
+        incdir = self.work / "cli-include"
+        shutil.rmtree(incdir, ignore_errors=True)
+        incdir.mkdir(parents=True)
+        incsrc = incdir / "shout.goose"
+        tc.write_text(incsrc, 'extern fn shout(s: const u8[:], out: u8[>..]&);\n'
+                              'extern fn half(x: i64) -> i64 = "goHalf";\n'
+                              'fn main() {\n    var b: u8[>..] = [];\n    shout("hi", b);\n'
+                              '    print(b, " ", half(84));\n}\n')
+        helper = incdir / "helper.go"
+        tc.write_text(helper, '//go:build ignore\n\npackage main\n\nimport (\n\t"strings"\n\t"os"\n)\n\n'
+                              'func shout(gs *GsStackBlock, s GsSlice, out GsRref) {\n'
+                              '\tGsBldAppendString(gs, out, strings.ToUpper(GsSliceToString(s))+"!")\n}\n\n'
+                              'func goHalf(x int64) int64 { _ = os.Args; return x / 2 }\n')
+        code, o, e = self.goose("run", "--target=go", "--include", helper, incsrc)
+        check("goose run --target=go --include helper.go", code == 0 and o == "HI! 42\n",
+              f"exit {code}\n{o}{e}")
+        code, o, e = self.goose("--target=go", "--include", helper, "-o", incdir / "out.go", incsrc)
+        text = (incdir / "out.go").read_text(encoding="utf-8") if (incdir / "out.go").exists() else ""
+        check("--include's //line names the file", code == 0 and "\n//line helper.go:1\n" in text and
+              "//go:build" not in text, o + e)
+        bad = incdir / "bad.go"
+        tc.write_text(bad, 'package main\n\nfunc shout(gs *GsStackBlock, s GsSlice, out GsRref) {\n'
+                           '\tvar n int = "not an int"\n\t_ = n\n}\n\nfunc goHalf(x int64) int64 { return x }\n')
+        code, o, e = self.goose("run", "--target=go", "--include", bad, incsrc)
+        check("an --include file's Go error names its line", code != 0 and "bad.go:4" in o + e,
+              f"exit {code}\n{o}{e}")
+        code, o, e = self.goose("--target=go", "--include", incdir / "shout.h", incsrc)
+        check("--target=go refuses an --include that is not Go",
+              code == 1 and "an --include file is Go source" in e, f"exit {code}\n{o}{e}")
         code, o, e = self.goose("--go-package", "geese", "-o", self.work / "cli.c", hello)
         check("--go-package needs --target=go", code == 1, o + e)
         # goose run --target=go: the program's streams and exit code.
@@ -1181,17 +1342,26 @@ def main():
     print(f"C reference: {r.cc.desc if r.cc else 'TinyCC (goose --jit)'}")
     programs = sorted((HERE / "go" / "programs").glob("*.goose"))
     build_only = sorted((HERE / "go" / "build_only").glob("*.goose"))
+    stdlib = sorted((HERE / "stdlib").glob("*.goose"))
+    exports = sorted(p for p in (HERE / "go" / "export").iterdir() if p.is_dir())
     if args.names:
         programs = [p for p in programs if p.stem in args.names]
         build_only = [p for p in build_only if p.stem in args.names]
-        if not programs and not build_only:
-            ap.error(f"no program named {' '.join(args.names)} in test/go/programs or "
-                     "test/go/build_only")
+        stdlib = [p for p in stdlib if p.stem in args.names]
+        exports = [p for p in exports if p.name in args.names]
+        if not programs and not build_only and not stdlib and not exports:
+            ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
+                     "test/go/build_only, test/stdlib or test/go/export")
+    if args.bless:
+        # Their expected output is the C suite's (test/expected/), and an
+        # export library's its Go tests.
+        stdlib, exports = [], []
     unsupported = [] if args.names else sorted((HERE / "go" / "unsupported").glob("*.goose"))
     sweep = []
     if args.sweep:
+        # test/stdlib/ has a section of its own (Runner.stdlib).
         skipdirs = {"errors", "errors_tc", "goose_in_goose", "lsp", "go", "packages", "gfx",
-                    "physics", "ui", "audio"}
+                    "physics", "ui", "audio", "stdlib"}
         sweep = [f for f in sorted(HERE.glob("*/*.goose"))
                  if f.parent.name not in skipdirs and f.name != "lexer_tokens.goose" and
                  not error_markers(f) and "parse-only" not in first_line(f)]
@@ -1199,6 +1369,8 @@ def main():
         futures = [pool.submit(r.program, p) for p in programs]
         futures += [pool.submit(r.build_only, p) for p in build_only]
         futures += [pool.submit(r.unsupported, p) for p in unsupported]
+        futures += [pool.submit(r.stdlib, p) for p in stdlib]
+        futures += [pool.submit(r.export, p) for p in exports]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
         futures += [pool.submit(r.sweep, p) for p in sweep]
         futures += [pool.submit(r.fuzz, seed)
