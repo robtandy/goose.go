@@ -943,6 +943,7 @@ struct CodeGenGo {
     // The foreign boundary (codegen_go_export.h): extern fns' calls, export
     // fns' Go entry points.
     bool usesos = false;   // A call needs the OS layer (go_runtime_os).
+    FnSpec *ExportOfExtern(FnSpec *sp);
     bool ExternTakesGs(FnSpec *sp);
     bool GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a, string &x);
     void EmitExports();

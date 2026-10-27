@@ -84,6 +84,8 @@ inline void CodeGenGo::CollectSpecs() {
                         calls.push_back(e);
                 };
                 if (c->builtin < 0) add(c->spec);
+                // An extern fn calling the program's own export back.
+                if (c->builtin < 0) add(ExportOfExtern(c->spec));
                 for (auto d : c->dispatch) add(d);
                 for (auto &fs : c->fmtspecs) add(fs.second);
                 // print renders its line on a data stack.
