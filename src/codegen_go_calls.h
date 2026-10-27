@@ -401,12 +401,10 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
     vector<string> args(an.size());
     for (size_t i = 0; i < an.size(); i++) {
         if ((int)i == pos) {
-            if (isref) {
-                e = AtTyped(GenPure(sn), enumtype);
-            } else {
-                // A copy, taken before the later arguments run.
-                e = AtVar(Snapshot(enumtype, CoerceVal(GenX(sn), sn->exprtype, enumtype, ln)), enumtype);
-            }
+            // A copy of the value, through a reference too, taken before the
+            // later arguments run: they may change it, and the dispatch is on
+            // the value it had (CodeGen::EmitDispatch).
+            e = AtVar(Snapshot(enumtype, CoerceVal(GenX(sn), sn->exprtype, enumtype, ln)), enumtype);
             continue;
         }
         auto pt = sp0->argtypes[i];
