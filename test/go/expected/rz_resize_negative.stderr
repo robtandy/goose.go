@@ -1,0 +1,1 @@
+goose runtime error: resize to a negative length (test/go/programs/rz_resize_negative.goose:2)

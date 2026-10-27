@@ -1,0 +1,1 @@
+goose runtime error: data stack overflow: a value on main's data stacks grew past the 64 KB reserved for it; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, up to 256 TB
