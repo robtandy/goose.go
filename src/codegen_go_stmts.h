@@ -28,7 +28,10 @@ inline void CodeGenGo::PopSc() {
 inline string CodeGenGo::AllocStk() {
     auto k = stknext++;
     stkmax = std::max(stkmax, stknext);
-    return cat("gs.Stks[", SpIdx(k), "]");
+    // Spaced as gofmt spaces an index.
+    auto idx = SpIdx(k);
+    idx.erase(std::remove(idx.begin(), idx.end(), ' '), idx.end());
+    return cat("gs.Stks[", idx, "]");
 }
 
 // What an exit through scope s runs: its `defer` bodies, latest first. A
@@ -205,7 +208,7 @@ inline void CodeGenGo::GenIf(IfExpr *fi, const GoDst &d) {
         PopSc();
         return;
     }
-    L("if ", c, " {");
+    L("if ", CondText(c), " {");
     ind++;
     PushSc(SC_PLAIN);
     GenBlockInner(fi->thenb, d);
@@ -341,7 +344,7 @@ inline void CodeGenGo::GenWhile(While *w) {
     if (incond) c = GenTruth(w->cond);
     if (dead) { PopLabeled(); return; }
     LabelHere();
-    L(incond ? cat("for ", c, " {") : string("for {"));
+    L(incond ? cat("for ", CondText(c), " {") : string("for {"));
     ind++;
     if (!incond) {
         PushSc(SC_PLAIN);

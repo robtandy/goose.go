@@ -247,6 +247,7 @@ struct CodeGenGo {
     static bool IsGoName(const string &x);
     static bool GoConstInt(const string &x, int64_t &v, bool &uns);
     static bool IsGoConst(const string &x);
+    static string CondText(const string &x);
     string Materialize(TypeExpr *t, const string &x);
     string Coerce(const string &x, TypeExpr *from, TypeExpr *to, Line ln);
     string Snapshot(TypeExpr *t, const string &x);

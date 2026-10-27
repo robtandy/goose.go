@@ -160,6 +160,25 @@ inline bool CodeGenGo::IsGoConst(const string &x) {
     return false;
 }
 
+// x without the parentheses around the whole of it, as gofmt writes an if's
+// or a for's condition.
+inline string CodeGenGo::CondText(const string &x) {
+    if (x.size() < 2 || x.front() != '(' || x.back() != ')') return x;
+    int depth = 0;
+    for (size_t i = 0; i < x.size(); i++) {
+        auto c = x[i];
+        if (c == '"') {
+            for (i++; i < x.size() && x[i] != '"'; i++)
+                if (x[i] == '\\') i++;
+        } else if (c == '(') {
+            depth++;
+        } else if (c == ')' && --depth == 0 && i + 1 < x.size()) {
+            return x;   // The first one closes before the end: `(a) && (b)`.
+        }
+    }
+    return x.substr(1, x.size() - 2);
+}
+
 // A constant held in a variable, so that an operation on it is computed as
 // the program computes it, wrapping and rounding at run time, rather than
 // exactly by the Go compiler, which rejects a result its type cannot hold
@@ -304,9 +323,9 @@ inline string CodeGenGo::ArithX(TType op, TypeExpr *t, string l, string r, Line 
             case T_MINUS: return cat("(", l, " - ", r, ")");
             // Rounded on its own: Go may otherwise fuse it with an add.
             case T_MUL:   return cat(gt, "(", l, " * ", r, ")");
-            // A constant zero divisor is a compile error even for floats'
-            // runtime division where the dividend is a constant too, which
-            // the materialization above has ruled out.
+            // Go rejects a float division by a constant zero only where the
+            // dividend is a constant too, which the materialization above
+            // rules out: any other gives the infinity or NaN it gives in C.
             case T_DIV:   return cat("(", l, " / ", r, ")");
             case T_MOD:
                 if (gt == "float32")
