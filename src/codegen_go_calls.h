@@ -58,10 +58,108 @@ static string FirstResult(const string &t, size_t n) {
     return s;
 }
 
+// A case-function call (§8.2): every argument evaluated once, in order,
+// then the scrutinee's tag picking the case, which takes its variant's
+// payload as its own type; every case's results land in the same
+// temporaries, which are returned. A fixed-mode ADT, also behind a
+// reference, dispatches only to cases taking the payload by value (§3.5).
+inline vector<string> CodeGenGo::GenDispatch(Call *c) {
+    auto ln = c->line;
+    auto sp0 = c->dispatch[0];
+    auto an = CallArgNodes(c, sp0->params.size());
+    auto pos = c->dispatcharg;
+    auto sn = an[pos];
+    auto enumtype = sn->exprtype;
+    auto isref = enumtype->kind == TY_REF;
+    if (isref) enumtype = enumtype->ref->sub;
+    if (enumtype->kind != TY_ENUM || enumtype->enu->varmode)
+        Unsupported(ln, cat("a case-function dispatch over ", TypeText(enumtype)));
+    auto ei = EIOf(enumtype);
+    auto &ti = TI(enumtype, ln);
+    GoLoc e;
+    vector<string> args(an.size());
+    for (size_t i = 0; i < an.size(); i++) {
+        if ((int)i == pos) {
+            if (isref) {
+                e = AtTyped(GenPure(sn), enumtype);
+            } else {
+                // A copy, taken before the later arguments run.
+                e = AtVar(Snapshot(enumtype, CoerceVal(GenX(sn), sn->exprtype, enumtype, ln)), enumtype);
+            }
+            continue;
+        }
+        auto pt = sp0->argtypes[i];
+        auto x = Coerce(GenX(an[i]), an[i]->exprtype, pt, an[i]->line);
+        if (!IsGoConst(x) && x != "nil") x = Snapshot(pt, x);
+        args[i] = x;
+    }
+    vector<string> res;
+    for (auto rt : sp0->rets) {
+        auto t = T();
+        Decl(t, LocalT(rt, ln));
+        res.push_back(t);
+    }
+    auto chain = [&] {
+        auto tag = T();
+        Decl(tag, ti.rep == GR_TAG ? ti.name : IntGoT(TagStore(ei->en)), TagOf(e, ln));
+        auto nv = ei->en->variants.size();
+        for (size_t vi = 0; vi < nv; vi++) {
+            auto sp = c->dispatch[vi];
+            auto &ki = sinfo[sp];
+            auto last = vi + 1 == nv;
+            auto open = !vi ? cat("if ", tag, " == 0 {")
+                            : last && !debug ? string("} else {") : cat("} else if ", tag, " == ", vi, " {");
+            if (!vi) L(open);
+            else LS(open);
+            ind++;
+            PushSc(SC_PLAIN);
+            auto vt = VariantType(enumtype, (int)vi);
+            auto pt = sp->argtypes[pos];
+            if (pt->kind == TY_REF) Fail(ln, "internal: a fixed-mode payload dispatched by reference");
+            auto varg = ti.voffs.empty() || ti.voffs[vi] < 0 ? ZeroOf(vt, ln) : PayloadLoc(e, (int)vi, ln).lv;
+            string list;
+            if (ki.needssp) {
+                NoStackAcrossCycleCall(sp, ln);
+                NoteStackCall(sp, ln);
+                list = cat("gs, ", SpTop());
+            }
+            for (size_t i = 0; i < an.size(); i++)
+                Append(list, list.empty() ? "" : ", ", (int)i == pos ? Coerce(varg, vt, pt, ln) : args[i]);
+            for (auto fv : ki.freevars) Append(list, list.empty() ? "" : ", ", FreeVarArg(c->FreeVarArg(fv)));
+            auto call = cat(ki.name, "(", list, ")");
+            if (res.empty()) {
+                L(call);
+            } else {
+                string names;
+                for (size_t i = 0; i < res.size(); i++) Append(names, i ? ", " : "", res[i]);
+                L(names, " = ", call);
+            }
+            PopSc();
+            ind--;
+        }
+        if (debug) {
+            // A debug build's check of a tag no variant has (GS_UNREACHABLE).
+            LS("} else {");
+            ind++;
+            LS("panic(GsTagError(", LocArgs(ln), "))");
+            ind--;
+        }
+        LS("}");
+        dead = false;
+    };
+    if (Unreached()) GenUnreached(chain);
+    else chain();
+    return res;
+}
+
 // A call as a value: made at this point, its first result in a temporary.
 inline string CodeGenGo::GenCall(Call *c) {
     if (c->builtin >= 0 || c->fvbody) return CtlValX(c);
-    if (!c->dispatch.empty()) Unsupported(c->line, "a case-function dispatch");
+    if (!c->dispatch.empty()) {
+        auto res = GenDispatch(c);
+        if (res.empty()) Fail(c->line, "internal: a call without results as a value");
+        return Coerce(res[0], c->dispatch[0]->rets[0], c->exprtype, c->line);
+    }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
     auto sp = c->spec;
     if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");
@@ -81,7 +179,20 @@ inline string CodeGenGo::GenCall(Call *c) {
 inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
     if (c->builtin >= 0) { GenBuiltin(c, d); return; }
     if (c->fvbody) { GenFvCall(c, d); return; }
-    if (!c->dispatch.empty()) Unsupported(c->line, "a case-function dispatch");
+    if (!c->dispatch.empty()) {
+        auto res = GenDispatch(c);
+        if (d.k == GD_DISCARD || res.empty()) return;
+        auto want = d.t ? d.t : c->exprtype;
+        auto rt = c->dispatch[0]->rets[0];
+        if (IsRelRef(want)) {
+            auto pt = ast.RefTo(want->ref->sub, c->line, want->ref->optional);
+            auto v = Snapshot(pt, Coerce(res[0], rt, pt, c->line));
+            EmitRelStore(AtVar(d.s, want), v, NonNullRef(c), false, c->line);
+            return;
+        }
+        L(d.s, " = ", Coerce(res[0], rt, want, c->line));
+        return;
+    }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
     auto sp = c->spec;
     if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");
@@ -111,7 +222,16 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
 // its variable, through temporaries of the callee's types where those are
 // not the variables'.
 inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
-    if (c->builtin >= 0 || c->fvbody || !c->dispatch.empty() || !c->spec)
+    if (!c->dispatch.empty()) {
+        auto rets = c->dispatch[0]->rets;
+        if (rets.size() != defs.size()) Fail(c->line, "internal: result count of a binding");
+        auto res = GenDispatch(c);
+        for (size_t i = 0; i < defs.size(); i++)
+            Decl(LocalName(defs[i]), LocalT(defs[i]->type, defs[i]->line),
+                 Coerce(res[i], rets[i], defs[i]->type, c->line));
+        return;
+    }
+    if (c->builtin >= 0 || c->fvbody || !c->spec)
         Unsupported(c->line, "a multiple binding from this call");
     auto sp = c->spec;
     if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");

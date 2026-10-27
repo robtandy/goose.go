@@ -556,6 +556,7 @@ struct CodeGenGo {
     vector<Node *> CallArgNodes(Call *c, size_t nparams);
     string FreeVarArg(const VarDef *fv);
     string SpecCallX(Call *c, FnSpec *sp);
+    vector<string> GenDispatch(Call *c);
     string GenCall(Call *c);
     void GenCallAny(Call *c, const GoDst &d);
     void GenCallInto(Call *c, const vector<VarDef *> &defs);

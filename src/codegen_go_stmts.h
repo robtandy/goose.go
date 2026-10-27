@@ -539,6 +539,20 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
     if (vals.size() == 1 && sp->rets.size() > 1) {
         // A single call forwards all its results (§7.1).
         auto c = Is<Call>(vals[0]);
+        if (c && !c->dispatch.empty() && c->dispatch[0]->rets.size() == sp->rets.size()) {
+            // A case-function call's results, which its cases deliver into
+            // temporaries.
+            auto res = GenDispatch(c);
+            for (size_t i = 0; i < sp->rets.size(); i++)
+                rv.push_back(Coerce(res[i], c->dispatch[0]->rets[i], sp->rets[i], c->line));
+            if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
+            EmitExitRestores(0);
+            string list;
+            for (size_t i = 0; i < rv.size(); i++) Append(list, i ? ", " : "", rv[i]);
+            L("return ", list);
+            dead = true;
+            return;
+        }
         if (!c || !c->spec || c->spec->rets.size() != sp->rets.size())
             Fail(vals[0]->line, "internal: a return forwarding no call's results");
         auto same = true;
