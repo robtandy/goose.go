@@ -1,0 +1,24 @@
+  in block 1
+  inner block of 1
+  note 1 depth 1
+nested 1 -> 1
+  note 5 depth 1
+nested 5 -> 50
+depth 0 notes 2
+  iteration 0 count 0
+  iteration 2 count 2
+  iteration 3 count 3
+  while 0
+  while 2
+  while 4
+  found 300 x 4
+loops -> 5
+returns_value -> 2
+  leaving block
+  early done true
+early true -> 10
+  leaving block
+  early done false
+early false -> 20
+in the block
+block done
