@@ -1,0 +1,2840 @@
+// Goose compiler — parsed program data: type expressions, AST nodes, and symbols.
+// All objects are owned centrally by Ast (append-only tables of pointers); the
+// trees just point at each other, so no per-node destructors are needed.
+#pragma once
+
+namespace goose {
+
+struct Node;
+struct Block;
+struct Break;
+struct FunVal;
+struct TypeExpr;
+struct SFunction;
+struct SStruct;
+struct SEnum;
+struct SVariant;
+struct SAlias;
+struct Ast;
+struct VarDef;
+struct FnSpec;
+struct StructInst;
+struct EnumInst;
+struct TypeCheck;
+struct Optimizer;
+struct Inliner;
+struct BCE;
+struct CodeGen;
+struct Dst;
+struct ExpansionClone;
+
+// A place in a source file: the 1-based line, which diagnostics name, and
+// the 1-based byte column, which Parser::CurLine records for every node,
+// type and declaration and the parser's Finish gives the ends of nodes as
+// well, one past their last byte. A column of 0 is a line alone (a place
+// the checker made up, Line {}), and a line of 0 is no place.
+struct Line {
+    int line = 0;
+    int fileidx = 0;
+    int col = 0;
+};
+
+// Where a diagnostic at a place, or over a node's extent, is.
+inline DiagLoc LocOf(Line l) { return { l.fileidx, l.line, l.col, 0, 0 }; }
+
+// ---------------------------------------------------------------------------
+// Type expressions. During parsing, a type name cannot generally be looked up
+// yet (top-level declarations are order-independent), so names parse as
+// TY_UNRESOLVED; ResolveTypeNames (resolve.h) then rewrites every one of them
+// in place into TY_STRUCT / TY_ENUM / TY_GENERIC, and *substitutes* alias uses
+// with the aliased type. After resolution no TY_UNRESOLVED remains and aliases
+// don't exist as types at all, so typecheck answers "is this an int?" by
+// comparing kind, nothing else.
+
+enum TypeKind {
+    TY_INT,         // A sized integer type; intstorage picks the width (§3.1, §3.6).
+    TY_FLT,         // A sized float type; fltstorage picks f32/f64.
+    TY_BOOL,
+    TY_STRUCT,      // A nominal struct, with any generic type arguments.
+    TY_ENUM,        // A nominal ADT; fixed-mode use, or variable-mode T.. (varmode flag, §3.5).
+    TY_GENERIC,     // A generic type parameter name (typecheck validates scope).
+    TY_UNRESOLVED,  // Parse-time only: a name + args; none survive resolution.
+    TY_FN,          // Static function value type; bare `fn` has has_sig false.
+    TY_ARRAY,       // The array family minus slices; akind picks the flavor.
+    TY_SLICE,       // T[:] — a reference + count; kin of TY_REF, not TY_ARRAY.
+    TY_REF,         // T& / T&<w> / T&<w in pool> (relative offset) / optional T?.
+    TY_VARIANT,     // T.Name — variant type of an ADT.
+    TY_VOID,        // Typecheck-created: the "type" of statements and valueless blocks.
+};
+
+enum ArrayKind {
+    A_FIXED,       // T[k]           sizeexpr = k, a constant expression
+    A_VAR,         // T[] / T[u8]    lenstorage = length field storage, -1 = default
+    A_LIMITED,     // T[..k] / T[..] sizeexpr = capacity, null = construction-time
+    A_GROW,        // T[>..]
+    A_GROWSHRINK,  // T[>..<]
+};
+
+// The integer types (§3.1). All are usable everywhere; IS_VARINT is the one
+// storage-only exception, LEB128-encoded in memory and read as i64 (§3.6).
+enum IntStorage { IS_I8, IS_I16, IS_I32, IS_I64, IS_U8, IS_U16, IS_U32, IS_U64, IS_VARINT };
+
+enum FltStorage { FS_F32, FS_F64 };
+
+inline const char *IntStorageName(int s) {
+    static const char *names[] = { "i8", "i16", "i32", "i64",
+                                   "u8", "u16", "u32", "u64", "varint" };
+    return names[s];
+}
+
+inline const char *FltStorageName(int s) {
+    static const char *names[] = { "f32", "f64" };
+    return names[s];
+}
+
+inline bool IsUnsigned(IntStorage s) { return s >= IS_U8 && s <= IS_U64; }
+inline int IntBits(IntStorage s) {
+    switch (s) {
+        case IS_I8: case IS_U8:   return 8;
+        case IS_I16: case IS_U16: return 16;
+        case IS_I32: case IS_U32: return 32;
+        default:                  return 64;
+    }
+}
+
+// The values a storage type holds, as i64 bounds. u64's upper half lies
+// beyond i64: a constant up there travels as its bits with a flag
+// (IntLit::uns, Val::uns), and every user of a u64 range meets that case
+// before consulting the bounds. A varint holds the full i64 range (§3.6).
+inline pair<int64_t, int64_t> IntRange(IntStorage s) {
+    switch (s) {
+        case IS_I8:  return { -128, 127 };
+        case IS_I16: return { -32768, 32767 };
+        case IS_I32: return { INT32_MIN, INT32_MAX };
+        case IS_U8:  return { 0, 255 };
+        case IS_U16: return { 0, 65535 };
+        case IS_U32: return { 0, (int64_t)UINT32_MAX };
+        case IS_U64: return { 0, INT64_MAX };
+        default:     return { INT64_MIN, INT64_MAX };
+    }
+}
+
+// Whether a constant (value bits v, u64-flavored when uns) fits a storage
+// type: above i64.max only u64 holds it, anything else by its range.
+inline bool FitsIntStorage(int64_t v, bool uns, IntStorage s) {
+    if (uns) return s == IS_U64;   // Above i64.max: only u64 holds it.
+    auto [lo, hi] = IntRange(s);
+    return v >= lo && v <= hi;
+}
+
+// A value as the storage holds it: the low bits, signed types sign-extended
+// back to 64. This is what §6.2's release-build wrap computes.
+inline int64_t WrapStorage(int64_t v, IntStorage s) {
+    switch (s) {
+        case IS_I8:  return (int8_t)v;   case IS_U8:  return (uint8_t)v;
+        case IS_I16: return (int16_t)v;  case IS_U16: return (uint16_t)v;
+        case IS_I32: return (int32_t)v;  case IS_U32: return (int64_t)(uint32_t)v;
+        default:     return v;
+    }
+}
+
+// Wrap-free signed 64-bit arithmetic, reporting overflow.
+inline bool AddOv(int64_t a, int64_t b, int64_t &r) {
+    r = (int64_t)((uint64_t)a + (uint64_t)b);
+    return ((a ^ r) & (b ^ r)) < 0;
+}
+
+inline bool SubOv(int64_t a, int64_t b, int64_t &r) {
+    r = (int64_t)((uint64_t)a - (uint64_t)b);
+    return ((a ^ b) & (a ^ r)) < 0;
+}
+
+inline bool MulOv(int64_t a, int64_t b, int64_t &r) {
+    r = (int64_t)((uint64_t)a * (uint64_t)b);
+    if (a == 0 || b == 0) return false;
+    if (a == -1) return b == INT64_MIN;
+    if (b == -1) return a == INT64_MIN;
+    return r / b != a;
+}
+
+// Signed `%` is Euclidean (§6.2): the result is in [0, |b|), never
+// negative. Callers check b != 0 first. The adjustment is computed
+// unsigned so that b == i64.min (whose negation is unrepresentable) and
+// the i64.min % -1 case both work out; the latter's exact remainder is 0,
+// which is why it needs no hardware division.
+inline int64_t EuclidMod(int64_t a, int64_t b) {
+    if (b == -1) return 0;
+    auto r = a % b;
+    if (r < 0) r = (int64_t)((uint64_t)r + (b < 0 ? 0u - (uint64_t)b : (uint64_t)b));
+    return r;
+}
+
+// The constant an integer operation folds to at storage `s`, false where it
+// has none. Unsigned arithmetic wraps modulo the width by definition (§6.2)
+// and so does a shift of either signedness (runtime.h's gs_shl_*), so those
+// always fold; a signed result that leaves the type does not, since a debug
+// build aborts on it and folding would define it away, and neither does a
+// zero divisor, which aborts in every build. Comparisons are not here: they
+// fold to a bool, which only the optimizer has a node for.
+inline bool FoldIntOp(TType op, int64_t la, int64_t rb, IntStorage s, int64_t &out) {
+    auto bits = IntBits(s);
+    if (IsUnsigned(s)) {
+        auto a = (uint64_t)la, b = (uint64_t)rb;
+        auto max = bits == 64 ? UINT64_MAX : (1ull << bits) - 1;
+        uint64_t r = 0;
+        switch (op) {
+            case T_PLUS:   r = a + b; break;
+            case T_MINUS:  r = a - b; break;
+            case T_MUL:    r = a * b; break;
+            case T_DIV:    if (!b) return false; r = a / b; break;
+            case T_MOD:    if (!b) return false; r = a % b; break;
+            case T_BITAND: r = a & b; break;
+            case T_BITOR:  r = a | b; break;
+            case T_XOR:    r = a ^ b; break;
+            case T_SHL:    r = a << (b & (bits - 1)); break;
+            case T_SHR:    r = (a & max) >> (b & (bits - 1)); break;
+            default:       return false;
+        }
+        out = WrapStorage((int64_t)r, s);
+        return true;
+    }
+    auto a = la, b = rb;
+    int64_t r = 0;
+    switch (op) {
+        case T_PLUS:   if (AddOv(a, b, r)) return false; break;
+        case T_MINUS:  if (SubOv(a, b, r)) return false; break;
+        case T_MUL:    if (MulOv(a, b, r)) return false; break;
+        case T_DIV:
+            if (!b || (a == INT64_MIN && b == -1)) return false;
+            r = a / b;
+            break;
+        case T_MOD:    if (!b) return false; r = EuclidMod(a, b); break;
+        case T_BITAND: r = a & b; break;
+        case T_BITOR:  r = a | b; break;
+        case T_XOR:    r = a ^ b; break;
+        case T_SHL:
+            out = WrapStorage((int64_t)((uint64_t)a << (b & (bits - 1))), s);
+            return true;
+        case T_SHR:    r = a >> (b & (bits - 1)); break;
+        default:       return false;
+    }
+    if (!FitsIntStorage(r, false, s)) return false;
+    out = r;
+    return true;
+}
+
+// Per-kind detail payloads. A kind that needs more than one field gets one of
+// these behind its single union member; they are owned by Ast.typedetails.
+struct TypeDetail { virtual ~TypeDetail() {} };
+
+struct TypeStruct : TypeDetail {     // TY_STRUCT
+    SStruct *st = nullptr;
+    vector<TypeExpr *> args;         // Generic type arguments, possibly empty.
+    StructInst *inst = nullptr;      // Instantiation cache (typecheck; concrete args only).
+};
+
+struct TypeEnum : TypeDetail {       // TY_ENUM
+    SEnum *en = nullptr;
+    vector<TypeExpr *> args;
+    bool varmode = false;            // T.. — variable-mode use (§3.5).
+    EnumInst *inst = nullptr;        // Instantiation cache (typecheck; concrete args only).
+};
+
+struct TypeName : TypeDetail {       // TY_UNRESOLVED and TY_GENERIC
+    int expansionbinding = 0;       // Lexical const-for binding, never a name lookup.
+    string_view expansionerror;     // Invalid substitution, diagnosed only when instantiated.
+    string_view name;                // As written: `Name`, `ns::Name` or `::Name`.
+    string_view ns;                  // Where an unqualified name resolves first: the
+                                     // namespace of the declaration it was written in
+                                     // (docs/design/namespaces.md).
+    vector<TypeExpr *> args;         // Args on a TY_GENERIC are an error (typecheck).
+    bool varmode = false;            // T.. as written; resolution moves it to TypeEnum.
+    // A TY_GENERIC an exemplar binds a type parameter to (TypeCheck::
+    // CheckExemplar): a concrete type equal only to itself, by this detail,
+    // which its `const` copies share.
+    bool opaque = false;
+};
+
+struct TypeFn : TypeDetail {         // TY_FN
+    vector<TypeExpr *> args;         // Parameter types.
+    vector<TypeExpr *> rets;
+    bool has_sig = false;            // Bare `fn` vs full signature.
+};
+
+struct TypeArray : TypeDetail {      // TY_ARRAY
+    TypeExpr *sub = nullptr;         // Element type.
+    ArrayKind akind = A_FIXED;
+    Node *sizeexpr = nullptr;        // A_FIXED size / A_LIMITED capacity (const expr; null for `[..]`).
+    int lenstorage = -1;             // A_VAR length field IntStorage; -1 = default (u32).
+    int64_t size = -1;               // Evaluated sizeexpr (typecheck); -1 = not yet / none.
+};
+
+struct TypeRef : TypeDetail {        // TY_REF
+    TypeExpr *sub = nullptr;         // Pointee.
+    int lenstorage = -1;             // Relative offset IntStorage; -1 = plain address.
+    bool optional = false;           // T? — nullable (`T&?` and `T?` are the same type).
+    // `T&<u32 in pool>`: the offset is measured from the named global pool's
+    // base instead of from the field itself (§3.9). The name is what the
+    // parser saw; typecheck resolves it once, and the pool is part of the
+    // type's identity from then on.
+    string_view poolname;
+    string_view poolns;              // The namespace poolname resolves in (as TypeName::ns).
+    VarDef *pool = nullptr;
+};
+
+struct TypeVariant : TypeDetail {    // TY_VARIANT
+    TypeExpr *adt = nullptr;         // The ADT type this is a variant of.
+    string_view name;                // Stable through resolution and substitution.
+    SVariant *variant = nullptr;     // Resolved declaration; null until its ADT is known.
+};
+
+// `u32 in a` / `u32 upto a` on a TY_INT (docs/design/index_types.md): a
+// value below a.len (at most a.len for `upto`) wherever it can be named. As
+// for a pool, the name is what the parser saw and typecheck resolves it
+// once; the array is part of the type's identity from then on. Copies of a
+// type (an alias's uses, `const`) share the detail.
+struct TypeIndex : TypeDetail {
+    string_view name;
+    string_view ns;                  // The namespace name resolves in (as TypeName::ns).
+    VarDef *arr = nullptr;
+    bool upto = false;
+};
+
+struct TypeExpr {
+    TypeKind kind;
+    Line line;
+    // `const T` (§9.5): a value whose contents are read-only, or, on a
+    // reference or slice, one whose pointee or elements are. Part of the
+    // type's identity (TypeEq); a C type does not carry it.
+    bool cq = false;
+    // A use of a type alias (resolve.h): a copy of the alias's type, whose
+    // sizes name what they name where the alias is declared, at top level,
+    // whatever scope the use is in (TypeCheck::ConstNamesIn).
+    bool aliasuse = false;
+    // On a TY_INT: an index or bound type (TypeIndex). Outside the union,
+    // since intstorage is the member a TY_INT uses.
+    TypeIndex *ix = nullptr;
+    union {                          // Active member selected by kind:
+        IntStorage intstorage;       //   TY_INT
+        FltStorage fltstorage;       //   TY_FLT
+        TypeExpr *sub;               //   TY_SLICE (element type)
+        TypeStruct *struc;           //   TY_STRUCT
+        TypeEnum *enu;               //   TY_ENUM
+        TypeName *named;             //   TY_UNRESOLVED, TY_GENERIC
+        TypeFn *fn;                  //   TY_FN
+        TypeArray *arr;              //   TY_ARRAY
+        TypeRef *ref;                //   TY_REF
+        TypeVariant *var;            //   TY_VARIANT
+    };                               // (TY_BOOL uses none.)
+
+    TypeExpr(TypeKind _kind, Line _line) : kind(_kind), line(_line) { named = nullptr; }
+    // Stops descending once s reaches `limit`: text past it is unspecified,
+    // and the caller cuts s back to the limit.
+    void Dump(string &s, size_t limit = string::npos) const;
+};
+
+// The views of a type's shape that every pass asks for.
+inline bool IsRefOrSlice(const TypeExpr *t) { return t->kind == TY_REF || t->kind == TY_SLICE; }
+inline bool IsOptional(const TypeExpr *t) { return t->kind == TY_REF && t->ref->optional; }
+inline bool IsOpaque(const TypeExpr *t) { return t && t->kind == TY_GENERIC && t->named->opaque; }
+// A plain reference: an address, neither optional nor a relative offset.
+inline bool IsPlainRef(const TypeExpr *t) {
+    return t->kind == TY_REF && !t->ref->optional && t->ref->lenstorage < 0;
+}
+// A relative reference (§3.9): an offset stored in place of an address.
+inline bool IsRelRef(const TypeExpr *t) { return t->kind == TY_REF && t->ref->lenstorage >= 0; }
+// One measured from where it lies, rather than from an `in pool` base.
+inline bool IsSelfRelRef(const TypeExpr *t) { return IsRelRef(t) && !t->ref->pool; }
+inline bool IsArrayKind(const TypeExpr *t, ArrayKind k) {
+    return t->kind == TY_ARRAY && t->arr->akind == k;
+}
+// Whether a variable or parameter of this type bound to a reusable pool is a
+// pool reference (§5.4), carrying the pool's freelist beside the address (a
+// gs_pref in the generated C): a plain reference to a grow-only array. One of
+// any other type refers to the pool as to any array.
+inline bool CarriesPool(const TypeExpr *t) {
+    return IsPlainRef(t) && IsArrayKind(t->ref->sub, A_GROW);
+}
+// A machine integer: any integer type but varint, the storage-only encoding.
+inline bool IsIntT(const TypeExpr *t) { return t->kind == TY_INT && t->intstorage != IS_VARINT; }
+inline bool IsVarintT(const TypeExpr *t) {
+    return t && t->kind == TY_INT && t->intstorage == IS_VARINT;
+}
+// A plain u8: an index type of u8 is not a byte (a string, a byte view or a
+// text sink would write any byte into it).
+inline bool IsU8(const TypeExpr *t) {
+    return t->kind == TY_INT && t->intstorage == IS_U8 && !t->ix;
+}
+// An index or bound type (`u32 in a`, `u32 upto a`).
+inline bool IsIndexT(const TypeExpr *t) { return t && t->kind == TY_INT && t->ix; }
+inline bool IsF32(const TypeExpr *t) { return t && t->kind == TY_FLT && t->fltstorage == FS_F32; }
+// The ADT a variant type is a variant of, and an enum type's own; else null.
+inline TypeExpr *AdtOf(TypeExpr *t) {
+    if (t->kind == TY_VARIANT) return t->var->adt->kind == TY_ENUM ? t->var->adt : nullptr;
+    return t->kind == TY_ENUM ? t : nullptr;
+}
+
+// The primitive type keyword tokens, in a contiguous range.
+inline bool IsPrimTypeToken(TType t) { return t >= T_TBOOL && t <= T_TF64; }
+
+struct GenericParam {
+    string_view name;
+    Line line;
+    TypeExpr *bound = nullptr;  // Optional ": fn(...)" style documentation bound.
+};
+
+struct Param {
+    string_view name;
+    Line line;                  // Of the name.
+    TypeExpr *type = nullptr;   // Null = untyped, i.e. generic.
+    Node *defaultval = nullptr; // What a call leaving the argument out passes (§7.1).
+    bool isvar = false;
+};
+
+struct Field {
+    string_view name;
+    Line line;                  // Of the name, or of `pad`.
+    string_view doc;            // The comment lines above it (Lexer::doc).
+    TypeExpr *type = nullptr;
+    Node *defaultval = nullptr;
+    bool isconst = false;       // "let" field: const after construction.
+    bool ispad = false;         // pad n / bare pad (padsize -1 = align next field).
+    int64_t padsize = -1;
+};
+
+struct FieldInit {
+    string_view name;           // Empty for positional.
+    Node *val = nullptr;
+    bool fromdefault = false;   // Checked in the type declaration's environment.
+    int expansionbinding = 0;
+    TypeExpr *accessorowner = nullptr;
+};
+
+enum PatKind { P_WILDCARD, P_LIST };
+
+// One item of a pattern list: a value, or a half-open range when hi is set.
+// Its bounds are literals and unchecked Idents, either one maybe negated. A
+// bare name is a variant in an ADT's match and a constant in an integer's.
+struct PatItem {
+    Node *lo = nullptr;
+    Node *hi = nullptr;
+    // A variants<E> binding's variant: E, which the match must be over (a
+    // variant of another ADT with the same name is not this one).
+    TypeExpr *variantowner = nullptr;
+};
+
+struct Pattern {
+    PatKind kind = P_WILDCARD;
+    vector<PatItem> items;      // P_LIST: any one of them matches.
+    string_view binder;         // A lone variant's optional payload binding.
+    bool byref = false;         // `Variant &b`: bind the payload by reference (§8.1).
+};
+
+// The first and last value an integer arm's value or range matches.
+struct ArmRange {
+    int64_t lo = 0, hi = 0;
+};
+
+struct MatchArm {
+    Pattern pat;
+    Node *body = nullptr;
+    // A `const for` in the arm list: its arms are fragments, flattened into
+    // the list before the match is checked (TypeCheck::ExpandArms). Such an
+    // arm has no pattern or body of its own.
+    Node *expansion = nullptr;
+    bool generated = false;         // Made by a `const for` of arms.
+    // Filled by typecheck, for arms but _:
+    vector<SVariant *> variants;    // ADT arms: one per listed variant.
+    VarDef *binder = nullptr;       // A lone variant's payload binding, if any.
+    vector<ArmRange> ranges;        // Integer arms: one per listed value or range.
+};
+
+// A function value bound to a generic parameter at some call (typecheck):
+// either a literal FunVal (trailing block) or a named function, plus the
+// specialization whose locals it captures.
+struct FnValBind {
+    const FunVal *fv = nullptr;
+    SFunction *named = nullptr;
+    FnSpec *env = nullptr;
+    // A named function with overloads: the whole set, which each call of the
+    // value resolves against (§7.6); `named` is its first member.
+    const vector<SFunction *> *set = nullptr;
+    bool operator==(const FnValBind &o) const {
+        return fv == o.fv && named == o.named && env == o.env && set == o.set;
+    }
+};
+
+// The two kinds of `reusable` pool (§5.4), as bits so that merging two
+// provenances keeps only what both allow: a pool of single slots, or a
+// `reusable[]` pool of slices.
+enum { RU_SLOTS = 1, RU_SLICES = 2 };
+
+// One place a reference-like value may point (§9.2): the variable whose
+// scope bounds the pointee's life, whether that variable's own storage holds
+// the pointee or only outlives it, and, where it was loaded out of a
+// container the load could not see into, which one (§9.5).
+struct RootAlt {
+    VarDef *root = nullptr;      // Owner or bound of the pointee (null = static data).
+    // Is `root` the pointee's owner, or only a scope bound something the
+    // pointee outlives? Rules that need the pointee's identity rather than
+    // its lifetime consult this (§9.2).
+    bool exact = false;
+    // For an inexact read-back: the container it came out of, whose stores
+    // say what it holds, and which a diagnostic names. Only a container
+    // named exactly: one a root only bounds is none, and so is one a merge
+    // joins with a value that did not come out of it (Roots::Add).
+    VarDef *from = nullptr;
+    // Loaded out of a field, an element or a global, or points into what
+    // such a slice points at (a location: lies there); of a holder's
+    // contents, the holder was read out of one, so the references it holds
+    // lie there. No reference into a grow-shrink array's elements is ever
+    // stored in those (§5.2), so this does not point into one. A reference
+    // there may still lead to a whole grow-shrink array, or to a variable
+    // holding a view into one: nothing reached through a reference keeps it.
+    bool slotread = false;
+    // Read out of the storage a parameter's class root stands for -- the
+    // caller's holder a reference parameter names, the elements of the
+    // caller's array a slice parameter views -- or points into what such a
+    // value views: one of the views that storage holds, never a reference
+    // into it, which `root` only bounds; of a holder's contents, the holder
+    // lay in that storage alone, so the references it holds are such views
+    // (TypeCheck::MarkClassCopy), and of a variable's, every store there at
+    // the class put such views (TypeCheck::AddContents). That storage holds
+    // what the activation stored there and what its callers did, which each
+    // call judges by its record of the argument's storage (§5.1). Where a
+    // value may also be anything else rooted at the class -- the storage's
+    // own, or whatever the class bounds -- it is none: a merge keeps it only
+    // where every value has it, and a bound, a reference crossed and a back
+    // edge's result drop it.
+    bool classread = false;
+    bool operator==(const RootAlt &) const = default;
+};
+
+// Every place a value may point, one alternative per root. A value that may
+// be any of several -- an `if`'s branches, a variable's bindings, a
+// function's returns, the candidates a read out of a container has (§9.5)
+// -- has all of theirs, so a rule asks each alternative where it may point
+// and whether it outlives a scope. Empty for a value with no provenance: a
+// null, or no reference at all, which every rule lets pass as static data
+// would. Two alternatives never share a root: adding one that does keeps the
+// weaker of the two.
+struct Roots {
+    small_vector<RootAlt, 1> alts;
+    // No places yet: a reference variable read before its binding in a pass
+    // of a loop, or a recursive call's result in the first round of its
+    // cycle, which a later pass or round revisits (TypeCheck::RefProvOf,
+    // CallResult). A reference value with no alternatives is that whatever
+    // this says; a holder's contents are only where this says so, an empty
+    // set of contents being one that holds nothing.
+    bool unknown = false;
+
+    // All consumers compare sets, never discovery order. A cycle ignores
+    // the source containers its next round recreates; global reachability
+    // reads owners/bounds and source containers, not the slot-read proofs
+    // or the discovery-only unknown bit. Keep those projections explicit.
+    enum class Compare { All, Cycle, GlobalReach };
+    bool Same(const Roots &o, Compare how = Compare::All) const {
+        if (alts.size() != o.alts.size() || (how != Compare::GlobalReach && unknown != o.unknown))
+            return false;
+        auto key = [how](RootAlt a) {
+            if (how == Compare::Cycle) a.from = nullptr;
+            if (how == Compare::GlobalReach) a.slotread = a.classread = false;
+            return a;
+        };
+        for (auto &a : alts)
+            if (none_of(o.alts.begin(), o.alts.end(), [&](const RootAlt &b) {
+                    return key(a) == key(b);
+                }))
+                return false;
+        return true;
+    }
+    bool operator==(const Roots &o) const { return Same(o); }
+
+    bool None() const { return alts.empty(); }
+    bool Unknown() const { return alts.empty() && unknown; }
+    void Clear() {
+        alts.clear();
+        unknown = false;
+    }
+    void SetUnknown() {
+        alts.clear();
+        unknown = true;
+    }
+    void Set(VarDef *r, bool exact, VarDef *from = nullptr, bool slotread = false) {
+        alts.clear();
+        unknown = false;
+        alts.push_back({ r, exact, from, slotread });
+    }
+    // The places of another set, and whether they are none yet.
+    void TakeAlts(const Roots &o) {
+        alts = o.alts;
+        unknown = o.unknown;
+    }
+    // Whether the set changed: a new place, or one it had made weaker. An
+    // alternative was read out of a container only where every value joined
+    // at its root was read out of that one (RootAlt::from).
+    bool Add(const RootAlt &a) {
+        for (auto &b : alts) {
+            if (b.root != a.root) continue;
+            auto before = b;
+            b.exact = b.exact && a.exact;
+            b.slotread = b.slotread && a.slotread;
+            b.classread = b.classread && a.classread;
+            if (b.from != a.from) b.from = nullptr;
+            return b != before;
+        }
+        alts.push_back(a);
+        return true;
+    }
+    bool Add(const Roots &o) {
+        auto changed = !unknown && o.unknown;
+        unknown = unknown || o.unknown;
+        for (auto &a : o.alts) changed = Add(a) || changed;
+        return changed;
+    }
+    // Every alternative made a bound: the pointee is bounded by each root
+    // rather than known to be held in it, or to be a view its storage held.
+    void Weaken() {
+        for (auto &a : alts) {
+            a.exact = false;
+            a.classread = false;
+        }
+    }
+    // Where a value was read out of (slotread, classread): nothing a
+    // reference leads to keeps it, nor does a back edge's result, whose
+    // returns are not all checked yet.
+    void ClearReads() {
+        for (auto &a : alts) {
+            a.slotread = false;
+            a.classread = false;
+        }
+    }
+    // One alternative, and it holds the pointee: the value names one array.
+    bool Exact() const { return alts.size() == 1 && alts[0].exact; }
+    // The one root of an exact value, else the innermost of the alternatives'
+    // roots: the scope every alternative outlives, which a diagnostic names
+    // and a single bound stands for. Null for static data and for no roots.
+    VarDef *Root() const;
+    // The container an alternative was read out of, for diagnostics.
+    VarDef *From() const;
+    // Every alternative was loaded out of storage (§5.2).
+    bool AllSlotRead() const {
+        if (alts.empty()) return false;
+        for (auto &a : alts) if (!a.slotread) return false;
+        return true;
+    }
+    bool Has(const VarDef *r) const {
+        for (auto &a : alts) if (a.root == r) return true;
+        return false;
+    }
+    template<typename F> bool Any(F f) const {
+        for (auto &a : alts) if (f(a)) return true;
+        return false;
+    }
+    template<typename F> bool All(F f) const {
+        for (auto &a : alts) if (!f(a)) return false;
+        return true;
+    }
+};
+
+// Where a reference or slice points, as the lifetime system tracks it (§9):
+// its roots, and the provenance bits. The checked value of an expression
+// (Val), a location (TypeCheck::LVal) and the binding a reference variable
+// holds (VarDef::ref) all carry one.
+struct Prov : Roots {
+    bool writable = false;       // Writable provenance (§9.5).
+    // A `bytes_of` view (docs/design/serialization.md): a u8 slice over the
+    // element region of an array of some other type. The shrink scans of §5.1
+    // and §5.2 otherwise dismiss a slice whose pointee the root's elements
+    // cannot contain -- true of every other slice, and exactly wrong here.
+    bool byteview = false;
+    // A byte view no field, element or global has held: the store rule (§5.2)
+    // lets one into those only where it covers no grow-shrink array, so a
+    // byte view loaded out of one never does. One not stored may cover any
+    // that its roots lead to (TypeCheck::GrowShrinkTaint).
+    bool freshview = false;
+    int reusable = 0;            // Root is a reusable pool (§5.4): its RU_ kind.
+    // Where the path to the pointee crossed a reference or slice: the type of
+    // the last one's pointee, which the fields and elements stepped into
+    // after it lie in by value, as storage the root owns or bounds. Whatever
+    // owns the pointee holds one, so the storage an inexact root may stand
+    // for is enumerated by it (the store rule, §9.2). Null where the path
+    // crossed none, and where the root was derived anew since: a read-back
+    // (§9.5), or a variable's binding, which a read of it crosses again.
+    TypeExpr *reached = nullptr;
+    bool operator==(const Prov &) const = default;
+    void SetProv(const Prov &p) { *this = p; }
+    const Roots &AsRoots() const { return *this; }
+};
+
+// The checked value of an expression (typecheck.h): its type, where it
+// points when it is a reference or slice, and the constant folding used for
+// literal fit and array sizes. Lives here because every node's Check
+// override returns one.
+enum ConstKind { CK_NONE, CK_INT, CK_FLT };
+struct Val : Prov {
+    TypeExpr *type = nullptr;
+    ConstKind ck = CK_NONE;
+    int64_t ival = 0;
+    bool uns = false;            // CK_INT: ival's bits are a u64 above i64.max.
+    double fval = 0;
+    bool strlit = false;         // String literal: adaptable to u8 array types.
+    bool emptyarr = false;       // [] with as yet unknown element type.
+    bool isnull = false;         // The null literal: adaptable to any optional.
+    // A literal parameter read inside its specialization (§7.7): a constant
+    // of unknown value at its nominal type, adapting to any type of its
+    // kind; the parameter it came from is where the adaptation is recorded.
+    bool unsized = false;
+    VarDef *unsizedparam = nullptr;
+    // A float computed from float literals and integers alone, and no
+    // constant (`n * 0.5`, `if c { 0.5 } else { 0.25 }`): like a float
+    // literal it takes the float type its destination or other operand has,
+    // and is f64 where nothing gives it one (§6.3). TypeCheck::RetypeFlex
+    // retypes the nodes computing it.
+    bool litfloat = false;
+    // A construct whose branches' values are all integer constants (§6.4):
+    // one of the constants from litlo to lithi (their bits read as u64 where
+    // `uns`, as a u64 constant's are), adapting as a constant does to any
+    // integer type they all fit.
+    bool litint = false;
+    // An array literal whose elements, at any depth of nesting, are all
+    // integer constants (also from litlo to lithi) or all floats of literals:
+    // as they would, it adapts to an array or slice of its shape with any
+    // integer or float elements they fit (TypeCheck::LitElemsAt).
+    bool litelems = false;
+    int64_t litlo = 0, lithi = 0;
+    // An integer computed from integer constants with a shift by a count
+    // that is no constant among its operations (`1 << k`, `(1 << k) - 1`,
+    // `~(1 << k)`; §6.1): like a constant it takes the integer type its
+    // destination or other operand has, where the constants it is computed
+    // from (litlo to lithi) all fit, and is an i64 where nothing gives it
+    // one. TypeCheck::RetypeFlexInt retypes the nodes computing it.
+    bool flexint = false;
+    // A flexint that is `~c` of a constant c >= 0 (litlo == lithi == c): at
+    // i64 it is the constant ~c, which `-` and named constants take it as.
+    bool notconst = false;
+    bool lvalue = false;         // Denotes storage (a variable, field or element), not a temporary.
+    // An lvalue of varint storage (§3.6), what a reference to such storage
+    // loads, or a construct whose branches all are one of those: its value is
+    // the i64 the varint decodes to, which no i64 storage holds, while a
+    // reference to the storage is a read-only varint& (§3.8).
+    bool isvarint = false;
+    // What a plain reference points at, loaded (TypeCheck::DecayRef): storage
+    // as an lvalue is, wherever the reference points, whatever roots it has.
+    bool pointee = false;
+    // A slice lvalue: where its slot lies -- the variable, or the storage
+    // the field or element is in -- which a reference to it is rooted at
+    // (TypeCheck::AutoRef), as `&` of the slot is (§3.8), and as writable
+    // as that is: as the path to the slot and a variable's binding allow.
+    // A slice loaded through a reference has one too, where the reference
+    // points (TypeCheck::DecayRef), and so does every slice print, str and
+    // format render (CheckPrintable, CheckRenderable); only a format hook
+    // taking it by reference binds those (UserFormatIn).
+    Prov slot;
+    bool hasslot = false;
+    // A reference to a slice passed to a `T[:]&` parameter: the slice its
+    // slot holds as the call is made, which the callee's view class of it
+    // stands for there (FnSpec::views). Binding a slice lvalue by reference
+    // sets it to what the lvalue loaded (TypeCheck::SlotRoots).
+    Prov held;
+    bool hasheld = false;
+    // A control construct's value, whose branches a destination with no type
+    // of its own copies (TypeCheck::CheckBranchCopy): whether every branch is
+    // storage (a variable, field or element) or a reference, which a
+    // reference parameter binds by reference instead (§4.1); and, where the
+    // check was left to the argument's check against its parameter
+    // (TypeCheck::argpath), the first branch such a copy would take
+    // implicitly, and the `&x` branches whose `&` the copy makes redundant.
+    bool storagebranches = false;
+    Node *implicitcopy = nullptr;
+    vector<Node *> refcopies;
+    // A control construct's branches checked with no destination type that
+    // are arrays and slices of one element type (TypeCheck::JoinBranches):
+    // the construct's value is a slice of that element, of this Val's type,
+    // which its branches are checked again as (§6.4). `joinslice` marks such
+    // a value, which carries nothing else yet; `joinhasslice`, that one of
+    // the branches is a slice of its own. Arrays of different types join
+    // only where one is, or a slice parameter takes them: `joinat` and the
+    // two types say where they first did not agree.
+    bool joinslice = false;
+    bool joinhasslice = false;
+    Node *joinat = nullptr;
+    TypeExpr *joina = nullptr;
+    TypeExpr *joinb = nullptr;
+    // A signed value the compiler knows cannot be negative, which is what
+    // lets it meet a u64 in a comparison (§6.1). Deliberately syntactic --
+    // a literal, a .len/.cap, or a `let` bound to one -- so that whether a
+    // comparison compiles never depends on how much the optimizer proved.
+    bool nonneg = false;
+    // The `let` it was read from, if any, whose value a writable reference
+    // could still change (TypeCheck::RelyOnNonneg); that `let`'s own
+    // nonnegfrom continues the chain.
+    VarDef *nonnegfrom = nullptr;
+    // A constant read from a named constant (VarDef::constlit), or computed
+    // from one: the one whose value it is, which a writable reference could
+    // still change (TypeCheck::RelyOnNamed); its own constfrom continues the
+    // chain.
+    VarDef *constfrom = nullptr;
+    // For a value whose type holds plain references or slices (§9.2's
+    // holder values): where those references may point. `holderset` says it
+    // was derived at all; an underived one's contents are bounded by the
+    // value's own roots (TypeCheck::ContentsOf).
+    Roots contents;
+    bool holderset = false;
+    // The variable or container the holder value was read out of, whose
+    // store events describe its contents exactly; none where it may lie in
+    // any of several, or anywhere a root only bounds (TypeCheck::HolderSource).
+    VarDef *holderfrom = nullptr;
+    FnValBind fnv;               // When type is TY_FN.
+};
+
+// ---------------------------------------------------------------------------
+// AST nodes. One base, leaves per construct; Dump implementations live
+// together in dump.h so that pass reads top to bottom.
+
+// Which NODE a Node is. Every pass asks often, so Is<T> compares this
+// instead of paying for a dynamic_cast.
+enum NodeKind : uint8_t {
+    NK_IntLit,
+    NK_FltLit,
+    NK_BoolLit,
+    NK_StrLit,
+    NK_Ident,
+    NK_ArrayLit,
+    NK_StructLit,
+    NK_Unary,
+    NK_Binary,
+    NK_Dot,
+    NK_Call,
+    NK_Index,
+    NK_SliceExpr,
+    NK_AsCast,
+    NK_NullLit,
+    NK_SelfRef,
+    NK_RangeExpr,
+    NK_Block,
+    NK_IfExpr,
+    NK_MatchExpr,
+    NK_EarlyBlock,
+    NK_While,
+    NK_LoopExpr,
+    NK_ForLoop,
+    NK_ConstFor,
+    NK_Return,
+    NK_Break,
+    NK_Continue,
+    NK_Defer,
+    NK_FunVal,
+    NK_VarDecl,
+    NK_Assign,
+    NK_IncDec,
+    NK_InlineBlock,
+    NK_FnDecl,
+    NK_StructDecl,
+    NK_EnumDecl,
+    NK_AliasDecl,
+};
+
+struct Node {
+    Line line;                      // Where the node is anchored: its first token, or
+                                    // its operator's for a binary, assignment, index,
+                                    // field or cast. Diagnostics name this line.
+    Line end;                       // One past its last byte (Parser::Finish); unknown
+                                    // (line 0) for a node the checker or optimizer made.
+    TypeExpr *exprtype = nullptr;   // Filled by typecheck (the value's type; TY_VOID for none).
+    // Filled by typecheck: the value is of non-fixed-size class and no
+    // storage, so it is a temporary of its statement, held on a data stack
+    // of the activation until the statement ends (TypeCheck::NoteTemp, §7.8).
+    bool nftemp = false;
+    NodeKind nkind;
+    // The node as the source has it, which every clone of it shares; null in
+    // that one itself.
+    const Node *origin = nullptr;
+    // Specialization-time provenance, retained in clones for diagnostics.
+    string_view expansiontrace;
+    int expansionbinding = 0;   // Ident or Dot: a lexical expansion binding.
+    Node(Line _line, NodeKind _nkind) : line(_line), nkind(_nkind) {}
+    virtual ~Node() {}
+    virtual void Dump(string &s, int ind) const = 0;
+    // Deep copy of the tree (typecheck clones function bodies per specialization
+    // so annotations are per-instantiation). TypeExprs are shared, not cloned.
+    // Clone1 copies one node, cloning its children, and Clone gives the copy
+    // its origin (implementations in clone.h).
+    Node *Clone(Ast &ast) const;
+    virtual Node *Clone1(Ast &ast) const = 0;
+    const Node *Origin() const { return origin ? origin : this; }
+    // Calls f on every direct child; generic tree walks build on this
+    // (implementations in clone.h alongside Clone).
+    virtual void Children(const function<void(Node *)> &f) const = 0;
+    // The typecheck pass for this node as a value expression; statements are
+    // dispatched separately by TypeCheck::CheckStmt. Implementations live
+    // together in typecheck_nodes.h.
+    virtual Val Check(TypeCheck &tc, TypeExpr *expected) = 0;
+    // The optimizer pass (both in optimize.h): Cp1 is the annotation-preserving
+    // deep copy used for inlining (its Cp wrapper carries exprtype over); Opt
+    // folds/propagates/inlines below this node and returns the possibly
+    // replaced node. Statements go through Optimizer::OptStmt, which handles
+    // VarDecl and statement removal itself.
+    virtual Node *Cp1(Inliner &inl) const = 0;
+    virtual Node *Opt(Optimizer &opt) = 0;
+    // The bounds-check elimination pass (bce.h): BceWalk analyzes this node
+    // in its program position and returns false when control provably does
+    // not continue past it; BceMark is the prescan that collects per-body
+    // facts before the analysis proper. Unlike the passes above, these two
+    // default to walking Children, so only the nodes that carry facts,
+    // kills, or bounds checks override them.
+    virtual bool BceWalk(BCE &bce);
+    virtual void BceMark(BCE &bce);
+    // The codegen pass (codegen.h): CgX emits the node as a C value
+    // expression, CgAny routes its value to a destination, CgStmt emits it in
+    // statement position. Implementations live together in codegen_nodes.h;
+    // most are one-line delegations into CodeGen's machinery.
+    virtual string CgX(CodeGen &cg) = 0;
+    virtual void CgAny(CodeGen &cg, const Dst &d) = 0;
+    virtual void CgStmt(CodeGen &cg) = 0;
+};
+
+// Where a diagnostic about n is: on its anchor's line, from the earliest
+// token the node has there (a binary expression's left operand, an
+// assignment's target, a field access's object, where they are on that
+// line) to the node's end.
+inline DiagLoc LocOf(const Node *n) {
+    auto l = LocOf(n->line);
+    function<void(Node *)> leftmost = [&](Node *c) {
+        if (!c || c->line.fileidx != n->line.fileidx || c->line.line != n->line.line) return;
+        if (c->line.col > 0 && (l.col == 0 || c->line.col < l.col)) l.col = c->line.col;
+        c->Children(leftmost);
+    };
+    n->Children(leftmost);
+    if (n->end.line > 0 && n->end.fileidx == n->line.fileidx) {
+        l.endline = n->end.line;
+        l.endcol = n->end.col;
+    }
+    return l;
+}
+
+// The node as a T, or null when it is some other kind.
+template<typename T> const T *Is(const Node *n) {
+    return n && n->nkind == T::NKind ? static_cast<const T *>(n) : nullptr;
+}
+template<typename T> T *Is(Node *n) {
+    return n && n->nkind == T::NKind ? static_cast<T *>(n) : nullptr;
+}
+
+#define BCE_WALK bool BceWalk(BCE &bce) override;
+#define BCE_MARK void BceMark(BCE &bce) override;
+
+#define NODE(name) struct name : Node { \
+    static constexpr NodeKind NKind = NK_##name; \
+    void Dump(string &s, int ind) const override; \
+    Node *Clone1(Ast &ast) const override; \
+    void Children(const function<void(Node *)> &f) const override; \
+    Val Check(TypeCheck &tc, TypeExpr *expected) override; \
+    Node *Cp1(Inliner &inl) const override; \
+    Node *Opt(Optimizer &opt) override; \
+    string CgX(CodeGen &cg) override; \
+    void CgAny(CodeGen &cg, const Dst &d) override; \
+    void CgStmt(CodeGen &cg) override;
+#define NODE_END };
+
+NODE(IntLit)
+    TypeExpr *fixedtype = nullptr; // Materialized typed constant; not an adaptable literal.
+    int64_t val;       // The value's bits; uns says how to read them.
+    string_view text;  // Original spelling, so hex/char literals dump readably.
+    bool uns;          // Value above i64.max: a u64 constant carried as bits.
+    IntLit(Line l, int64_t _val, string_view _text = {}, bool _uns = false)
+        : Node(l, NKind), val(_val), text(_text), uns(_uns) {}
+NODE_END
+
+NODE(FltLit)
+    TypeExpr *fixedtype = nullptr;
+    double val;
+    string_view text;  // Original spelling, so hex floats and overflowing exponents dump as written.
+    FltLit(Line l, double _val, string_view _text = {}) : Node(l, NKind), val(_val), text(_text) {}
+NODE_END
+
+NODE(BoolLit)
+    bool val;
+    BoolLit(Line l, bool _val) : Node(l, NKind), val(_val) {}
+NODE_END
+
+NODE(StrLit)
+    string val;
+    // A """ string spanning lines (§2): line k of its text is source line
+    // `line.line + k`, which embed_shader reports shader errors at.
+    bool multiline = false;
+    StrLit(Line l, string _val, bool _multiline = false)
+        : Node(l, NKind), val(std::move(_val)), multiline(_multiline) {}
+NODE_END
+
+NODE(Ident)
+    string_view expansionerror;
+    BCE_MARK
+    string_view name;               // As written: `x`, `ns::x` or `::x`. A qualified
+                                    // spelling is one interned string, so it can never
+                                    // coincide with a local's name.
+    string_view ns;                 // Where an unqualified name resolves first: the
+                                    // namespace of the declaration this was written in.
+    // Filled by typecheck: exactly one of these.
+    VarDef *vdef = nullptr;         // A variable.
+    SFunction *fnref = nullptr;     // A named function used as a function value.
+    Ident(Line l, string_view _name, string_view _ns = {}) : Node(l, NKind), name(_name), ns(_ns) {}
+NODE_END
+
+NODE(ArrayLit)
+    vector<Node *> elems;
+    Node *fillval = nullptr;    // [v; n] fill form: fillval/fillcount, elems empty.
+    Node *fillcount = nullptr;
+    Node *capexpr = nullptr;    // [..cap]: an empty limited array with capacity.
+    ArrayLit(Line l) : Node(l, NKind) {}
+NODE_END
+
+NODE(StructLit)
+    TypeExpr *type;             // Named type or variant type.
+    vector<FieldInit> inits;
+    bool defaultall = false;    // A trailing `..`, or synthesized by default<T>(): a field
+                                // not given takes its declared default, else its type's.
+    // Made by the checker for a default value (TypeCheck::DefaultValue,
+    // default<T>()), of a type written elsewhere, whose sizes were checked
+    // there (TypeCheck::ConstNamesIn).
+    bool implicit = false;
+    // Filled by typecheck:
+    StructInst *sinst = nullptr;    // Struct literals.
+    EnumInst *einst = nullptr;      // Variant literals.
+    SVariant *variant = nullptr;    //   "
+    vector<int> fieldindices;       // Per init, the target field index.
+    vector<int> sourcefieldindices; // Supplied fields before CheckInits sorts; retained on rechecks.
+    StructLit(Line l, TypeExpr *_type) : Node(l, NKind), type(_type) {}
+    // The initializer of field `fieldidx` once the literal is checked
+    // (TypeCheck::CheckInits): the one written, the field's declared
+    // default, or the default<T>() call a `..` or default<T>() fills it
+    // with; null for an omitted optional field, which is null.
+    Node *InitFor(int fieldidx) const {
+        for (size_t k = 0; k < fieldindices.size(); k++)
+            if (fieldindices[k] == fieldidx) return inits[k].val;
+        return nullptr;
+    }
+NODE_END
+
+NODE(Unary)
+    BCE_MARK
+    TType op;                   // T_MINUS, T_NOT, T_BITNOT, T_BITAND (ref-of).
+    Node *child;
+    bool synth = false;         // A `&` the checker inserted (§4.1), not written by the user.
+    bool litfloat = false;      // Filled by typecheck: its value is a Val::litfloat.
+    bool flexint = false;       // Filled by typecheck: its value is a Val::flexint.
+    Unary(Line l, TType _op, Node *_child) : Node(l, NKind), op(_op), child(_child) {}
+NODE_END
+
+NODE(Binary)
+    BCE_WALK
+    TType op;
+    Node *left, *right;
+    // Filled by typecheck for && and ||: optionals the right operand un-narrows.
+    vector<VarDef *> rightkills;
+    // Filled by BCE for && and || (BCE::ProbeRight): 1 where every bounds
+    // check in the right operand holds whatever the left operand gives, -1
+    // where one may not, 0 where the pass did not look. Codegen evaluates a
+    // right operand with a bounds check in it unconditionally only on a 1
+    // (CodeGen::Speculatable).
+    int8_t specidx = 0;
+    bool litfloat = false;      // Filled by typecheck: its value is a Val::litfloat.
+    bool flexint = false;       // Filled by typecheck: its value is a Val::flexint.
+    // Filled by BCE (bce.h) for a signed `/`, `%` or `>>`: the left operand
+    // is provably nonnegative and a divisor provably positive, so codegen
+    // computes it unsigned, with no zero or overflow check to make.
+    bool nonneg = false;
+    Binary(Line l, TType _op, Node *_l, Node *_r) : Node(l, NKind), op(_op), left(_l), right(_r) {}
+NODE_END
+
+NODE(Dot)
+    TypeExpr *accessorowner = nullptr; // The concrete struct declaring a bound selector.
+    BCE_MARK
+    Node *obj;
+    string_view name;
+    string_view ns;                 // For a UFCS call: the namespace of the declaration
+                                    // this was written in, where the function resolves first.
+    // Filled by typecheck: field access, builtin property (.len/.cap), or a
+    // payload-less variant constant (obj names the enum type).
+    int fieldidx = -1;
+    int member = -1;                // BuiltinKind, builtins.h.
+    SVariant *variantconst = nullptr;
+    EnumInst *einst = nullptr;
+    // A `.` with no name after it, which the parser reported and kept, with
+    // an empty name: a completion asks for its object's type, which the
+    // checker records before it stops the body here (Abandoned).
+    bool incomplete = false;
+    Dot(Line l, Node *_obj, string_view _name, string_view _ns = {})
+        : Node(l, NKind), obj(_obj), name(_name), ns(_ns) {}
+    // A field, which lies in its object's storage: a path, as codegen
+    // addresses it (CodeGen::GenLoc). A property or a variant constant is a
+    // value computed on the spot (Dot::CgX).
+    bool IsField() const { return !variantconst && member < 0; }
+NODE_END
+
+NODE(Call)
+    BCE_WALK
+    BCE_MARK
+    Node *callee;               // Ident, or Dot for UFCS; resolution is later.
+    vector<TypeExpr *> tyargs;  // Explicit <T> list, normally empty (inferred).
+    vector<Node *> args;
+    FunVal *trailing = nullptr; // Trailing-block function value, if any.
+    // A default<T>() the checker made (TypeCheck::DefaultCall), for a type
+    // written elsewhere, whose sizes were checked there
+    // (TypeCheck::ConstNamesIn).
+    bool implicit = false;
+    // Filled by typecheck: exactly one resolution among these.
+    FnSpec *spec = nullptr;             // A direct call to one specialization.
+    vector<FnSpec *> dispatch;          // Case-function tag dispatch, per variant.
+    int dispatcharg = -1;               //   which argument dispatches.
+    int builtin = -1;                   // BuiltinKind, builtins.h (members included).
+    Block *fvbody = nullptr;            // Call of a function value: checked body instance.
+    Node *defaultinit = nullptr;        // Per-use default construction, visible to every pass.
+    vector<VarDef *> fvparams;          //   its parameter bindings.
+    vector<TypeExpr *> rettypes;        // All return values (exprtype is rettypes[0] or void).
+    // A call to a nested function that the optimizer copied out of the body
+    // declaring it (Inliner): the variables the callee reaches as free
+    // variables (§7.5) that the copy replaced, each with the copy the call
+    // passes in its place.
+    vector<pair<VarDef *, VarDef *>> fvremap;
+    // print/str/format: the user `format` overloads rendering the types that
+    // occur in the arguments, by type (§3.7).
+    vector<pair<TypeExpr *, FnSpec *>> fmtspecs;
+    vector<Call *> fmtcontexts; // One immutable hook set per rendered argument.
+    // Typecheck: the defaults of the trailing parameters the call leaves out
+    // (§7.1), `ndefaults` fresh clones in args from args[firstdefault] on,
+    // where the arguments would be. A diagnostic prints the call without
+    // them, and checking the call again starts from it as written.
+    int firstdefault = 0;
+    int ndefaults = 0;
+    // free_slice/realloc_slice: the slice handed back is not provably the pool's,
+    // so codegen checks at run time that it lies inside the pool (§5.4).
+    bool poolcheck = false;
+    TypeExpr *qtype = nullptr;  // qlimit<T>: T, which names the queue (§11.2).
+    const string *shaderblob = nullptr;  // embed_shader's compiled blob or embed_file's bytes, in Ast::shaders.
+    Call(Line l, Node *_callee) : Node(l, NKind), callee(_callee) {}
+    // What the call passes for the callee's free variable v (fvremap).
+    VarDef *FreeVarArg(VarDef *v) const {
+        for (auto &p : fvremap) if (p.first == v) return p.second;
+        return v;
+    }
+    // The first argument in either spelling: a.f(b) is f(a, b) (§7.1).
+    Node *FirstArg() const {
+        if (auto d = Is<Dot>(callee)) return d->obj;
+        return args[0];
+    }
+    // Every argument in either spelling, the receiver of a.f(b) first: what
+    // a callee's parameters align with. A function value passed as an
+    // argument is among them, a trailing block is not.
+    vector<Node *> ArgNodes() const {
+        vector<Node *> an;
+        if (auto d = Is<Dot>(callee)) an.push_back(d->obj);
+        for (auto a : args) an.push_back(a);
+        return an;
+    }
+    // What the callee's parameters take: ArgNodes without the function-value
+    // arguments that follow them, which are compile-time only (§7.6).
+    vector<Node *> ValueArgNodes() const {
+        auto an = ArgNodes();
+        while (!an.empty() && an.back()->exprtype && an.back()->exprtype->kind == TY_FN)
+            an.pop_back();
+        return an;
+    }
+    // Replaces argument i of that list, the receiver included: the node a
+    // check of the argument made of it (TypeCheck::AutoRef) stands in for
+    // the original.
+    void SetArgNode(size_t i, Node *n) {
+        if (auto d = Is<Dot>(callee)) {
+            if (!i) { d->obj = n; return; }
+            i--;
+        }
+        args[i] = n;
+    }
+    void SetArgNodes(const vector<Node *> &an) {
+        for (size_t i = 0; i < an.size(); i++) SetArgNode(i, an[i]);
+    }
+    // Whether args[i] is one of those defaults.
+    bool IsDefaultArg(size_t i) const {
+        return (int)i >= firstdefault && (int)i < firstdefault + ndefaults;
+    }
+NODE_END
+
+NODE(Index)
+    BCE_WALK
+    BCE_MARK
+    Node *obj, *idx;
+    bool nobc = false;          // Bounds check proven redundant (bce.h); codegen omits it.
+    Index(Line l, Node *_obj, Node *_idx) : Node(l, NKind), obj(_obj), idx(_idx) {}
+NODE_END
+
+NODE(SliceExpr)
+    BCE_WALK
+    BCE_MARK
+    Node *obj;
+    Node *lo = nullptr, *hi = nullptr;      // Either may be absent.
+    bool lo_from_end = false, hi_from_end = false;  // ^k bounds.
+    bool nobc = false;          // Bounds check proven redundant (bce.h); codegen omits it.
+    bool cmpview = false;       // The whole slice `==` takes of an operand (§4.5).
+    SliceExpr(Line l, Node *_obj) : Node(l, NKind), obj(_obj) {}
+NODE_END
+
+NODE(AsCast)
+    BCE_WALK
+    Node *child;
+    TypeExpr *type;
+    bool unchecked;             // as! vs as.
+    // An integer's conversion to a float the checker inserted (§6.3), not
+    // written by the user: TypeCheck::ToFloat.
+    bool implicit = false;
+    // A conversion to an index or bound type checks the operand against
+    // the array as indexing it would, in every build; nobc is that check
+    // proven redundant (bce.h).
+    bool nobc = false;
+    // Filled by typecheck: the concrete type the cast converts to. exprtype
+    // can be wider: it is the slot the result lands in (an i8 cast stored
+    // into an i64), and the cast still wraps and checks at its own type.
+    TypeExpr *totype = nullptr;
+    AsCast(Line l, Node *_child, TypeExpr *_type, bool _unchecked)
+        : Node(l, NKind), child(_child), type(_type), unchecked(_unchecked) {}
+    // The cast as the source has it, which the checker's clones of it (one
+    // per specialization) share. A redundant cast warns once for all of them
+    // (TypeCheck::CastVerdict).
+    const AsCast *Origin() const { return static_cast<const AsCast *>(Node::Origin()); }
+NODE_END
+
+NODE(NullLit)                   // The null optional; adapts to any T? (§3.8).
+    NullLit(Line l) : Node(l, NKind) {}
+NODE_END
+
+NODE(SelfRef)                   // `self`: the value a literal is constructing (§3.9).
+    SelfRef(Line l) : Node(l, NKind) {}
+NODE_END
+
+NODE(RangeExpr)                 // Only inside for-headers.
+    Node *lo, *hi;
+    RangeExpr(Line l, Node *_lo, Node *_hi) : Node(l, NKind), lo(_lo), hi(_hi) {}
+NODE_END
+
+// A { stmt* expr? } sequence; tail is the value-producing trailing expression.
+NODE(Block)
+    BCE_WALK
+    vector<Node *> stmts;
+    Node *tail = nullptr;
+    bool expansionboundary = false;
+    // Where the parser lost a statement to an error it reported (-1 for
+    // none): the statements before it are what the block had up to the
+    // error, those from it on what parsed after. The checker checks the
+    // block up to it and stops the body there (Abandoned).
+    int brokenat = -1;
+    Block(Line l) : Node(l, NKind) {}
+NODE_END
+
+NODE(IfExpr)
+    BCE_WALK
+    Node *cond;
+    Block *thenb;
+    Node *elseb;                // Block, IfExpr, or null (any expr after optimization).
+    // Filled by typecheck: the if ends its block (is its tail, or its last
+    // statement where it has none) and its else cannot complete normally,
+    // the shape a guard parses to (§6.4). What follows the else then runs
+    // exactly where cond holds, so codegen puts the then-block's contents
+    // after `if (!cond) { else }`, in the C block the if is in rather than
+    // in one of their own (IfExpr::CgAny), and the optimizer counts no C
+    // block for the then-block (Optimizer::Around).
+    bool flat = false;
+    IfExpr(Line l, Node *_cond, Block *_thenb, Node *_elseb)
+        : Node(l, NKind), cond(_cond), thenb(_thenb), elseb(_elseb) {}
+NODE_END
+
+NODE(MatchExpr)
+    BCE_WALK
+    BCE_MARK
+    Node *scrutinee;
+    vector<MatchArm> arms;
+    MatchExpr(Line l, Node *_scrutinee) : Node(l, NKind), scrutinee(_scrutinee) {}
+NODE_END
+
+NODE(EarlyBlock)                // "block { }": breakable early-out construct.
+    BCE_WALK
+    Block *body;
+    vector<Break *> breaks;     // Filled by typecheck: the breaks giving it a value.
+    EarlyBlock(Line l, Block *_body) : Node(l, NKind), body(_body) {}
+NODE_END
+
+// A resizable array in a field: the variable holding or referencing the
+// struct, and the field indices from there out (BCE::FieldIndexed).
+using FieldPath = pair<VarDef *, vector<int>>;
+
+NODE(While)
+    BCE_WALK
+    // Set by BCE: the reference variables this loop indexes whose array it can
+    // neither resize nor re-bind, so codegen reads their base and length once
+    // before the loop instead of through the reference at every access.
+    vector<VarDef *> hoistrefs;
+    // Likewise for the arrays it indexes in fields (FieldPath).
+    vector<FieldPath> hoistfields;
+    // Set by the optimizer's loop shaping (optimize_loops.h): the loop is
+    // `while v > 0 { v--; ... }` over a local integer nothing else in the
+    // body can write, so its trip count is v's value at entry and codegen
+    // runs it as a counted loop.
+    bool countdown = false;
+    Node *cond;
+    Block *body;
+    While(Line l, Node *_cond, Block *_body) : Node(l, NKind), cond(_cond), body(_body) {}
+NODE_END
+
+NODE(LoopExpr)
+    BCE_WALK
+    vector<VarDef *> hoistrefs;   // See While.
+    vector<FieldPath> hoistfields;
+    Block *body;
+    vector<Break *> breaks;       // Filled by typecheck: the breaks giving it a value.
+    LoopExpr(Line l, Block *_body) : Node(l, NKind), body(_body) {}
+NODE_END
+
+NODE(ForLoop)
+    BCE_WALK
+    // Set by BCE for array/slice iteration: nothing in the body can change the
+    // iterated array's length, so the view may be read once instead of every
+    // iteration (§6.5 otherwise requires the re-read, since growing during
+    // iteration is legal).
+    bool fixedlen = false;
+    vector<VarDef *> hoistrefs;   // See While.
+    vector<FieldPath> hoistfields;
+    // Set by BCE for array/slice iteration: a constant the length never
+    // exceeds where an iteration tests it (-1: none known), and whether it
+    // always equals it.
+    int64_t lenbound = -1;
+    bool lenexact = false;
+    // Set by the optimizer's loop shaping (optimize_loops.h); codegen uses
+    // them where the iteration count is fixed at entry and the body can be
+    // emitted twice (CodeGen::Dupable). `stripk`: the counter starts at 0
+    // and the body takes it modulo stripk (the `lanemods`), which in a block
+    // of stripk iterations starting at a multiple of it is the position in
+    // the block. `sumred`: the body is `s += e` on a float local that e
+    // neither reads nor writes, so the terms of a block of iterations may be
+    // computed before they are added to s, in order.
+    int stripk = 0;
+    vector<Binary *> lanemods;
+    bool sumred = false;
+    BCE_MARK
+    bool byref;                 // for &x in ...
+    string_view var;
+    string_view idxvar;         // Optional second binding; empty if absent.
+    // The integer types written for a range's or count's binder and for an
+    // array's index binder (`for i: i32 in a..b`, `for x, i: u8 in arr`).
+    TypeExpr *vartype = nullptr, *idxtype = nullptr;
+    Node *iter;                 // Expression or RangeExpr.
+    Block *body;
+    // Filled by typecheck:
+    VarDef *vdef = nullptr;
+    VarDef *idxdef = nullptr;
+    int iterkind = 0;           // IterKind, typecheck.h.
+    ForLoop(Line l, bool _byref, string_view _var, string_view _idxvar, Node *_iter, Block *_body)
+        : Node(l, NKind), byref(_byref), var(_var), idxvar(_idxvar), iter(_iter), body(_body) {}
+NODE_END
+
+enum ExpansionSource { ES_FIELDS, ES_TYPES, ES_CONSTANTS, ES_VARIANTS };
+
+NODE(ConstFor)
+    ExpansionSource source = ES_FIELDS;
+    vector<string_view> names;
+    vector<int> bindings;           // Assigned by BindExpansionNames, stable across clones.
+    vector<TypeExpr *> types;
+    vector<Node *> constants;
+    Block *body = nullptr;          // Statement fragments, or null for initializer or arm fragments.
+    vector<FieldInit> inits;
+    bool armfragments = false;      // Its fragments are match arms (in a match's arm list).
+    vector<MatchArm> arms;
+    ConstFor(Line l) : Node(l, NKind) {}
+NODE_END
+
+NODE(Return)
+    BCE_WALK
+    vector<Node *> vals;
+    string_view from;           // "return ... from f"; empty if absent. As written (Ident::name).
+    string_view ns;             // The namespace `from` resolves in first (Ident::ns).
+    SFunction *target = nullptr;  // Filled by typecheck (the fn this exits; `from` or own).
+    FnSpec *targetspec = nullptr; // Its concrete return contract and propagation channel.
+    Return(Line l) : Node(l, NKind) {}
+NODE_END
+
+NODE(Break)
+    BCE_WALK
+    Node *val;
+    Break(Line l, Node *_val) : Node(l, NKind), val(_val) {}
+NODE_END
+
+NODE(Continue)
+    BCE_WALK
+    Continue(Line l) : Node(l, NKind) {}
+NODE_END
+
+// `defer s;` or `defer { ... }` (§6.6): the body runs when the block the
+// statement is in ends, however it ends. The statement form is a block of
+// one statement. The body cannot leave, and may not run long-distance
+// return machinery or name the function's named result (TypeCheck::
+// CheckDefer, CheckDefers); codegen emits it at each exit of the block
+// (CodeGen::RegisterDefer).
+NODE(Defer)
+    BCE_WALK
+    Block *body;
+    Defer(Line l, Block *_body) : Node(l, NKind), body(_body) {}
+NODE_END
+
+// A function value: trailing block or block with named params. Non-escaping,
+// compile-time entity; participates in calls only.
+NODE(FunVal)
+    BCE_WALK
+    vector<Param> params;       // Empty param list = implicit "it".
+    bool explicit_params = false;
+    Block *body;
+    FunVal(Line l, Block *_body) : Node(l, NKind), body(_body) {}
+NODE_END
+
+// let/var declarations, local and global.
+NODE(VarDecl)
+    BCE_WALK
+    BCE_MARK
+    bool isvar;                 // var vs let.
+    bool isconst = false;       // `const x`: a let whose type is `const` (§4.4).
+    int reusable = 0;           // `reusable` or `reusable[]`: RU_SLOTS or RU_SLICES (§5.4).
+    bool isglobal = false;
+    bool byref = false;         // `x .= e`: bound by reference, no decay (§3.8).
+    bool inline_arg = false;    // Synthesized call argument: caller-scope storage.
+    string_view ns;             // A global's namespace ("" = global; docs/design/namespaces.md).
+    string_view doc;            // The comment lines above it (Lexer::doc).
+    vector<string_view> names;  // let a, b = f();
+    // The results of `a, b = f();`, which the assignments after it in its
+    // block take (Parser::ParseMultiAssign).
+    bool results = false;
+    TypeExpr *type = nullptr;
+    vector<Node *> inits;       // Empty for uninitialized locals.
+    vector<VarDef *> defs;      // Filled by typecheck, aligned with names.
+    VarDecl(Line l, bool _isvar) : Node(l, NKind), isvar(_isvar) {}
+NODE_END
+
+NODE(Assign)
+    BCE_WALK
+    BCE_MARK
+    TType op;                   // T_ASSIGN, T_PLUSEQ, ...
+    Node *lval, *rhs;
+    bool pointee = false;       // Typecheck: lval is a reference and this writes its pointee.
+    Assign(Line l, TType _op, Node *_lval, Node *_rhs) : Node(l, NKind), op(_op), lval(_lval), rhs(_rhs) {}
+NODE_END
+
+NODE(IncDec)
+    BCE_WALK
+    BCE_MARK
+    TType op;                   // T_INC / T_DEC.
+    Node *lval;
+    IncDec(Line l, TType _op, Node *_lval) : Node(l, NKind), op(_op), lval(_lval) {}
+NODE_END
+
+// Created by the optimizer (optimize.h), never by the parser: an inlined call
+// body spliced into the caller. Parameter bindings are marked VarDecls at
+// the top of body, evaluated in the caller's scope before entering the inline
+// body so temporary argument storage also outlives a borrowed return value.
+// Value semantics for codegen: a Return inside whose target
+// == sf exits this block with its value(s) as the block's value; normal
+// completion yields the body's tail value. Returns with other targets pass
+// through (they exit an enclosing InlineBlock or the real function).
+NODE(InlineBlock)
+    BCE_WALK
+    SFunction *sf;
+    FnSpec *spec;               // The specialization this body came from.
+    Block *body;
+    InlineBlock(Line l, SFunction *_sf, FnSpec *_spec, Block *_body)
+        : Node(l, NKind), sf(_sf), spec(_spec), body(_body) {}
+    void EmitBody(CodeGen &cg, const Dst &d);   // CgAny, as the callee's own result type.
+NODE_END
+
+// ---------------------------------------------------------------------------
+// Symbols (top-level declarations). Wrapped in decl nodes so a module's
+// top-level items keep source order for dumping.
+
+struct SFunction {
+    string_view name;           // The leaf name, as lexical lookups and diagnostics use it.
+    string_view ns;             // Its namespace, "" for the global one (docs/design/namespaces.md).
+    string_view qname;          // `ns::name`, or just name in the global namespace; interned in Ast.
+    Line line;
+    Line end;                   // One past the declaration's last byte (its `}` or `;`).
+    string_view doc;            // The comment lines above it (Lexer::doc).
+    vector<GenericParam> generics;
+    vector<Param> params;
+    vector<TypeExpr *> rets;    // Empty + !has_rets = inferred/none.
+    bool has_rets = false;
+    bool isrec = false;         // Declared with `recursive`.
+    bool isinline = false;      // Declared with `inline`: inlined whatever its size (§7.13).
+    bool issimd = false;        // Declared with `simd`: one version per instruction set (§7.12).
+    // Declared with `checkfree`, or nested in such a function: a bounds
+    // check left in any copy of the body is an error (bce.h).
+    bool checkfree = false;
+    bool isthread = false;
+    bool isextern = false;      // A C function behind a Goose signature (§7.10); no body.
+    bool isexport = false;      // A Goose function exposed through a C ABI wrapper.
+    string cname;               // Its C symbol (the Goose name unless spelled out).
+    // The shared library an extern block binds it from by that symbol as
+    // the program starts (§7.10); empty for an extern the link resolves.
+    string dylib;
+    // An extern that reads every data-stack top of its thread program
+    // (os.trim_memory): each caller, and transitively theirs, publishes all
+    // of its cached tops before the call (CodeGen::CollectSpecs, SyncReach).
+    bool readsalltops = false;
+    bool isnested = false;
+    SFunction *outer = nullptr;     // The function a nested one is declared in.
+    Block *body = nullptr;
+    // The body lost a statement to a parse error, or holds an incomplete
+    // `.` (Block::brokenat, Dot::incomplete): the signature is whole, and a
+    // call is checked against it alone, the body up to the error
+    // (TypeCheck::CheckSpecBodyOnce).
+    bool broken = false;
+    // The header lost to a parse error after the name (Parser::ParseMembers):
+    // the parameters, results and type parameters parsed before the error
+    // stand, but there is no body, and nothing a call could be checked
+    // against (TypeCheck::ResolveCall).
+    bool brokensig = false;
+    vector<FnSpec *> specs;     // Specializations (typecheck), owned by Ast.
+
+    // Checked once per distinct argument types (§7.7): a function with type
+    // parameters or an untyped parameter.
+    bool IsGeneric() const {
+        if (!generics.empty()) return true;
+        for (auto &p : params) if (!p.type) return true;
+        return false;
+    }
+};
+
+struct SStruct {
+    string_view name;
+    string_view ns;             // As SFunction::ns / qname.
+    string_view qname;
+    Line line;
+    Line end;                   // As SFunction::end.
+    string_view doc;            // As SFunction::doc.
+    vector<GenericParam> generics;
+    vector<Field> fields;
+    vector<StructInst *> insts;  // Instantiations (typecheck), owned by Ast.
+    // The declaration lost a field to a parse error (Parser::ParseMembers):
+    // its fields are those parsed before the error, and a name it lacks is
+    // a consequence of the error, which ends the check of the code naming
+    // it silently.
+    bool broken = false;
+    // Stands for a type name that names nothing, reported where it is
+    // written (ResolveTypeNames, Ast::unknowntypes): broken, with no fields,
+    // and a value of it, or one expected to be of it, ends the check of the
+    // code at hand silently.
+    bool unknown = false;
+};
+
+struct SVariant {
+    string_view name;
+    Line line;                  // Of the name.
+    string_view doc;            // As SFunction::doc.
+    vector<Field> fields;
+    bool has_payload = false;   // Distinguishes "Point" from "Point {}".
+};
+
+struct SEnum {
+    string_view name;
+    string_view ns;             // As SFunction::ns / qname.
+    string_view qname;
+    Line line;
+    Line end;                   // As SFunction::end.
+    string_view doc;            // As SFunction::doc.
+    vector<GenericParam> generics;
+    vector<SVariant> variants;  // Stable once parsing completes; pointed at by TY_VARIANT.
+    vector<EnumInst *> insts;   // Instantiations (typecheck), owned by Ast.
+    // As SStruct::broken, of its variants: those parsed before the error,
+    // each whole.
+    bool broken = false;
+
+    SVariant *FindVariant(string_view vname) {
+        for (auto &v : variants) if (v.name == vname) return &v;
+        return nullptr;
+    }
+    // A variant's position, which is also its tag value.
+    int VariantIndex(const SVariant *v) const {
+        assert(v >= variants.data() && v < variants.data() + variants.size());
+        return (int)(v - variants.data());
+    }
+};
+
+// The index of the last field that is not padding, -1 for none: where a
+// resizable tail may sit (§3.4), and what a frame object's C struct ends in.
+inline int LastRealField(const vector<Field> &fields) {
+    for (auto i = (int)fields.size() - 1; i >= 0; i--) if (!fields[i].ispad) return i;
+    return -1;
+}
+
+// Whether fields lay out no bytes: no field, and no pad with a size (a bare
+// pad aligns only a field after it, §3.2). C has no empty structs and gives
+// such a struct or variant type one byte (gs_empty). A struct takes it in
+// its layout too, but a variant's payload takes no bytes behind its ADT's
+// tag: its type is never a field or an element (§3.4), and a fixed-mode
+// ADT's union has no member for it.
+inline bool EmptyLayout(const vector<Field> &fields) {
+    for (auto &f : fields) if (!f.ispad || f.padsize > 0) return false;
+    return true;
+}
+
+// Not a type: a name referring to a type. Uses are substituted away during
+// resolution; the symbol remains for the declaration itself and lookups.
+struct SAlias {
+    string_view name;
+    string_view ns;             // As SFunction::ns / qname.
+    string_view qname;
+    Line line;
+    Line end;                   // As SFunction::end.
+    string_view doc;            // As SFunction::doc.
+    TypeExpr *type = nullptr;
+};
+
+// The namespace a nominal type was declared in; "" for every other type.
+inline string_view NominalNs(const TypeExpr *t) {
+    switch (t->kind) {
+        case TY_STRUCT:  return t->struc->st->ns;
+        case TY_ENUM:    return t->enu->en->ns;
+        case TY_VARIANT: return NominalNs(t->var->adt);
+        default:         return {};
+    }
+}
+
+NODE(FnDecl)
+    SFunction *sf;
+    FnDecl(Line l, SFunction *_sf) : Node(l, NKind), sf(_sf) {}
+NODE_END
+
+NODE(StructDecl)
+    SStruct *st;
+    StructDecl(Line l, SStruct *_st) : Node(l, NKind), st(_st) {}
+NODE_END
+
+NODE(EnumDecl)
+    SEnum *en;
+    EnumDecl(Line l, SEnum *_en) : Node(l, NKind), en(_en) {}
+NODE_END
+
+NODE(AliasDecl)
+    SAlias *al;
+    AliasDecl(Line l, SAlias *_al) : Node(l, NKind), al(_al) {}
+NODE_END
+
+#undef NODE
+#undef NODE_END
+
+// ---------------------------------------------------------------------------
+// Typecheck data. Everything below is produced by typecheck.h; it lives here
+// because later phases (optimization/codegen) consume it alongside the AST.
+
+// Size classes (§1.1): the max over a compound's parts, subject to placement.
+enum SizeClass { SC_FIXED, SC_VARIABLE, SC_RESIZABLE };
+
+// One checked variable: a global, local, parameter, or binding (for/match/
+// function value). Created per specialization, so generic code has concrete
+// types here. Also carries the transient flow state (assigned/narrowed) used
+// while its scope is being checked.
+struct VarDef {
+    string_view name;
+    TypeExpr *type = nullptr;   // Concrete (post-substitution) declared type.
+    Line line;
+    bool isvar = false;         // Reassignable (§4.4).
+    // A by-value `for` or `match` binding: a copy of the element, which a
+    // write would silently update instead of the element, so none is
+    // allowed (§6.5, §8.1).
+    bool copybind = false;
+    bool isglobal = false;
+    bool isparam = false;
+    // One of the results of `a, b = f();` (VarDecl::results), which its one
+    // assignment takes as the call's value: constructed at the target, as
+    // `a = f()` would construct it (TypeCheck::CheckAssign).
+    bool resulttemp = false;
+    // Not a variable but a temporary's storage (typecheck.h TempRoot): a
+    // call's result, say, which lasts until the end of the statement that
+    // made it.
+    bool istemp = false;
+    int reusable = 0;           // A reusable pool (§5.4): RU_SLOTS or RU_SLICES.
+    bool nonneg = false;        // A `let` whose initializer was non-negative (§6.1).
+    VarDef *nonnegfrom = nullptr;   // The initializer's Val::nonnegfrom.
+    // A named constant: a `let` global with no annotated type whose
+    // initializer is an integer constant (§3.1), or a `let` with no annotated
+    // type whose initializer is a float of literals and integers (§6.3). It
+    // reads as that constant, or as such a float, and a use adapting it as a
+    // literal relies on its keeping that value (TypeCheck::RelyOnNamed).
+    bool constlit = false;
+    bool constuns = false;      // constval's bits are a u64 above i64.max (Val::uns).
+    int64_t constval = 0;
+    bool constnot = false;      // A constlit whose constval is `~c`, c >= 0 (Val::notconst).
+    bool constflt = false;      // A float constant, of value constfval.
+    double constfval = 0;
+    VarDef *constfrom = nullptr;    // The initializer's Val::constfrom.
+    // A `let` initialized to exactly `X.len` (§5.2): the path X, as checked
+    // there. Resizing the same X back to it is a balanced shrink.
+    Node *markof = nullptr;
+    FnSpec *ownerspec = nullptr;  // Null for globals.
+    // Lifetime depth for the outlives check (§9.2): globals 0, then one per
+    // nested scope along the current compile-time call path. Only comparable
+    // between variables simultaneously live on that path.
+    int depth = 0;
+    // Synthetic per-class parameter roots only (typecheck.h): the call-site
+    // root the class was created from, and whether every parameter in the
+    // class is a reference to a resizable-class value. No function in a
+    // recursive cycle holds such a value across a call into the cycle (§7.8),
+    // so references in a pool class are rooted outside the cycle and exempt
+    // from the cycle store rule.
+    VarDef *classfrom = nullptr;
+    bool poolclass = false;
+    // The global pool every call site's argument for this class is rooted in
+    // (§3.9); null where there is none, which is the usual case.
+    VarDef *classpool = nullptr;
+    // Synthetic class roots only: the call-site root holds a grow-shrink
+    // array, so the shrink rules follow the class into the body (§5.2);
+    // `gselems`: the element types of the grow-shrink arrays that root
+    // holds, which say what a pointee lying in one can be
+    // (TypeCheck::GrowShrinkCanHold); `gsvia`: the array is not that root's
+    // own but one the argument may point into otherwise -- another of its
+    // roots, or what a slice it refers to views -- so its elements may be
+    // anything. Keyed (RootArg), so every call site the body serves agrees
+    // on them, which classfrom, the first one's root, need not.
+    bool growshrink = false;
+    bool gsvia = false;
+    vector<TypeExpr *> gselems;
+    // Synthetic class roots only: the types of the caller's storage the
+    // class's parameters lead to through their references, at any remove
+    // (TypeCheck::ReachedThroughRefs of each parameter's type), which an
+    // inexact root at the class stands for beside the class's own storage
+    // (TypeCheck::BoundReach).
+    vector<TypeExpr *> classreach;
+    // Synthetic roots only (classes, a render's buffer): element types the
+    // storage they stand for holds only as the elements of one array, so
+    // that a reference to one rooted there is an element of that array
+    // (TypeCheck::OneArrayOf). Keyed for classes (RootArg::onearray).
+    vector<TypeExpr *> onearray;
+    // Synthetic class roots of a `T[:]&` parameter with a view only
+    // (FnSpec::views): a variable of the body standing for the slice the
+    // caller's slot holds, whose binding a load through the class sees and
+    // every store that may write the slot joins (TypeCheck::SlotView,
+    // NoteSlotStore).
+    VarDef *heldslice = nullptr;
+    // A reference parameter's aggregate contents, keyed as a view beside
+    // slice slots. Stores through any possibly aliased class join this
+    // holder, so reads retain only roots known at entry or stored since.
+    VarDef *heldholder = nullptr;
+    // For variables of reference/slice type: where the value they hold
+    // points, fixed at first binding (see typecheck.h header note). A
+    // null-initialized optional has no commitment yet (refrootknown false),
+    // and counts as writable until it makes one.
+    Prov ref { .writable = true };
+    bool refrootknown = false;
+    // For variables whose type holds plain references or slices by value
+    // (a struct with a slice field, an array of such): where the references
+    // stored into it so far may point, which bounds what a copy of the value
+    // may point at (§9.2). Every store into it adds to it; empty until one.
+    // One at a parameter's class is marked where every store of it put views
+    // that class's storage holds (RootAlt::classread).
+    Roots contents;
+    bool contentbyteview = false; // A stored reference may view raw typed storage.
+    // A literal parameter (§7.7): reads as a constant of unknown value.
+    // A function-value parameter bound from one stands for that one.
+    bool unsized = false;
+    VarDef *unsizedorigin = nullptr;
+    // Flow state during checking: assigned on every path here, and on some
+    // path here -- a `let` is assigned only where it is on none (§4.4).
+    bool assigned = false;
+    bool maybeassigned = false;
+    TypeExpr *narrowed = nullptr;  // T? narrowed to T& in the current region.
+    bool captured = false;         // Accessed from a nested fn / function value.
+    // The first comparison relying on the variable being non-negative
+    // (§6.1), and the first writable reference bound to it (§4.4), whichever
+    // makes the other an error (TypeCheck::RelyOnNonneg, NoteWritableRef).
+    // The first balanced resize back to it as a mark (§5.2) relies on it
+    // too, but a resize after the reference is merely unbalanced
+    // (TypeCheck::ResizesToMark). So does the first compile-time size, fill
+    // count or match pattern taking a global at its initializer's value, as
+    // a named constant (§11.1, TypeCheck::RelyOnConstant); `constwhat` says
+    // which. Like `captured`, they outlast a re-check of the variable's scope.
+    Node *nonneguse = nullptr;
+    Node *markuse = nullptr;
+    Node *constuse = nullptr;
+    const char *constwhat = nullptr;
+    Node *refwrite = nullptr;
+    // Globals only: the first compile-time size, capacity or fill count
+    // taking the `.len` (`extentcap`: the `.cap`) its initializer gives
+    // (§3.3), which a type not fixing it would let change
+    // (TypeCheck::RelyOnExtent); `extentwhat` says which.
+    Node *extentuse = nullptr;
+    const char *extentwhat = nullptr;
+    bool extentcap = false;
+    // A slice variable a reference to whose slot has been made (§3.8), so
+    // that a reference read out of storage, or a parameter's class, may name
+    // it (TypeCheck::RootCandidates, StoreIntoSlot). Kept as the marks are.
+    bool slotref = false;
+};
+
+// Lifetime depth of a root (§9.2): a global's or static data's is 0.
+inline int RootDepth(const VarDef *v) { return v ? v->depth : 0; }
+
+inline VarDef *Roots::Root() const {
+    VarDef *r = nullptr;
+    for (size_t i = 0; i < alts.size(); i++) {
+        auto a = alts[i].root;
+        // Static data ties with the globals; a global is the one to name.
+        if (!i || RootDepth(a) > RootDepth(r) || (a && !r)) r = a;
+    }
+    return r;
+}
+
+inline VarDef *Roots::From() const {
+    VarDef *f = nullptr;
+    for (auto &a : alts)
+        if (a.from && (!f || RootDepth(a.root) > RootDepth(f))) f = a.from;
+    return f;
+}
+
+// One run of fields with their instantiated types, aligned (a pad's type is
+// null): what a nominal type's values are made of. A struct type has one
+// run, a variant type its variant's, and an enum type one per variant, its
+// tag aside. Every pass that walks a type's contents does so run by run.
+struct FieldRun {
+    const vector<Field> *fields = nullptr;
+    const vector<TypeExpr *> *ftypes = nullptr;
+};
+
+// A struct type with concrete generic arguments: substituted field types plus
+// the derived properties every user of the type needs.
+struct StructInst {
+    SStruct *st = nullptr;
+    vector<TypeExpr *> args;
+    vector<TypeExpr *> ftypes;     // Aligned with st->fields; null for pads.
+    FieldRun run;                  // st->fields with ftypes (RunsOf).
+    SizeClass sclass = SC_FIXED;
+    bool flat = true;
+    bool validated = false;        // Guards against recursive by-value nesting.
+    // Its build was cut short by the error that ended the root it was in
+    // (TypeCheck::CheckRoot): never used again, and a use of it ends its own
+    // root silently, as a consequence of the error reported
+    // (TypeCheck::GetStructInst).
+    bool failed = false;
+    // Resizable-tailed with an all-fixed prefix free of relative references:
+    // a frame object (C.2), whose fixed fields and tail header live in the
+    // owning frame and whose tail alone occupies the data stack.
+    bool frameobj = false;
+};
+
+// An enum type with concrete generic arguments.
+struct EnumInst {
+    SEnum *en = nullptr;
+    vector<TypeExpr *> args;
+    vector<vector<TypeExpr *>> vftypes;   // Per variant, per field.
+    vector<FieldRun> runs;                // Per variant, its fields and vftypes.
+    bool allfixed = true;                 // Every payload is fixed-size.
+    // A payload holds self-relative references, which only a binding by
+    // reference reads: a copy does not keep them (§3.9), and fixed mode
+    // binds its payloads by value alone (§3.5).
+    bool selfrel = false;
+    SizeClass varclass = SC_VARIABLE;     // Class when used in variable mode.
+    bool flat = true;
+    bool validated = false;
+    bool failed = false;                  // As StructInst::failed.
+    // Per variant while the instance is being built: 1 while its payload's
+    // fields are being validated, 2 once they are.
+    vector<uint8_t> vbuilt;
+};
+
+inline span<const FieldRun> RunsOf(const StructInst *si) { return { &si->run, 1 }; }
+inline span<const FieldRun> RunsOf(const EnumInst *ei) { return ei->runs; }
+inline span<const FieldRun> RunsOf(const EnumInst *ei, int vi) { return { &ei->runs[vi], 1 }; }
+
+// Whether `f` holds of some field type in these runs, and the same for every
+// one of them; pads (a null type) are skipped. Which runs a type has is the
+// pass's own question -- the checker instantiates the type to answer it, the
+// backend reads the instantiation the checker left behind -- but what to do
+// with them is this.
+template<typename F> bool AnyFieldOf(span<const FieldRun> runs, F f) {
+    for (auto &run : runs)
+        for (auto ft : *run.ftypes) if (ft && f(ft)) return true;
+    return false;
+}
+
+template<typename F> void EachFieldOf(span<const FieldRun> runs, F f) {
+    for (auto &run : runs)
+        for (auto ft : *run.ftypes) if (ft) f(ft);
+}
+
+// Whether a value of type t holds a relative reference by value, at any
+// depth, variable-size parts included but not what a plain reference or a
+// slice leads to: any with `inpool`, else a self-relative one, whose offset
+// depends on where the value sits (§3.9). `runs` is the pass's FieldRuns, as
+// for AnyFieldOf.
+template<typename R> bool HasRelRefOf(TypeExpr *t, bool inpool, R runs) {
+    switch (t->kind) {
+        case TY_REF: return IsRelRef(t) && (inpool || !t->ref->pool);
+        case TY_ARRAY: return HasRelRefOf(t->arr->sub, inpool, runs);
+        default:
+            return AnyFieldOf(runs(t), [&](TypeExpr *ft) { return HasRelRefOf(ft, inpool, runs); });
+    }
+}
+
+// Call-site facts about one reference/slice or holder parameter, part of the
+// specialization key (§10.2): the relative-outlives class of its root among
+// the call's reference arguments (0 = static, 1 = outermost, ...), where
+// its depth stands, and the provenance bits.
+struct RootArg {
+    int cls = 0;
+    bool writable = true;
+    int reusable = 0;
+    // The argument may point into a grow-shrink array (§5.2): some root of
+    // its holds one, or, for a reference to a slice, the slice may. Part of
+    // the key: a body is checked against its shrink rules only where they
+    // apply, and such a parameter is never stored. `gsvia`: that array is
+    // not the one the class's own root holds (VarDef::gsvia); else
+    // `gselems`, the element types of the root's grow-shrink arrays
+    // (VarDef::gselems). Both part of the key, `gselems` compared apart
+    // from the rest (GetOrCreateSpec), as types: the body's store rule and
+    // shrink scans ask them what a reference into the argument's storage
+    // may point into (TypeCheck::GrowShrinkCanHold).
+    bool growshrink = false;
+    bool gsvia = false;
+    vector<TypeExpr *> gselems;
+    // The element types of arrays the class's parameters lead to that its
+    // root's storage holds only as the elements of one array
+    // (VarDef::onearray): what index_of (§3.3) and a slice pool's checks
+    // (§5.4) take a reference rooted at the class to be an element of. Part
+    // of the key, compared apart from the rest as `gselems` is.
+    vector<TypeExpr *> onearray;
+    // Where `growshrink` is set by a root of the argument, or of a holder's
+    // contents, or by a grow-shrink array the argument's pointee holds:
+    // every place it may point was loaded out of a field, an element or a
+    // global, which no reference into a grow-shrink array's elements is
+    // stored in (RootAlt::slotread). Part of the key: the parameter is then
+    // a slot read in the body, where it may be stored, while what the body
+    // reaches through it still meets its class's grow-shrink array.
+    bool slotread = false;
+    // The argument points nowhere yet: a reference variable read in a pass of
+    // a loop before the pass that binds it (TypeCheck::RefProvOf). The
+    // parameter then has no roots in the body, which no rule reads, so the
+    // body's summary through it is empty; part of the key, so that only such
+    // a call reaches the specialization, and the loop's last pass never does.
+    bool unknown = false;
+    // The argument is a bytes_of view (Prov::byteview). Part of the key for
+    // the same reason growshrink is: the shrink scans dismiss a slice whose
+    // pointee the root cannot hold, and this is the one that survives that.
+    bool byteview = false;
+    // Roots::Exact() of the roots the argument's class stands for (where it
+    // may point, or a holder's contents may), ANDed over every call site that
+    // reaches the specialization. Deliberately not part of the key: within
+    // the callee a class always names one root's storage (typecheck.h keeps
+    // an inexactly rooted argument out of every other argument's class), and
+    // the only use of this bit -- codegen's proof that two classes are
+    // *different* arrays -- runs after every call site has been seen.
+    bool exact = true;
+    // For a holder parameter (§9.2): everything the argument holds points
+    // into the one array its class names, which the body then takes as that
+    // array exactly (CheckSpecBody). Part of the key, unlike `exact`: a
+    // reference in a class is in that array whatever the call site, but a
+    // holder's class only bounds the arrays its references point into, by the
+    // deepest of them. Never set for a recursive function, whose back edges
+    // reuse its body whatever they pass (§7.8).
+    bool heldexact = false;
+    // The argument is a different array from every other concrete argument at
+    // its call site: a global or a function's variable with no class of a
+    // parameter beside it, a variable created inside the activation whose
+    // classes are beside it, or one of those classes with nothing else beside
+    // them (GetOrCreateSpec). ANDed over call sites and not part of the key,
+    // like `exact`.
+    bool concrete = false;
+    // For a class: the specialization and index of each parameter it stood
+    // for at some call site. It stays concrete only while all of those are
+    // concrete and exact, which SettleParamRootExactness settles.
+    vector<pair<FnSpec *, int>> via;
+    // The global pool the argument is exactly rooted in, where that global is
+    // named by some `T&<w in pool>` type in the program (§3.9); null
+    // otherwise, which is every argument of a program that has no such type.
+    // Unlike `exact` this *is* part of the key: a relative store measures from
+    // this pool's base, so a call site passing a different one is a different
+    // specialization rather than a fact to weaken afterwards.
+    VarDef *pool = nullptr;
+    // The depth the class takes in the body (TypeCheck::ClassDepth). Not part
+    // of the key: the body is checked with its first call site's depths, and
+    // `depthkey` says which other call sites those stand for.
+    int depth = 0;
+    // What the key keeps of `depth`: the depth itself where it is within the
+    // reach of a lexical environment the body can see (only a global's, 0,
+    // for a body that sees none), else its rank among the distinct depths of
+    // the call's classes beyond that, negated. Calls that agree on it agree
+    // on which class outlives which, which ones share a depth, and how each
+    // stands against every variable the body can name outside itself, which
+    // settles every comparison of a class depth in the body. Part of the
+    // key, but compared apart from the rest (GetOrCreateSpec): a back edge
+    // whose classes differ only here still passes the arrays they describe.
+    int depthkey = 0;
+    bool operator==(const RootArg &o) const {
+        return cls == o.cls && writable == o.writable && reusable == o.reusable &&
+               growshrink == o.growshrink && gsvia == o.gsvia && slotread == o.slotread &&
+               byteview == o.byteview && pool == o.pool && heldexact == o.heldexact &&
+               unknown == o.unknown;
+    }
+};
+
+// How a body's shrinks of one array leave it (§5.2): balanced where each
+// resizes it back to a length it had during the call, or is a balanced call,
+// so that it is never shorter than when the call began and no view taken
+// before the call can tell; unbalanced where one may leave it shorter. A grow-only array's
+// shrinks are never balanced (§5.1): a callee may store references to its
+// new elements into the caller's holders before popping them.
+enum ShrinkBalance { SB_BALANCED, SB_UNBALANCED };
+
+// A shrink a body records against what one of its parameters' or outside
+// roots' storage only leads to, through the references it holds: an array
+// of the given type (TypeCheck::ShrinkTargets).
+template<typename K> struct BoundShrink {
+    K key;
+    TypeExpr *type = nullptr;
+    ShrinkBalance balance = SB_UNBALANCED;
+};
+
+// A reference, slice or holder value stored into a container (§9.2): what
+// the shrink rules (§5.1) consult to know whether the container may point
+// into an array.
+struct StoreEvent {
+    VarDef *container = nullptr;
+    // What was stored: a reference to something rooted at `root`, or (a
+    // copy of) the contents of container `src` -- a holder value read out
+    // of it, whose own events say what it points at. Never a local reference
+    // or slice variable, which holds what its binding says, nor any but the
+    // one container the value came out of (TypeCheck::StoreSource).
+    VarDef *root = nullptr;      // Null: static data.
+    VarDef *src = nullptr;
+    bool exact = false;
+    TypeExpr *pointee = nullptr; // Null: unknown (a holder value's contents).
+    bool byteview = false;
+    Line at;
+    // The type of the storage the slot stored into lies in, as the
+    // destination reached it (Prov::reached; the slot's own type where no
+    // reference was crossed), by which the storage an inexact root may stand
+    // for is enumerated (TypeCheck::ShrinkTargets); null for a binding's
+    // contents, which are the variable's own.
+    TypeExpr *reached = nullptr;
+    // Stored not into the container's own storage but into storage its
+    // references lead to, which it only bounds: a parameter's class stands
+    // for the caller's, which the call widens to the candidates there.
+    bool bound = false;
+    // Stored into the slot a reference to a slice names, which assigns the
+    // slice variable that slot may be (TypeCheck::StoreIntoSlot).
+    bool slot = false;
+    // What was stored is a reference to a slice: `root` is the storage its
+    // slot lies in, which may be a slice variable, whose binding rather than
+    // a store record says what the slot holds
+    // (TypeCheck::StoredSlotMayPointInto).
+    bool sliceref = false;
+    // What was stored came out of the storage parameter class `src` stands
+    // for and nothing else: one of the views that storage holds
+    // (RootAlt::classread), or a copy of a holder lying there alone
+    // (Val::holderfrom). It holds what that storage holds -- what the
+    // activation stored there, and what its callers did, which each call
+    // judges -- rather than whatever the class bounds. A class `src` without
+    // it only bounds what was stored: a value that may also be anything else
+    // rooted at the class still names it as the container it was read out
+    // of (RootAlt::from).
+    bool classread = false;
+};
+
+// A shrink, and a reference, slice or holder still used after it that only
+// the call sites can tell apart from the shrunk array (§5.1, §5.2): one of
+// the two roots is a parameter's class, which a call site maps onto its
+// argument's root; the other is too, or is a global or a variable or class
+// of a lexical parent.
+struct LiveShrink {
+    VarDef *shrunk = nullptr;
+    bool shrunkexact = true;
+    // The type of the array shrunk where `shrunk` only bounds it, leading to
+    // it through the references its storage holds; null where it holds it.
+    TypeExpr *bound = nullptr;
+    VarDef *live = nullptr;      // The root of what is still used.
+    bool liveexact = true;
+    TypeExpr *pointee = nullptr; // What it points at; null: unknown.
+    bool byteview = false;
+    bool growonly = false;       // The shrink is §5.1's, else §5.2's.
+    string name;                 // What is still used, as the error names it.
+    // What is still used reaches what `live`'s storage holds rather than
+    // that storage: the holder a reference parameter names, or the elements
+    // a slice parameter views, of type `pointee` (§5.1). `live` is a
+    // parameter's class; a call judges where what its argument holds may
+    // point by its record of it (TypeCheck::HeldViews).
+    bool contents = false;
+    // What is still used is a print, str or format walking a `pointee` in
+    // place (TypeCheck::BodyState::renderwalks), which a shrink of storage
+    // it lies in may relay out, whatever kind the shrink is
+    // (TypeCheck::ShrinkMayMove).
+    bool inplace = false;
+};
+
+// One return value's reference roots, or for a holder the roots of what it
+// holds: every root a return gives, which each call maps and merges as it
+// would the branches of an `if` (§9.2), and the cycle fixpoint's prediction
+// of them (§7.8).
+struct RetRoot {
+    Roots alts;                // Every root the checked returns give.
+    bool writable = true;      // Writable only where every return is (§9.5).
+    bool byteview = false;
+    bool freshview = false;    // Prov::freshview.
+    bool set = false;          // A non-null return has recorded its root.
+};
+
+// A literal parameter's contact with a type (§7.7): what the literal at
+// each call site must fit.
+struct LitAdapt {
+    int param = 0;
+    TypeExpr *type = nullptr;
+    Line at;
+};
+// A literal parameter passed on as a literal: the callee's contacts apply.
+struct LitFlow {
+    int param = 0;
+    FnSpec *to = nullptr;
+    int toparam = 0;
+};
+
+// What a body found of a variable outside its activation that it names (a
+// nested function's free variable, one a function value it calls names):
+// the variable's checking state (VarDef) as the body's check began with it.
+struct EnvRead {
+    VarDef *var = nullptr;
+    bool assigned = false;
+    bool maybeassigned = false;
+    bool refrootknown = false;
+    Prov ref;
+    Roots contents;
+    bool contentbyteview = false;
+    bool slotref = false;
+};
+
+// An exit of a body outside a specialization's activation that its check
+// took (FnSpec::outerexits).
+struct OuterExit {
+    FnSpec *target = nullptr;
+    set<VarDef *> assigned, maybeassigned;
+};
+
+// The analysis a checked body exposes to its callers. A recursive round
+// moves this record aside and starts a fresh one; specialization identity,
+// parameters, lexical environment and annotated code are never snapshotted.
+// The event range locates this round's stores in TypeCheck::storeevents; it
+// is replay metadata, not a fact compared for convergence.
+struct FnRecord {
+    // Relative links need their location and target in the same root.
+    // A result location is supplied by the caller; other destinations
+    // name parameter classes or lexical storage, mapped as return roots are.
+    struct RelativeStore {
+        Roots source, destination;
+        int result = -1;
+    };
+    vector<RelativeStore> relativestores;
+    // Whether this specialization can resume its immediate Goose caller.
+    // A return-from to an outer body does not, although its C function returns
+    // normally to propagate that exit. Unknown recursive calls may return.
+    bool mayreturn = true;
+    vector<RetRoot> retroots;      // Per ret: the checked returns' roots and the prediction.
+    // External optional bindings this body (or a callee) may rebind.
+    set<VarDef *> reboundoptionals;
+    // Arrays the body may shrink, itself or through its callees (§5.1,
+    // §5.2): global/captured roots, and indices of parameters whose pointee
+    // shrinks, each with how every shrink of it leaves it.
+    map<VarDef *, ShrinkBalance> shrinkexternals;
+    // Effect keys below: [0, params.size()) names the argument's class;
+    // [params.size(), 2 * params.size()) names its view's contents class.
+    map<int, ShrinkBalance> shrinkparams;
+    // Shrinks of an array of the given type that such a root's storage only
+    // leads to, through the references it holds: the call counts each as a
+    // shrink of any array of that type the root, or the argument's root,
+    // bounds (TypeCheck::ShrinkTargets).
+    vector<BoundShrink<VarDef *>> shrinkexternalbounds;
+    vector<BoundShrink<int>> shrinkparambounds;
+    // The body's shrinks, itself or through its callees, while something it
+    // still uses may point into the shrunk array as only the call sites can
+    // tell: each a parameter's class against another class, or against an
+    // array or view outside the activation.
+    vector<LiveShrink> liveshrinks;
+    // Arrays the body may grow -- push, append, a pool allocation, format,
+    // resize, a whole assignment -- itself or through its callees
+    // (§1.3(4)), in the same form, each with the types of the resizable
+    // arrays grown, null for one the checker cannot tell
+    // (TypeCheck::GrowEvent::arr).
+    map<VarDef *, vector<TypeExpr *>> growexternals;
+    map<int, vector<TypeExpr *>> growparams;
+    // Stores into the caller's storage, through reference parameters'
+    // class roots (§5.1): the call sites map them onto their arguments.
+    vector<StoreEvent> classevents;
+    // Where in the body each grow-only shrink above stands, as its call
+    // sites judge it (§5.1): of a parameter's pointee or what it leads to
+    // (`param`), or of an external, the bound's type where the root only
+    // bounds it; how many of `classevents` were on record at it, at its
+    // latest occurrence (the later ones were stored after it); and the parts
+    // of reference parameters' pointees every occurrence had emptied
+    // (TypeCheck::Kill), each a parameter's index and the part's path.
+    struct ShrinkOrder {
+        int param = -1;
+        VarDef *external = nullptr;
+        TypeExpr *bound = nullptr;
+        size_t before = 0;
+        vector<pair<int, string>> kills;
+    };
+    vector<ShrinkOrder> shrinkorders;
+    size_t eventstart = 0;         // storeevents.size() when the body's check began.
+    size_t eventend = 0;           // And when it ended.
+};
+
+// One monomorphic specialization of a function: the unit of typechecking and
+// of later codegen. The body is an Ast-owned clone with annotations filled;
+// only a recursive round's previous analysis record is owned here.
+struct FnSpec {
+    SFunction *sf = nullptr;
+    FnSpec *lexparent = nullptr;   // Defining specialization (or body), for nested fns.
+    // Not a specialization but a function value's body as one check of its
+    // call sees it (§7.6): the lexical parent of the functions and function
+    // values written in that body, which may name its parameters and locals.
+    // Each check clones the body afresh, so each has one of these. Its
+    // lexparent is where the value was written, its sf the named function
+    // whose body that is.
+    bool isfunval = false;
+    vector<TypeExpr *> argtypes;   // Concrete parameter types (the key, with the below).
+    // Aligned with argtypes/params; a parameter holding no roots has the
+    // default entry. Every pass uses the parameter index directly.
+    vector<RootArg> roots;
+    // Aligned the same way, for reference parameters whose contents only
+    // the callee's parameters reach (TypeCheck::HasView): the class of a
+    // slice slot's binding or an aggregate's known single-root contents,
+    // numbered with `roots`. Loads through the parameter's class see the
+    // view (VarDef::heldslice/heldholder), including stores made while the
+    // body runs. cls is -1 for every other parameter. Part of the key.
+    vector<RootArg> views;
+    // Optional facts in the lexical environment at specialization entry.
+    vector<VarDef *> narrowedenv;
+    // What the body read of the variables outside its activation that it, or
+    // a callee checked or reused for it, names: part of the key, since a
+    // body checked while one of them was unassigned, or pointed or held
+    // references elsewhere, says nothing of a call where it is otherwise
+    // (TypeCheck::EnvUnchanged). Filled while the body is checked.
+    vector<EnvRead> envreads;
+    // The same variables as the check left them, which a call reusing it
+    // leaves them as too (TypeCheck::ReplayEnvExits).
+    vector<EnvRead> envexits;
+    // Exits of the bodies outside this one's activation that its check took
+    // -- a function value's `return`, a `return from` -- each target with
+    // the variables outside it that the activation had assigned at all of
+    // them, where they were unassigned when it began, and those it may have
+    // assigned at any of them, where none could be when it began: a call
+    // reusing it takes them again (TypeCheck::ReplayOuterExits).
+    vector<OuterExit> outerexits;
+    vector<int> litparams;         // Parameters that are literals (§7.7): part of the key.
+    vector<LitAdapt> litadapts;    // The types those parameters adapted to in the body.
+    vector<LitFlow> litflows;      // Where they were passed on as literals.
+    vector<pair<string_view, FnValBind>> fnvals;  // Generic name -> bound function value.
+    vector<pair<string_view, TypeExpr *>> bindings;  // Generic name -> concrete type.
+    Block *body = nullptr;         // Cloned, annotated copy of sf->body.
+    vector<VarDef *> params;
+    vector<TypeExpr *> rets;       // TY_VOID-free: empty = no return values.
+    bool retsknown = false;
+    bool inprogress = false;
+    // Its check was in progress when the root being checked ended on an
+    // error (TypeCheck::CheckRoot): checked no further, never reused, and a
+    // call that would reuse it ends its own root silently, as a
+    // consequence of the error reported (TypeCheck::GetOrCreateSpec).
+    bool failed = false;
+    // Made by the exemplar check of this generic function, which nothing
+    // instantiated (TypeCheck::CheckExemplar): its types are the opaque
+    // bindings', and it is in Ast::exemplarspecs, not fnspecs.
+    SFunction *exemplar = nullptr;
+    bool incycle = false;          // Part of a recursive cycle (§7.8).
+    // The cycle member this one was merged under; following the links ends
+    // at the outermost member on the call path that found the cycle, which
+    // is still in progress exactly while the cycle can grow (TypeCheck::
+    // CycleHead).
+    FnSpec *cyclelink = nullptr;
+    // A cycle is checked in rounds until what its bodies record settles
+    // (TypeCheck::CheckSpecBody): the head's members, and each member's
+    // record from the round before, which the calls back into it read while
+    // it is in progress -- none in the first round, whose back edges have no
+    // effects and results that point nowhere yet. `stale`: a member the
+    // next round has yet to check again, and once the cycle is checked, one
+    // its last round did not, which no later call reuses. The class roots
+    // its parameters stand at are made once and kept across rounds
+    // (TypeCheck::ThreadedClass).
+    vector<FnSpec *> cyclemembers;
+    FnRecord record;
+    unique_ptr<FnRecord> prev;
+    int rounds = 0;
+    bool stale = false;
+    vector<VarDef *> classroots;
+    Line joinedat;                 // The call that joined it to its cycle.
+    set<FnSpec *> needs;           // Concrete `return from` targets enclosing every call.
+    bool hasdefer = false;         // The body, a function value's run in it included, has a `defer`.
+    // Calls that reused this spec, with the call path each was checked on: a
+    // target recorded later applies to those paths too. The call that created
+    // the spec needs no entry, since its path starts every path a target
+    // reaches the spec by.
+    vector<pair<Node *, vector<pair<SFunction *, FnSpec *>>>> neededges;
+    // The body stored a value rooted at one of its parameters' classes into
+    // a variable outside its activation, or bound a reference variable there
+    // to one, which its call mapped onto that call's arguments in place
+    // (TypeCheck::ApplyCalleeStores), or a function value's body checked in
+    // it returned a reference out of it into the record of a function outside
+    // it, mapped the same way (TypeCheck::ReturnThroughCalls): no other call
+    // reuses the check.
+    bool storesout = false;
+    // A value with self-relative references is returned as the body's named
+    // result, which is right only where it is built at the destination
+    // (TypeCheck::CheckNamedResultUses): the body is never inlined, where a
+    // destination might not take it in place (Optimizer::Scan).
+    bool relnamedresult = false;
+    int id = 0;                    // Unique, for diagnostics/codegen naming.
+    // Filled by the optimizer (optimize.h):
+    int uses = 0;                  // Call sites in live code (tag-dispatch entries included).
+    bool live = false;             // Reachable from main / threads / global initializers.
+    // Left out of line where the inliner could have inlined it, as a cold
+    // branch's only callee (Optimizer::TryInline): the C compiler is told so
+    // too, since it inlines a function with one caller whatever its size.
+    bool outofline = false;
+    // Goose wanted to inline this function at some call but could not
+    // (Optimizer::TryInline), so it is declared GS_INLINE in C and the C
+    // compiler inlines it.
+    bool cinline = false;
+};
+
+// ---------------------------------------------------------------------------
+// Namespaces (docs/design/namespaces.md): one symbol-table scope each, the
+// global one named "". Within one, types (structs/enums/aliases) share a
+// namespace, functions overload, and globals have their own.
+
+struct Namespace {
+    unordered_map<string_view, SStruct *> structmap;
+    unordered_map<string_view, SEnum *> enummap;
+    unordered_map<string_view, SAlias *> aliasmap;
+    unordered_map<string_view, vector<SFunction *>> functionmap;
+    unordered_map<string_view, VarDecl *> globalmap;
+
+    bool TypeNameExists(string_view name) const {
+        return structmap.count(name) || enummap.count(name) || aliasmap.count(name);
+    }
+};
+
+// A name as a reference spells it: `leaf`, `ns::leaf`, or `::leaf` for the
+// global declaration a namespaced one shadows. `ns` is where to look: the
+// qualifier, else the namespace the reference was written in.
+struct NameRef {
+    string_view leaf;
+    string_view ns;
+    bool qualified = false;      // Search ns alone, never the global fallback.
+};
+
+inline NameRef SplitName(string_view name, string_view usens) {
+    auto pos = name.find("::");
+    if (pos == string_view::npos) return { name, usens, false };
+    return { name.substr(pos + 2), name.substr(0, pos), true };
+}
+
+// The leaf of `::name`, for the builtins, which are global; any other
+// spelling unchanged, so `ns::push` never finds the builtin.
+inline string_view GlobalLeaf(string_view name) {
+    return name.substr(0, 2) == "::" ? name.substr(2) : name;
+}
+
+// ---------------------------------------------------------------------------
+// Ast: owner of everything produced by parsing.
+
+// A package (docs/design/packages.md §4.1): a directory of modules, under
+// which a file's `import a.b;` resolves `a/b.goose`. Package 0 is the
+// program, rooted at its root file's directory; a standard library
+// directory is one too, once a module in it is reached.
+// A sidecar's dylibs entry (§7.10): the spelling to open the shared
+// library a block names `name` by, on every platform (`any`) or on one;
+// empty where the entry says nothing and the derived spelling applies.
+struct DylibSpelling {
+    string name, any, onwindows, onmacos, onlinux;
+    const string &On(const char *platform) const {
+        return string_view(platform) == "_windows" ? onwindows
+             : string_view(platform) == "_macos"   ? onmacos
+                                                   : onlinux;
+    }
+    string &On(const char *platform) {
+        return const_cast<string &>(std::as_const(*this).On(platform));
+    }
+};
+
+struct Package {
+    string name;
+    string root;          // With its trailing separator, or "" for the working directory.
+    bool stdlib = false;
+    string cachekey;      // A git source's place under GOOSE_HOME/pkg; "" for a path.
+    int builtin = -1;     // Its index in builtin_packages when compiled into the compiler.
+    // The sidecar beside its entry, `<name>.build` (docs/design/packages.md
+    // §4.7), read when the package is loaded: the C it compiles, which makes
+    // its native part (§5), and the rest of its settings.
+    string sidecar;
+    bool hassidecar = false;
+    vector<string> csources, cincludes;     // Absolute.
+    vector<string> cdefines, cflags_cc, cflags_msvc, clibs;
+    string cmake_target;
+    vector<string> cmake_options;
+    // Directories whose files are none of its own (§4.7): absolute, forward
+    // slashes, trailing /.
+    vector<string> exclude;
+    bool main_thread_only = false;
+    vector<DylibSpelling> dylibs;           // The sidecar's, by name, each once.
+    string output;                          // A program's executable, relative to its root.
+    vector<int> required;                   // The packages its files require (§4.3), by index.
+
+    bool HasNative() const { return !csources.empty() || !cmake_target.empty(); }
+};
+
+struct Ast {
+    // Non-null only while specializing a const-for fragment. Ordinary clones
+    // retain templates; expansion clones substitute lexically bound uses.
+    ExpansionClone *expansionclone = nullptr;
+    TypeExpr *CloneExpansionType(TypeExpr *t);
+    FieldInit CloneFieldInit(const FieldInit &fi);
+    // Source buffers stay alive here; all string_views point into them. The
+    // contents are heap-boxed so vector growth never moves an SSO buffer.
+    vector<pair<string, unique_ptr<string>>> sources;   // (filename, contents).
+
+    // Where a warning, or an error the compile went on past, goes: stderr,
+    // as its text, or the sink the driver sets to collect it as data
+    // (--diagnostics json, the language server).
+    function<void(const Diagnostic &)> sink;
+    // The errors the compile went on past (Report), in the order found: the
+    // parser's, which it recovers from per statement and declaration, and
+    // the checker's, per root. Any of them fails the compile.
+    vector<Diagnostic> errors;
+
+    // Set where an analysis may be abandoned for a newer one (the language
+    // server, lsp_workspace.h): the parser polls it at each top-level
+    // declaration and the checker at each body and statement, and throw
+    // Cancelled when it is set.
+    const atomic<bool> *cancel = nullptr;
+    void CheckCancel() const {
+        if (cancel && cancel->load(memory_order_relaxed)) throw Cancelled {};
+    }
+    // Set by the language server: the checker gives each generic function
+    // nothing instantiated an exemplar check (TypeCheck::CheckExemplars).
+    bool exemplars = false;
+
+    // Every `import` as a file wrote it, with the file it resolved to: what
+    // a go to definition on the import line opens.
+    struct ImportSite { Line line; Line end; string path; };
+    vector<ImportSite> imports;
+
+    // The text the terminal shows for d (RenderDiagnostic), the source line
+    // it is on included where `withsource`: an error echoes its line, a
+    // warning does not.
+    string DiagnosticText(const Diagnostic &d, bool withsource) const {
+        auto known = d.where.fileidx >= 0 && d.where.fileidx < (int)sources.size();
+        return RenderDiagnostic(d, known ? sources[d.where.fileidx].first : string(),
+                                known && withsource ? string_view(*sources[d.where.fileidx].second)
+                                                    : string_view(),
+                                false);
+    }
+
+    void Warn(Diagnostic d) {
+        d.warning = true;
+        d.text = DiagnosticText(d, false);
+        Emit(d);
+    }
+
+    // An error the compile goes on past: reported as a warning is, at once
+    // as text or through the sink, and kept in `errors`.
+    void Report(Diagnostic d) {
+        d.warning = false;
+        if (d.text.empty()) d.text = DiagnosticText(d, true);
+        errors.push_back(d);
+        Emit(d);
+    }
+
+    void Emit(const Diagnostic &d) {
+        if (sink) sink(d);
+        else PrintDiagnosticText(d.text);
+    }
+
+    // A warning about a place, as the checker and the driver give them.
+    void Warn(DiagLoc where, string message) {
+        Diagnostic d;
+        d.where = where;
+        d.message = std::move(message);
+        Warn(std::move(d));
+    }
+    vector<Package> packages;
+    vector<int> filepkg;                                // Per source, its package.
+
+    vector<Node *> allnodes;
+    vector<TypeExpr *> alltypes;
+    vector<TypeDetail *> typedetails;
+    vector<SFunction *> functions;
+    vector<SStruct *> structs;
+    vector<SEnum *> enums;
+    vector<SAlias *> aliases;
+    // The structs standing for the type names that name nothing
+    // (SStruct::unknown), in no namespace and no declaration list.
+    vector<SStruct *> unknowntypes;
+
+    // Typecheck products (owned here so later phases can rely on them).
+    vector<VarDef *> vardefs;
+    vector<StructInst *> structinsts;
+    vector<EnumInst *> enuminsts;
+    vector<FnSpec *> fnspecs;
+    vector<FnSpec *> fvenvs;     // FnSpec::isfunval environments, which only the checker reads.
+    // The specializations exemplar checks made (FnSpec::exemplar), which
+    // only the language server reads.
+    vector<FnSpec *> exemplarspecs;
+
+    vector<Node *> topdecls;                        // In source/import order.
+    vector<VarDecl *> globals;                      // Initialization order.
+
+    // embed_shader's compiled blobs, compiled once by the checker and emitted
+    // by codegen: a shader file's by its path as resolved from the file
+    // calling it, a shader given as source by that file, stage and source.
+    // And embed_file's bytes, by "file\n" and the path, read the same way.
+    map<string, string> shaders;
+
+    // Every checked tree that runs outside a function body: the global
+    // initializers. `f` gets the slot, so a pass that rewrites trees can
+    // put its result back.
+    template<typename F> void ForEachRootTree(F f) {
+        for (auto g : globals) for (auto &i : g->inits) f(i);
+    }
+
+    // Declarations, by namespace. Qualified spellings (`ns::name`) are
+    // interned here: the lexer delivers their parts as separate tokens.
+    map<string_view, Namespace> namespaces;
+    deque<string> interned;
+
+    // Shared instances of the primitive types.
+    TypeExpr *inttypes[IS_VARINT + 1];
+    TypeExpr *flttypes[FS_F64 + 1];
+    TypeExpr *booltype;
+    TypeExpr *voidtype;
+
+    Ast() {
+        for (int s = IS_I8; s <= IS_VARINT; s++) {
+            inttypes[s] = NewType(TY_INT, Line {});
+            inttypes[s]->intstorage = (IntStorage)s;
+        }
+        for (int s = FS_F32; s <= FS_F64; s++) {
+            flttypes[s] = NewType(TY_FLT, Line {});
+            flttypes[s]->fltstorage = (FltStorage)s;
+        }
+        booltype = NewType(TY_BOOL, Line {});
+        voidtype = NewType(TY_VOID, Line {});
+    }
+
+    ~Ast() {
+        for (auto n : allnodes) delete n;
+        for (auto t : alltypes) delete t;
+        for (auto d : typedetails) delete d;
+        for (auto f : functions) delete f;
+        for (auto s : structs) delete s;
+        for (auto s : unknowntypes) delete s;
+        for (auto e : enums) delete e;
+        for (auto a : aliases) delete a;
+        for (auto v : vardefs) delete v;
+        for (auto i : structinsts) delete i;
+        for (auto i : enuminsts) delete i;
+        for (auto sp : fnspecs) delete sp;
+        for (auto sp : fvenvs) delete sp;
+        for (auto sp : exemplarspecs) delete sp;
+    }
+
+    TypeExpr *NewType(TypeKind kind, Line line) {
+        auto t = new TypeExpr(kind, line);
+        alltypes.push_back(t);
+        return t;
+    }
+
+    // The sizes of the declaration lists at a point of the parse, so that
+    // what a parse abandoned after it can be dropped again (DropSince).
+    struct DeclMark {
+        size_t types = 0, functions = 0, structs = 0, enums = 0, aliases = 0, globals = 0,
+               topdecls = 0;
+    };
+    DeclMark Mark() const {
+        return { alltypes.size(), functions.size(), structs.size(), enums.size(), aliases.size(),
+                 globals.size(), topdecls.size() };
+    }
+
+    // Deletes the types and declarations made since the mark: a parse the
+    // parser backtracked over made them, or a declaration it lost to an
+    // error, and the passes that walk the lists would take them for written
+    // ones. A global registers its name as it is parsed, so one dropped
+    // leaves the namespace too; the other declarations register at their
+    // end, which a dropped one never reached. The nodes stay owned here.
+    void DropSince(const DeclMark &m) {
+        for (auto i = m.types; i < alltypes.size(); i++) delete alltypes[i];
+        alltypes.resize(m.types);
+        for (auto i = m.functions; i < functions.size(); i++) delete functions[i];
+        functions.resize(m.functions);
+        for (auto i = m.structs; i < structs.size(); i++) delete structs[i];
+        structs.resize(m.structs);
+        for (auto i = m.enums; i < enums.size(); i++) delete enums[i];
+        enums.resize(m.enums);
+        for (auto i = m.aliases; i < aliases.size(); i++) delete aliases[i];
+        aliases.resize(m.aliases);
+        for (auto i = m.globals; i < globals.size(); i++) {
+            auto g = globals[i];
+            auto &gm = NS(g->ns).globalmap;
+            for (auto name : g->names)
+                if (auto it = gm.find(name); it != gm.end() && it->second == g) gm.erase(it);
+        }
+        globals.resize(m.globals);
+        topdecls.resize(m.topdecls);
+    }
+
+    // The same type with its contents read-only (§9.5): a fresh node, since
+    // a primitive type's node is shared.
+    TypeExpr *ConstOf(TypeExpr *t) {
+        if (t->cq) return t;
+        auto n = NewType(t->kind, t->line);
+        *n = *t;
+        n->cq = true;
+        return n;
+    }
+
+    // The same type without its own qualifier: what a load of a const value
+    // yields (a copy), and the pointee of a reference to one, whose
+    // constness the reference carries instead. A reference or slice keeps
+    // its qualifier, which is about its own pointee.
+    TypeExpr *PlainOf(TypeExpr *t) {
+        if (!t->cq || t->kind == TY_REF || t->kind == TY_SLICE) return t;
+        auto n = NewType(t->kind, t->line);
+        *n = *t;
+        n->cq = false;
+        return n;
+    }
+
+    template<typename T> T *NewDetail() {
+        auto d = new T();
+        typedetails.push_back(d);
+        return d;
+    }
+
+    // The plain integer an index or bound type's value is as a number:
+    // what arithmetic computes with, and what any other type gets.
+    TypeExpr *NoIndex(TypeExpr *t) {
+        return t && t->kind == TY_INT && t->ix ? inttypes[t->intstorage] : t;
+    }
+    // An index (or, with upto, bound) type of the resolved global array `arr`.
+    TypeExpr *IndexTypeOf(IntStorage s, VarDef *arr, bool upto, Line line) {
+        auto t = NewType(TY_INT, line);
+        t->intstorage = s;
+        t->ix = NewDetail<TypeIndex>();
+        t->ix->name = arr->name;
+        t->ix->arr = arr;
+        t->ix->upto = upto;
+        return t;
+    }
+
+    // The type constructors every pass builds types with. Each gives a
+    // fresh node at `line`: a type's identity is structural
+    // (TypeCheck::TypeEq), and the line is the construction's own.
+    TypeExpr *SliceOf(TypeExpr *elem, Line line) {
+        auto t = NewType(TY_SLICE, line);
+        t->sub = elem;
+        return t;
+    }
+    // A plain or optional reference; a relative one sets its width and
+    // pool on the detail afterwards.
+    TypeExpr *RefTo(TypeExpr *sub, Line line, bool optional = false) {
+        auto t = NewType(TY_REF, line);
+        t->ref = NewDetail<TypeRef>();
+        t->ref->sub = sub;
+        t->ref->optional = optional;
+        return t;
+    }
+    // An array of `kind` over `elem`; `size` is a fixed array's length or
+    // a limited one's capacity where the maker knows it (-1: not yet, or
+    // none, for `[..]`).
+    TypeExpr *ArrayOf(TypeExpr *elem, ArrayKind kind, Line line, int64_t size = -1) {
+        auto t = NewType(TY_ARRAY, line);
+        t->arr = NewDetail<TypeArray>();
+        t->arr->sub = elem;
+        t->arr->akind = kind;
+        t->arr->size = size;
+        return t;
+    }
+    TypeExpr *StructOf(SStruct *st, vector<TypeExpr *> args, Line line) {
+        auto t = NewType(TY_STRUCT, line);
+        t->struc = NewDetail<TypeStruct>();
+        t->struc->st = st;
+        t->struc->args = std::move(args);
+        return t;
+    }
+    // An enum type in either mode (§3.5).
+    TypeExpr *EnumOf(SEnum *en, vector<TypeExpr *> args, bool varmode, Line line) {
+        auto t = NewType(TY_ENUM, line);
+        t->enu = NewDetail<TypeEnum>();
+        t->enu->en = en;
+        t->enu->args = std::move(args);
+        t->enu->varmode = varmode;
+        return t;
+    }
+    // The variant type `adt.name`; `variant` is its declaration where that
+    // is known (null in the parser, which resolution fills in).
+    TypeExpr *VariantOf(TypeExpr *adt, string_view name, SVariant *variant, Line line) {
+        auto t = NewType(TY_VARIANT, line);
+        t->var = NewDetail<TypeVariant>();
+        t->var->adt = adt;
+        t->var->name = name;
+        t->var->variant = variant;
+        return t;
+    }
+    // The variant type of a variant of a concrete enum type. A variant type
+    // is mode-neutral: its ADT is the enum's fixed-mode spelling (§3.5).
+    TypeExpr *VariantTypeOf(TypeExpr *enumtype, SVariant *v, Line line) {
+        auto base = enumtype->enu->varmode
+                        ? EnumOf(enumtype->enu->en, enumtype->enu->args, false, line)
+                        : enumtype;
+        return VariantOf(base, v->name, v, line);
+    }
+
+    template<typename T, typename... Args> T *New(Args &&...args) {
+        auto n = new T(std::forward<Args>(args)...);
+        allnodes.push_back(n);
+        return n;
+    }
+
+    VarDef *NewVarDef()       { auto v = new VarDef();     vardefs.push_back(v);     return v; }
+    StructInst *NewStructInst() { auto i = new StructInst(); structinsts.push_back(i); return i; }
+    EnumInst *NewEnumInst()   { auto i = new EnumInst();   enuminsts.push_back(i);   return i; }
+    FnSpec *NewFnSpec() {
+        auto sp = new FnSpec();
+        sp->id = (int)fnspecs.size();
+        fnspecs.push_back(sp);
+        return sp;
+    }
+    FnSpec *NewFunValEnv() {
+        auto sp = new FnSpec();
+        sp->isfunval = true;
+        fvenvs.push_back(sp);
+        return sp;
+    }
+
+    TypeExpr *PrimTypeForToken(TType t) {
+        switch (t) {
+            case T_TI8:     return inttypes[IS_I8];
+            case T_TI16:    return inttypes[IS_I16];
+            case T_TI32:    return inttypes[IS_I32];
+            case T_TI64:    return inttypes[IS_I64];
+            case T_TU8:     return inttypes[IS_U8];
+            case T_TU16:    return inttypes[IS_U16];
+            case T_TU32:    return inttypes[IS_U32];
+            case T_TU64:    return inttypes[IS_U64];
+            case T_TVARINT: return inttypes[IS_VARINT];
+            case T_TF32:    return flttypes[FS_F32];
+            case T_TF64:    return flttypes[FS_F64];
+            case T_TBOOL:   return booltype;
+            default:        assert(false); return inttypes[IS_I64];
+        }
+    }
+
+    string_view Intern(string s) {
+        interned.push_back(std::move(s));
+        return interned.back();
+    }
+
+    // A declaration's qualified name: `ns::leaf`, or the leaf itself in the
+    // global namespace.
+    string_view QualifiedName(string_view ns, string_view leaf) {
+        return ns.empty() ? leaf : Intern(cat(ns, "::", leaf));
+    }
+
+    Namespace &NS(string_view ns) { return namespaces[ns]; }
+    Namespace *FindNS(string_view ns) {
+        auto it = namespaces.find(ns);
+        return it == namespaces.end() ? nullptr : &it->second;
+    }
+
+    // The one lookup rule for every declaration kind: a qualified name names
+    // its namespace alone; an unqualified one is searched in the namespace it
+    // is used from, then in the global one. Returns the map entry, or null.
+    template<typename T>
+    T *Lookup(unordered_map<string_view, T> Namespace::*map, string_view name,
+              string_view usens) {
+        auto ref = SplitName(name, usens);
+        if (auto n = FindNS(ref.ns))
+            if (auto it = (n->*map).find(ref.leaf); it != (n->*map).end()) return &it->second;
+        if (ref.qualified || ref.ns.empty()) return nullptr;
+        auto n = FindNS("");
+        if (!n) return nullptr;
+        auto it = (n->*map).find(ref.leaf);
+        return it == (n->*map).end() ? nullptr : &it->second;
+    }
+
+    // Structs, enums and aliases share one type namespace. Choose the nearest
+    // declaration before inspecting its kind: a local alias must shadow a
+    // global struct just as a local struct would (§11.1).
+    template<typename T>
+    T *LookupType(unordered_map<string_view, T> Namespace::*map, string_view name,
+                  string_view usens) {
+        auto ref = SplitName(name, usens);
+        auto n = FindNS(ref.ns);
+        if ((!n || !n->TypeNameExists(ref.leaf)) && !ref.qualified && !ref.ns.empty())
+            n = FindNS("");
+        if (!n) return nullptr;
+        auto it = (n->*map).find(ref.leaf);
+        return it == (n->*map).end() ? nullptr : &it->second;
+    }
+
+    SStruct *LookupStruct(string_view name, string_view usens) {
+        auto p = LookupType(&Namespace::structmap, name, usens);
+        return p ? *p : nullptr;
+    }
+    SEnum *LookupEnum(string_view name, string_view usens) {
+        auto p = LookupType(&Namespace::enummap, name, usens);
+        return p ? *p : nullptr;
+    }
+    SAlias *LookupAlias(string_view name, string_view usens) {
+        auto p = LookupType(&Namespace::aliasmap, name, usens);
+        return p ? *p : nullptr;
+    }
+    VarDecl *LookupGlobal(string_view name, string_view usens) {
+        auto p = Lookup(&Namespace::globalmap, name, usens);
+        return p ? *p : nullptr;
+    }
+    // A function name's overload set: that of the first namespace in lookup
+    // order that declares the name at all. Sets never merge across namespaces.
+    const vector<SFunction *> &LookupFunctions(string_view name, string_view usens) {
+        static const vector<SFunction *> none;
+        auto p = Lookup(&Namespace::functionmap, name, usens);
+        return p ? *p : none;
+    }
+    // A UFCS call's overload set past the scopes around it: that of the
+    // namespace the receiver's nominal type is declared in, where that is a
+    // named namespace declaring the name, else the call's own. A type's
+    // functions are its methods wherever it is used (§11.1).
+    const vector<SFunction *> &LookupMethods(string_view name, string_view usens,
+                                             const TypeExpr *recv) {
+        auto tns = NominalNs(recv);
+        if (auto n = tns.empty() ? nullptr : FindNS(tns))
+            if (auto it = n->functionmap.find(name); it != n->functionmap.end()) return it->second;
+        return LookupFunctions(name, usens);
+    }
+
+    // The entry point: the root file's global `main` (an imported file's is
+    // never registered, §11.1). Null when there is not exactly one.
+    SFunction *MainFunction() {
+        auto n = FindNS("");
+        if (!n) return nullptr;
+        auto it = n->functionmap.find("main");
+        return it != n->functionmap.end() && it->second.size() == 1 ? it->second[0] : nullptr;
+    }
+
+    // Whether the root file declares a main() in any namespace. Only the
+    // root's are registered, and a main anywhere but the global namespace is
+    // never the entry point, so a file declaring one is meant to be a program.
+    bool DeclaresMain() {
+        for (auto &[name, n] : namespaces)
+            if (n.functionmap.count("main")) return true;
+        return false;
+    }
+
+    void Dump(string &s) const;  // In dump.h.
+};
+
+}  // namespace goose

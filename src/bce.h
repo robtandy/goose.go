@@ -1,0 +1,4263 @@
+// Goose compiler — bounds-check elimination. Runs between the optimizer and
+// codegen over every live specialization body (plus global initializers), and
+// marks Index / SliceExpr nodes whose runtime check provably cannot fire
+// (Index::nobc / SliceExpr::nobc); codegen then omits those checks. The pass
+// never changes semantics: an elided check is one that could not have aborted.
+//
+// The analysis is a flow-sensitive difference-constraint domain over four
+// base kinds: the constant zero, integer variables, array lengths
+// (len(place)), and one-shot bases for expressions the operation itself
+// bounds, with facts of the form `l <= r + c`. Queries are shortest paths
+// over the fact graph (Bellman-Ford with saturating weights), extended by
+// always-true axioms: sub-64-bit integer storage ranges, `0 <= len <= 2^48`
+// (an array length is bounded by the address space), and the invariants
+// inferred below.
+//
+// Value pinning. Every base carries a generation; a base (v, g) denotes the
+// value the variable/length held while generation g was current at that
+// program point, so a kill merely opens a new generation and existing facts
+// stay true about the pinned old value — which is exactly what makes the
+// snapshot bounds of `for i in n` loops sound across iterations. Length
+// mutations additionally add a bridging fact between the generations when
+// their direction is known (grow: old <= new, shrink: new <= old), so facts
+// survive pure growth — indexing a grow-only array stays provable across
+// pushes — and are cut by shrinks. Monotone variables (all writes are
+// guarded, non-wrapping increments, or all decrements, plain assignments
+// included where each is proven to move the same way) get the same bridges
+// across their kill points.
+//
+// Facts come from: `for` headers (0 <= i < n at the appropriate snapshot),
+// while/if/assert conditions and their negations (through !/&&/||; a side
+// `i + c` counts where the facts show it did not wrap), integer match arms,
+// declaration and assignment equalities with recognizable right-hand sides,
+// ++/--/+=/-= which shift facts in place when the pre-state provably cannot
+// wrap at the variable's width, and completed checks: past `a[i]` the
+// program only continues with 0 <= i < len. A `!=` is strict against a side
+// the facts already order (`len != 0` is `len >= 1`). Condition facts are suppressed
+// when evaluating the condition itself may have changed tracked state (a
+// mutating call inside it), since the comparison then ran against pre-kill
+// values.
+//
+// Lengths are tracked exactly where the program states them: a literal's
+// element count, `resize`/`clear`, a push or a constant-length append as a
+// delta on the previous length, a counted loop whose body pushes a fixed
+// number of times per iteration, and a slice binding, whose length is the
+// difference of its bounds (`src[lo..lo + W]` is W long, so the row-slice
+// idiom needs no assert). Values likewise: `a % b` and `a & b` land in
+// [0, b], a nonnegative `a / d` or `a >> k` in [0, a] (d >= 0, or any
+// count), with the dividend's constant bounds divided or shifted by a
+// constant, and a cast whose value the facts already place in the target's
+// range carries its operand's term across — together these prove the
+// reduce-a-hash-into-a-table idiom without any guard in the source.
+//
+// Products and two-variable sums fall outside a difference domain, so they
+// are handled by intervals instead: where both operands have constant bounds,
+// `a * b` takes the extremes of the four corner products and `a ± b` the sum
+// of the two ranges, on a one-shot base. That is what proves a row-major
+// index — `y * W + x` against a `W * H` length — and the interval is only
+// stated when it fits the expression's own width, since §6.2 arithmetic wraps
+// there in release builds. A sum whose one operand varies within a small
+// range is also related to the other operand: `i * 4 + b` for b in 0..3 lies
+// within three of `i * 4`.
+//
+// A multiple of a term by a constant (`x * m`, `x << k`) and a floor
+// quotient of one (`x >> k`, a nonnegative `x / m`) are Lin bases, which
+// remember their operand: two with the same m relate as their operands do,
+// scaled (`2 * i <= 2 * n - 2` from `i < n`) or divided and rounded up
+// (`j >> 5 <= ((n + 31) >> 5) - 1` from `j < n`), and the same multiple of
+// one base is one base, so `4 * i` and `4 * i + 4` bound a slice four long.
+// A completed check or a length that bounds a quotient bounds its operand in
+// turn (QuotBack): `resize((n + 31) >> 5)` puts n below 2^53.
+//
+// Aliasing uses the checker's reference provenance (VarDef::ref.root chains):
+// a write or grow/shrink kills the length bases of every place it may name.
+// Storage is unreachable to a callee, and to unknown references, unless its
+// owner is a global, is captured, or has its address taken (creating any
+// reference into a variable's storage requires one of those); reference
+// parameters use the specialization's root classes, where distinct classes
+// are provably distinct roots and none names storage of a variable the body
+// declares. Unknown callees kill everything reachable.
+//
+// Calls into user code are summarized rather than assumed hostile. A first
+// pass computes, per specialization, the storage its body may resize or
+// overwrite beyond its own locals -- by parameter index for what it reaches
+// through a reference parameter, by variable for globals and captured outer
+// locals -- and the integers it may write, as a fixpoint over the call
+// graph (a callee's effects, translated to the arguments, are its caller's).
+// A call then kills exactly the places those effects can name, so a length
+// fact survives a call to a kernel that only reads and writes elements. In
+// the other direction, every call site records what it proves about the
+// arguments -- constant bounds on a passed array's length, and how the
+// passed lengths and integers relate -- and a specialization whose every
+// site has been analyzed enters with the meet of those facts about its
+// parameters: `blur(&a, &b)` from a caller that knows both lengths makes
+// `src.len == W * W` a fact inside `blur`. Specializations are analyzed
+// callers first for that; a site inside a recursive cycle is not analyzed
+// yet when its callee is, and such a callee simply gets nothing.
+//
+// Loops: a body is first walked in a kills-only mode to invalidate whatever
+// any earlier iteration may have changed, then walked for real; while-loop
+// condition facts re-establish at every body entry. Invariants (v >= 0,
+// v <= len(P) + c, and wrap-freedom for the bridges above) are inferred by a
+// recording pass that checks every write of an eligible variable preserves
+// them, then granted as axioms to the judging pass — this is what proves the
+// classic `var i = 0; while i < a.len { ... a[i] ...; i++; }` and the
+// post-loop `a[start..i]` slice. The declaration picks c: 0, or what a start
+// above the length needs (`var j = 1` before `while j + 4 <= a.len`), and
+// also -1 where the start is below it, as a masked probe index stays.
+// Growth alone never breaks `v <= len(P) + c`, so
+// only a shrink disqualifies P. Globals get the same treatment across the
+// whole program (RunAll's first phase), which is what a cursor kept in a
+// global needs: its upper bound comes from the loop condition, its lower
+// bound from nothing else. A counter that a counted `for` loop's body steps
+// by at most one per iteration keeps the distance to the loop index it had
+// on entry, which bounds a partition's or compaction's second index by the
+// first (StepCounters).
+//
+// Speculation: in the body of a loop that can be straight-line code, codegen
+// evaluates the right operand of && or || whatever the left gives where that
+// cannot fail or have an effect (CodeGen::Speculatable), which lets the C
+// compiler if-convert and vectorize the loop. An index there qualifies only
+// if its check holds without the facts the left operand establishes, so the
+// judging pass probes each such right operand once more from the state after
+// the left, with neither the left's facts nor those of any && or || nested
+// in it (Binary::specidx, ProbeRight).
+#pragma once
+
+namespace goose {
+
+// Whether index ix is in bounds by the types alone: a fixed array indexed by
+// a constant within it, or by an integer whose type holds no value outside it
+// (a u8 into a [256]). Codegen speculates such an index whatever this pass
+// proved about it (CodeGen::Speculatable).
+inline bool IndexInRangeByType(Index *ix) {
+    auto at = ix->obj->exprtype;
+    if (at && IsPlainRef(at)) at = at->ref->sub;
+    if (!at || !IsArrayKind(at, A_FIXED) || at->arr->size <= 0) return false;
+    auto n = at->arr->size;
+    if (auto lit = Is<IntLit>(ix->idx)) return !lit->uns && lit->val >= 0 && lit->val < n;
+    auto it = ix->idx->exprtype;
+    if (!it || !IsIntT(it)) return false;
+    auto [lo, hi] = IntRange(it->intstorage);
+    return lo >= 0 && hi < n;
+}
+
+struct BCE {
+    Ast &ast;
+
+    // Reporting: totals plus per-source-line outcomes for --bce-test.
+    int idxelided = 0, idxtotal = 0, slelided = 0, sltotal = 0;
+    map<pair<int, int>, pair<int, int>> lineout;   // (file, line) -> (elided, kept).
+
+    // checkfree (docs/design/index_types.md): the source lines each checkfree
+    // function's text spans, nested functions and blocks included, and every
+    // check kept on one of them, with why, once per line and reason. A check
+    // belongs to the text it was written in, as for --bce-test: every
+    // specialization of it, every inlined copy and whatever the optimizer
+    // restated it as.
+    struct Span { SFunction *sf; int file, lo, hi; };
+    vector<Span> checkfreespans;
+    struct KeptCheck { Line line; string why; };
+    vector<KeptCheck> checkfreefails;
+
+    void CheckfreeSpans() {
+        for (auto sf : ast.functions) {
+            if (!sf->checkfree || !sf->body) continue;
+            auto hi = sf->line.line;
+            function<void(Node *)> last = [&](Node *n) {
+                if (!n) return;
+                if (n->line.fileidx == sf->line.fileidx) hi = std::max(hi, n->line.line);
+                n->Children(last);
+            };
+            last(sf->body);
+            checkfreespans.push_back({ sf, sf->line.fileidx, sf->line.line, hi });
+        }
+    }
+
+    BCE(Ast &_ast) : ast(_ast) {}
+
+    // ------------------------------------------------------------------
+    // Bases, facts, terms.
+
+    enum BaseKind : uint8_t { BK_ZERO, BK_VAR, BK_LEN, BK_TMP };
+
+    struct Base {
+        uint8_t kind = BK_ZERO;
+        int id = 0;
+        int gen = 0;
+        bool operator==(const Base &o) const {
+            return kind == o.kind && id == o.id && gen == o.gen;
+        }
+    };
+
+    struct Fact { Base l, r; int64_t c; };   // l <= r + c.
+    struct Term { bool ok = false; Base b; int64_t off = 0; };
+
+    // A one-shot base that is an exact multiple of a term, tmp == x * m, or
+    // a floor quotient of one, tmp == floor(x / m), m >= 1. Two of these
+    // with the same m relate as their operands do (LinRelate), which is what
+    // compares `2 * i + 1` with a `2 * n` length or `j >> 5` with a
+    // `(n + 31) >> 5` one. A quotient is `exact` once x's term is known to
+    // be the value the machine divided rather than one that wrapped.
+    struct Lin { int tmp; Term x; int64_t m; bool quot, exact; };
+
+    // The generation of each variable or place id a kill has bumped, by id;
+    // the others are at 0. A body bumps few, and a flow is copied at every
+    // branch, so they are a sorted list rather than a hash table.
+    struct Gens {
+        struct Gen { int id, gen; };
+        small_vector<Gen, 8> gens;
+
+        // Where id is, or would go.
+        size_t At(int id) const {
+            auto it = std::lower_bound(gens.begin(), gens.end(), id,
+                                       [](const Gen &g, int i) { return g.id < i; });
+            return (size_t)(it - gens.begin());
+        }
+        int Get(int id) const {
+            auto i = At(id);
+            return i < gens.size() && gens[i].id == id ? gens[i].gen : 0;
+        }
+        void Set(int id, int gen) {
+            auto i = At(id);
+            if (i < gens.size() && gens[i].id == id) gens[i].gen = gen;
+            else gens.insert(gens.begin() + i, { id, gen });
+        }
+        // Per id, the later of the two.
+        static Gens Max(const Gens &a, const Gens &b) {
+            Gens r;
+            size_t i = 0, j = 0;
+            while (i < a.gens.size() || j < b.gens.size()) {
+                auto ai = i < a.gens.size() ? a.gens[i].id : INT32_MAX;
+                auto bj = j < b.gens.size() ? b.gens[j].id : INT32_MAX;
+                if (ai < bj) r.gens.push_back(a.gens[i++]);
+                else if (bj < ai) r.gens.push_back(b.gens[j++]);
+                else r.gens.push_back({ ai, std::max(a.gens[i++].gen, b.gens[j++].gen) });
+            }
+            return r;
+        }
+    };
+    // The Lin bases a flow has made, with their operands named as that flow
+    // names them: a shift reinterprets a variable's base in place
+    // (ShiftCore), so the operands move with the facts, path by path.
+    struct Flow {
+        vector<Fact> facts;
+        Gens vgen, pgen;   // By var id / place id.
+        small_vector<Lin, 4> lins;
+    };
+    Flow flow;
+    int nextgen = 0;
+
+    static constexpr int64_t INF = INT64_MAX;
+    // §10.4: a data stack reserves at most 2^48 bytes, so no value is larger
+    // and no array longer than that. Guaranteed rather than assumed, and the
+    // 15 bits of headroom below i64 are what make size arithmetic (i + 1,
+    // len - 1, len + len) provably free of overflow.
+    static constexpr int64_t LENMAX = int64_t(1) << 48;
+    static constexpr int64_t OFFCAP = int64_t(1) << 32;
+    static constexpr int64_t CCAP = int64_t(1) << 60;
+    static constexpr size_t MAXFACTS = 200;
+
+    // Saturating adds: INF is an absorbing "unprovable" sentinel, positive
+    // overflow saturates to it (weakens, never strengthens, a <= bound), and
+    // the negative side clamps finitely.
+    static int64_t SatAdd(int64_t a, int64_t b) {
+        if (a == INF || b == INF) return INF;
+        if (b > 0 && a > INF - 1 - b) return INF;
+        if (b < 0 && a < INT64_MIN - b) return -CCAP;
+        auto r = a + b;
+        return r < -CCAP ? -CCAP : r;
+    }
+    static int64_t SatSub(int64_t a, int64_t b) {
+        if (b == INT64_MIN) return a >= 0 ? INF : (a + INT64_MAX) + 1;
+        return SatAdd(a, -b);
+    }
+    static bool SmallOff(int64_t c) { return c > -OFFCAP && c < OFFCAP; }
+
+    // Variable interning (Base holds compact ids).
+    unordered_map<const VarDef *, int> varid;
+    vector<VarDef *> varof;
+    int VarId(VarDef *v) {
+        auto it = varid.find(v);
+        if (it != varid.end()) return it->second;
+        auto id = (int)varof.size();
+        varid[v] = id;
+        varof.push_back(v);
+        return id;
+    }
+    static Base Zero() { return Base { BK_ZERO, 0, 0 }; }
+    // An anonymous base for one evaluation of an expression whose value range
+    // the operation itself bounds (§6.2 modulo and mask). A fresh base per
+    // evaluation, so a later evaluation of the same node never inherits the
+    // earlier one's facts.
+    int nexttmp = 0;
+    Base TmpBase() { return Base { BK_TMP, nexttmp++, 0 }; }
+    // Constant bounds a one-shot base carries by construction, kept as
+    // axioms of that base rather than as facts: they hold wherever the base
+    // can be named, and they never compete for the fact cap.
+    unordered_map<int, pair<int64_t, int64_t>> tmpival;
+    Base VarBase(VarDef *v) {
+        auto id = VarId(v);
+        return Base { BK_VAR, id, flow.vgen.Get(id) };
+    }
+    Base LenBase(int pid) { return Base { BK_LEN, pid, flow.pgen.Get(pid) }; }
+
+    void AddFactB(Base l, Base r, int64_t c) {
+        if (l == r) return;
+        if (c >= CCAP) return;              // Too weak to matter.
+        if (c < -CCAP) c = -CCAP;
+        for (auto &f : flow.facts)
+            if (f.l == l && f.r == r) {
+                if (c < f.c) f.c = c;       // Keep the strongest.
+                return;
+            }
+        if (flow.facts.size() >= MAXFACTS) flow.facts.erase(flow.facts.begin());
+        flow.facts.push_back({ l, r, c });
+    }
+
+    // ------------------------------------------------------------------
+    // Places: an array/slice location nameable as a variable plus a chain of
+    // struct fields, with reference crossings marked (-1 path entries). The
+    // "ultimate" storage owner drives aliasing.
+
+    enum UltKind { UK_OWNED, UK_STATIC, UK_OPAQUE };
+
+    struct Place {
+        VarDef *rootv = nullptr;
+        vector<int> path;
+        VarDef *ultv = nullptr;
+        int ultkind = UK_OPAQUE;
+        bool refcrossed = false;
+        bool readsref = false;  // Its path reads a reference stored in a field.
+        bool lenmut = false;    // A grow/shrink operation can target it.
+        bool slice = false;     // Its length is a slice's, held in a slot.
+        bool inelem = false;    // Of a type an array element can have.
+        // A limited array's static capacity, which its length never exceeds;
+        // -1 for every other place.
+        int64_t cap = -1;
+        TypeExpr *arr = nullptr;   // The array's type, for an array's place.
+    };
+    vector<Place> places;
+    map<pair<VarDef *, vector<int>>, int> placeids;
+
+    // Follows reference/slice provenance to the storage-owning variable.
+    // A synthetic parameter root class (typeless VarDef) is opaque, but two
+    // references in distinct classes are known-distinct roots (§10.2). An
+    // inexact root names a scope the pointee outlives rather than its owner
+    // (§9.5), so it says nothing about which storage this is. With `slot`,
+    // what is sought is the slot a slice's length lives in, which a
+    // reference to a slice is rooted at (§9.2): the chain stops at a slice
+    // variable rather than following it on to the array it views.
+    pair<int, VarDef *> UltOf(VarDef *v, bool slot = false) {
+        for (auto guard = 0; guard < 16; guard++) {
+            if (!v) return { UK_STATIC, nullptr };
+            auto t = v->type;
+            if (!t) return { UK_OPAQUE, v };
+            if (!IsRefOrSlice(t) || (slot && t->kind == TY_SLICE)) return { UK_OWNED, v };
+            if (!v->refrootknown || !v->ref.Exact()) return { UK_OPAQUE, nullptr };
+            v = v->ref.Root();
+        }
+        return { UK_OPAQUE, nullptr };
+    }
+
+    static bool IsSliceRef(TypeExpr *t) {
+        return t && t->kind == TY_REF && t->ref->sub->kind == TY_SLICE;
+    }
+
+    // Whether the field or element `cur` reads holds a reference or a slice,
+    // so that what lies beyond it on a chain is the pointee of a stored
+    // reference: storage the chain's root does not own. The node's own type
+    // says so where the checker kept the reference; a decayed read falls
+    // back to the declared field or element type, and a generic field whose
+    // instantiation is not at hand counts as one.
+    static bool ReadsStoredRef(Node *cur) {
+        auto isref = [](TypeExpr *t) { return t && IsRefOrSlice(t); };
+        if (isref(cur->exprtype)) return true;
+        auto d = Is<Dot>(cur);
+        auto ix = Is<Index>(cur);
+        auto obj = d ? d->obj : ix ? ix->obj : nullptr;
+        auto t = obj ? obj->exprtype : nullptr;
+        if (!t) return false;
+        if (t->kind == TY_REF) t = t->ref->sub;
+        if (ix) {
+            if (t->kind == TY_ARRAY) return isref(t->arr->sub);
+            return t->kind == TY_SLICE && isref(t->sub);
+        }
+        auto ft = FieldTypeOf(d);
+        return ft && (isref(ft) || ft->kind == TY_GENERIC);
+    }
+
+    // The declared type of the field a Dot reads, as its object's type
+    // instantiates it; null for anything but a field.
+    static TypeExpr *FieldTypeOf(Dot *d) {
+        auto t = d->obj->exprtype;
+        if (!t || d->fieldidx < 0) return nullptr;
+        if (t->kind == TY_REF) t = t->ref->sub;
+        TypeExpr *ft = nullptr;
+        if (t->kind == TY_STRUCT) {
+            auto inst = t->struc->inst;
+            ft = inst ? inst->ftypes[d->fieldidx] : t->struc->st->fields[d->fieldidx].type;
+        } else if (t->kind == TY_VARIANT) {
+            auto v = t->var->variant;
+            ft = v->fields[d->fieldidx].type;
+            if (auto inst = t->var->adt->enu->inst)
+                for (size_t vi = 0; vi < inst->en->variants.size(); vi++)
+                    if (&inst->en->variants[vi] == v) ft = inst->vftypes[vi][d->fieldidx];
+        }
+        return ft;
+    }
+
+    // The static capacity of the limited array a variable or a field holds,
+    // as declared: what a slice of it whole is never longer than, whatever
+    // type the use converted it to. -1 for anything else.
+    static int64_t DeclCap(Node *n) {
+        if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
+        TypeExpr *t = nullptr;
+        if (auto id = Is<Ident>(n)) t = id->vdef ? id->vdef->type : nullptr;
+        else if (auto d = Is<Dot>(n)) t = FieldTypeOf(d);
+        if (t && t->kind == TY_REF) t = t->ref->sub;
+        if (!t || t->kind != TY_ARRAY || t->arr->akind != A_LIMITED) return -1;
+        return t->arr->size;
+    }
+
+    // The place of the array or slice of type t (a reference's pointee
+    // included) at `path` under `root`; -1 where there is nothing to track.
+    // `readsref`: the path reads a reference stored in a field (PlaceOf).
+    int PlaceFor(VarDef *root, const vector<int> &path, TypeExpr *t, bool readsref = false) {
+        if (t && t->kind == TY_REF) t = t->ref->sub;
+        auto slice = t && t->kind == TY_SLICE;
+        auto arr = t && t->kind == TY_ARRAY && t->arr->akind != A_FIXED;
+        if (!slice && !arr) return -1;
+        return InternPlace(root, path, t, arr ? t : nullptr, [&](Place &P) {
+            // A leading crossing is the root reference's own: what lies past
+            // it is in the storage that reference points into, as for the
+            // root's own pointee. Any later one reads a stored reference.
+            auto rootcross = !path.empty() && path[0] == -1 && root->type &&
+                             root->type->kind == TY_REF;
+            auto midcross =
+                std::find(path.begin() + (rootcross ? 1 : 0), path.end(), -1) != path.end();
+            P.refcrossed = midcross || (root->type && root->type->kind == TY_REF);
+            P.readsref = readsref;
+            if (!P.refcrossed) {
+                P.ultkind = UK_OWNED;
+                P.ultv = root;
+            } else if (midcross) {
+                P.ultkind = UK_OPAQUE;   // Reads a stored reference: target root unknown here.
+            } else {
+                // A slice's length is in the slot a reference to it names.
+                auto [k, u] = UltOf(root, slice);
+                P.ultkind = k;
+                P.ultv = u;
+            }
+        });
+    }
+
+    // The place at `path` under `root` of t, a slice or an array other than
+    // a fixed one: the one made before, or a new one, which `own` gives its
+    // owner and crossings and which records `arr` as its array type.
+    template<typename F>
+    int InternPlace(VarDef *root, const vector<int> &path, TypeExpr *t, TypeExpr *arr, F own) {
+        auto key = pair<VarDef *, vector<int>>(root, path);
+        auto it = placeids.find(key);
+        if (it != placeids.end()) return it->second;
+        Place P;
+        P.rootv = root;
+        P.path = path;
+        own(P);
+        auto isarr = t->kind == TY_ARRAY;
+        P.lenmut = isarr && t->arr->akind != A_VAR;
+        P.arr = arr;
+        if (isarr && t->arr->akind == A_LIMITED && t->arr->size >= 0) P.cap = t->arr->size;
+        P.slice = !isarr;
+        P.inelem = !isarr || (t->arr->akind != A_GROW && t->arr->akind != A_GROWSHRINK);
+        auto id = (int)places.size();
+        places.push_back(P);
+        placeids[key] = id;
+        return id;
+    }
+
+    // `crossed` reports a stored reference read on the way, whether or not
+    // a place came of it. With `as`, n is read as that type rather than its
+    // checked one: the declared type of a field whose use converted it.
+    int PlaceOf(Node *n, bool *failidx = nullptr, bool *crossed = nullptr,
+                TypeExpr *as = nullptr) {
+        vector<int> path;
+        VarDef *root = nullptr;
+        auto readsref = false;
+        for (auto cur = n;;) {
+            if (auto id = Is<Ident>(cur)) { root = id->vdef; break; }
+            if (auto d = Is<Dot>(cur); d && d->fieldidx >= 0) {
+                // A field holding a reference is a crossing of its own: the
+                // place lies wherever that reference points, not in the
+                // object the field belongs to.
+                if ((as && cur == n) ? IsRefOrSlice(as) : ReadsStoredRef(d)) {
+                    path.push_back(-1);
+                    if (crossed) *crossed = true;
+                    // It reads the reference stored there, unless the field
+                    // holds the slice the place is, whose length lies in the
+                    // field itself.
+                    auto ft = cur == n ? (as ? as : FieldTypeOf(d)) : nullptr;
+                    if (!ft || ft->kind != TY_SLICE) readsref = true;
+                }
+                path.push_back(d->fieldidx);
+                if (d->obj->exprtype && d->obj->exprtype->kind == TY_REF) path.push_back(-1);
+                cur = d->obj;
+                continue;
+            }
+            if (Is<Index>(cur)) {
+                if (failidx) *failidx = true;
+                if (crossed && ReadsStoredRef(cur)) *crossed = true;
+            }
+            return -1;
+        }
+        if (!root) return -1;
+        std::reverse(path.begin(), path.end());
+        return PlaceFor(root, path, as ? as : n->exprtype, readsref);
+    }
+
+    // The place a variable's own array/slice value occupies (used at
+    // declarations and whole-variable assignments, where no obj node exists).
+    int PlaceOfVar(VarDef *v) { return v ? PlaceFor(v, {}, v->type) : -1; }
+
+    // The slice or array an element of a tracked resizable or limited array
+    // holds (`adj[v]`, `g.rows[i]`): one place for all the elements, its
+    // length lying in the array's storage, which is where a reference to an
+    // element would measure it -- so an element write, a refill among them
+    // (GrowShrinkKill), or an overwrite of the array is a kill, and nothing
+    // else is: a resize moves no element, and the slots a shrink drops keep
+    // their values. It has the array's owner: a variable, the root class of
+    // a reference parameter the array is reached through (PlaceFor), or
+    // storage unknown here. -1 for any other expression.
+    int ElemPlaceOf(Node *n) {
+        auto ix = Is<Index>(n);
+        auto t = n->exprtype;
+        if (!ix || !t || (t->kind != TY_SLICE && t->kind != TY_ARRAY)) return -1;
+        if (t->kind == TY_ARRAY && t->arr->akind == A_FIXED) return -1;
+        auto at = ix->obj->exprtype;
+        if (at && at->kind == TY_REF) at = at->ref->sub;
+        if (!at || at->kind != TY_ARRAY || at->arr->akind == A_FIXED) return -1;
+        auto apid = PlaceOf(ix->obj);
+        if (apid < 0) return -1;
+        auto path = places[apid].path;
+        path.push_back(-2);
+        auto arr = t->kind == TY_ARRAY ? t : nullptr;
+        return InternPlace(places[apid].rootv, path, t, arr, [&](Place &P) {
+            P.ultkind = places[apid].ultkind;
+            P.ultv = places[apid].ultv;
+            P.refcrossed = true;
+            P.readsref = places[apid].readsref;
+        });
+    }
+
+    // The exact length of a fresh array value, when its construction states
+    // it: a literal's element count, a [v; n] fill count, [..cap]'s zero, a
+    // string literal's byte count.
+    Term FreshLenOf(Node *init) {
+        if (auto al = Is<ArrayLit>(init)) {
+            if (al->capexpr) return Term { true, Zero(), 0 };
+            if (al->fillval) return TermOf(al->fillcount);
+            return Term { true, Zero(), (int64_t)al->elems.size() };
+        }
+        if (auto sl = Is<StrLit>(init))
+            return Term { true, Zero(), (int64_t)sl->val.size() };
+        return {};
+    }
+
+    // ------------------------------------------------------------------
+    // Per-spec analysis state.
+
+    set<VarDef *> addrof;     // Address taken (&x, for &x, match &b), incl. owned ults.
+    set<VarDef *> intvars;    // Integer variables seen (call-kill candidates).
+    set<VarDef *> wdecl;      // Single-name, initialized declarations.
+    set<VarDef *> wbad;       // A write shape that defeats invariant tracking.
+    struct WKinds { bool inc = false, dec = false, setw = false; };
+    map<VarDef *, WKinds> wkinds;
+    map<VarDef *, set<int>> relpids;   // Var -> places it indexes or bounds.
+
+    struct Cand {
+        bool ge0 = true;         // v >= 0 preserved by every write.
+        bool wrapfree = true;    // No write can wrap at the variable's width.
+        // Every plain assignment `v = e` (not the declaration) provably
+        // lowers or keeps v (setdec), or raises or keeps it (setinc).
+        bool setdec = true, setinc = true;
+        // Surviving `v <= len(P) + c` candidates, (P, c); the declaration
+        // decides c (RecordSet).
+        vector<pair<int, int64_t>> le;
+        bool declseen = false;
+    };
+    map<VarDef *, Cand> cands;
+    // Global integer variables that are nonnegative at every program point:
+    // established by their initializer and preserved by every write in every
+    // live body and every global's initializer (validated in RunAll's first
+    // phase, granted in the second).
+    // Globals are the idiomatic home for parser/cursor state, whose upper
+    // bound comes from a loop condition but whose lower bound has nowhere
+    // else to come from.
+    map<VarDef *, bool> gge0;
+    set<VarDef *> gaddr;   // Globals whose address is taken anywhere.
+
+    // Granted invariants for the judging pass.
+    set<VarDef *> ge0;
+    // While ValidateGlobalInvariants walks a tree: every candidate of gge0
+    // still standing is assumed (Ge0) and recorded (CandOf) without being
+    // copied into ge0 and cands, of which a tree writes a handful.
+    bool seedglobals = false;
+
+    bool GlobalCand(VarDef *v) {
+        auto it = gge0.find(v);
+        return it != gge0.end() && it->second;
+    }
+    bool Ge0(VarDef *v) { return ge0.count(v) || (seedglobals && GlobalCand(v)); }
+    // v's candidate state, made on its first write while validating the
+    // globals; null for a variable that is no candidate.
+    Cand *CandOf(VarDef *v) {
+        auto it = cands.find(v);
+        if (it != cands.end()) return &it->second;
+        if (!seedglobals || !GlobalCand(v)) return nullptr;
+        auto &c = cands[v];
+        c.declseen = true;
+        return &c;
+    }
+    map<VarDef *, vector<pair<int, int64_t>>> lelen;   // v <= len(P) + c, as (P, c).
+    map<VarDef *, int> mono;   // +1 nondecreasing / -1 nonincreasing, wrap-free.
+
+    bool Reach(VarDef *v) {
+        return v && (v->isglobal || v->captured || addrof.count(v) != 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Interprocedural state.
+
+    // What a body may do to storage its caller can see: resize or overwrite
+    // it (params, vars), or write an integer in it (intparams, intvars). A
+    // parameter stands for its root class -- every argument bound to a
+    // member of the class -- and a write the analysis cannot attribute to
+    // any of these makes the summary opaque, which a caller treats as the
+    // blanket kill.
+    struct Effects {
+        set<int> params, intparams;
+        set<VarDef *> vars, intvars;
+        bool opaque = false, intopaque = false;
+        bool operator==(const Effects &o) const {
+            return params == o.params && intparams == o.intparams && vars == o.vars &&
+                   intvars == o.intvars && opaque == o.opaque && intopaque == o.intopaque;
+        }
+        void Merge(const Effects &o) {
+            params.insert(o.params.begin(), o.params.end());
+            intparams.insert(o.intparams.begin(), o.intparams.end());
+            vars.insert(o.vars.begin(), o.vars.end());
+            intvars.insert(o.intvars.begin(), o.intvars.end());
+            opaque = opaque || o.opaque;
+            intopaque = intopaque || o.intopaque;
+        }
+    };
+    map<FnSpec *, Effects> effects;
+    Effects *effsum = nullptr;   // Where the current walk records effects, while summarizing.
+    set<VarDef *> ownvars;       // Variables this body declares, parameters included.
+    map<VarDef *, vector<int>> classparams;   // Parameter root class -> member indices.
+    set<VarDef *> ownclasses;    // The root classes of this body's own parameters.
+
+    // Whether place P is reached through a reference this body was handed
+    // (rooted at one of its own parameter classes) and v is a variable it
+    // declares itself, a by-value parameter included: that reference was
+    // formed before the body ran, so it names none of the storage v owns.
+    // KillClassWrite applies the same rule from the other side.
+    bool HandedApart(const Place &P, VarDef *v) {
+        return P.ultkind == UK_OPAQUE && P.ultv && ownclasses.count(P.ultv) &&
+               OwnerTarget(v).kind == TG_OWN;
+    }
+
+    // The call graph over live specializations: callees per caller, the
+    // number of ordinary call sites per callee, and the callees also reached
+    // some way a site cannot describe (a thread spawn, print's format
+    // overloads, an export's C wrapper), plus the order every callee
+    // precedes its callers in.
+    map<FnSpec *, vector<FnSpec *>> callees;
+    map<FnSpec *, int> nsites;
+    set<FnSpec *> opaquesites;
+    vector<FnSpec *> calleesfirst;
+
+    // A specialization's interface bases, in the order its site matrix uses
+    // them: the constant zero first, then one per parameter that is a
+    // machine integer (its value) or an array, slice, or reference to one
+    // (its length).
+    struct Iface {
+        vector<pair<bool, int>> bases;   // (is a length, parameter index); [0] is zero.
+    };
+    map<FnSpec *, Iface> ifaces;
+
+    // What the analyzed call sites of one specialization jointly prove about
+    // its interface bases: c[X * n + Y] is the weakest `X <= Y + c` any site
+    // established, INF where some site could not, over `seen` sites.
+    struct Sites {
+        int seen = 0;
+        bool viable = true;
+        vector<int64_t> c;
+    };
+    map<FnSpec *, Sites> sites;
+
+    // ------------------------------------------------------------------
+    // Index and bound types (§3.11). A value of one is below its array's
+    // length (at most it, for a bound) whenever it can be observed, and the
+    // array never shrinks, so the axiom holds against the length's current
+    // generation. Each such array has a place from the prescan on, so that
+    // every kill of its length reaches it.
+
+    set<VarDef *> indexarrays;       // Every array an index type names.
+    map<VarDef *, int> ixpid;        // Its place in this body.
+    // One-shot bases standing for a value of an index or bound type read out
+    // of storage: its array's place and the slack (-1, or 0 for a bound).
+    map<int, pair<int, int>> tmplen;
+
+    void IndexPlaces() {
+        ixpid.clear();
+        tmplen.clear();
+        for (auto a : indexarrays) ixpid[a] = PlaceOfVar(a);
+    }
+
+    // The place and slack of base b's index type, or a pid of -1.
+    pair<int, int> IndexBoundOf(const Base &b) {
+        if (b.kind == BK_TMP) {
+            auto it = tmplen.find(b.id);
+            return it == tmplen.end() ? pair { -1, 0 } : it->second;
+        }
+        if (b.kind != BK_VAR) return { -1, 0 };
+        auto t = varof[b.id]->type;
+        if (!IsIndexT(t)) return { -1, 0 };
+        auto it = ixpid.find(t->ix->arr);
+        return { it == ixpid.end() ? -1 : it->second, t->ix->upto ? 0 : -1 };
+    }
+
+    // A value of index or bound type t that no other term names: a fresh
+    // base, non-negative, below the array's length.
+    Term IndexTypeTerm(TypeExpr *t) {
+        if (mode == M_KILLS || !IsIndexT(t)) return {};
+        auto it = ixpid.find(t->ix->arr);
+        if (it == ixpid.end() || it->second < 0) return {};
+        auto m = TmpBase();
+        auto hi = t->intstorage == IS_U64 ? LENMAX
+                                          : std::min(IntRange(t->intstorage).second, LENMAX);
+        tmpival[m.id] = { 0, hi };
+        tmplen[m.id] = { it->second, t->ix->upto ? 0 : -1 };
+        return Term { true, m, 0 };
+    }
+
+    // ------------------------------------------------------------------
+    // The query: prove l <= r + c from facts + axioms, by shortest path.
+
+    bool Query(Base l, Base r, int64_t c) {
+        auto d = Dist(l, r);
+        return d != INF && d <= c;
+    }
+
+    // The smallest c for which `l <= r + c` is provable, INF when nothing is.
+    int64_t Dist(Base l, Base r) {
+        if (l == r) return 0;
+        return DistsFrom(l, span(&r, 1))[0];
+    }
+
+    // Shortest paths from `l` to each base in `to`: one run serves every
+    // target, which is what relating a call's arguments pairwise needs. The
+    // graph is the facts and the bases they name, few enough to sit in place.
+    // With `rev`, the paths run the other way: from each base in `to` to `l`.
+    small_vector<int64_t, 4> DistsFrom(Base l, span<const Base> to, bool rev = false) {
+        small_vector<Base, 16> nodes = { Zero(), l };
+        auto add = [&](const Base &b) {
+            for (auto &x : nodes) if (x == b) return;
+            nodes.push_back(b);
+        };
+        for (auto &b : to) add(b);
+        for (auto &f : flow.facts) { add(f.l); add(f.r); }
+        // Length bases of index and bound types' arrays.
+        if (!ixpid.empty())
+            for (size_t i = 0; i < nodes.size(); i++) {
+                auto [pid, slack] = IndexBoundOf(nodes[i]);
+                if (pid >= 0) add(LenBase(pid));
+            }
+        // Length bases contributed by granted v <= len(P) + c invariants.
+        if (!lelen.empty())
+            for (size_t i = 0; i < nodes.size(); i++) {
+                if (nodes[i].kind != BK_VAR) continue;
+                auto it = lelen.find(varof[nodes[i].id]);
+                if (it != lelen.end())
+                    for (auto [pid, c] : it->second) add(LenBase(pid));
+            }
+        auto idx = [&](const Base &b) {
+            for (size_t i = 0; i < nodes.size(); i++) if (nodes[i] == b) return (int)i;
+            return -1;
+        };
+        struct Edge { int a, b; int64_t w; };
+        small_vector<Edge, 32> edges;
+        for (auto &f : flow.facts) edges.push_back({ idx(f.l), idx(f.r), f.c });
+        for (size_t i = 0; i < nodes.size(); i++) {
+            auto &b = nodes[i];
+            if (b.kind == BK_LEN) {
+                edges.push_back({ 0, (int)i, 0 });         // 0 <= len.
+                // len <= 2^48 (§10.4), or a limited array's capacity.
+                auto cap = places[b.id].cap;
+                edges.push_back({ (int)i, 0, cap >= 0 && cap < LENMAX ? cap : LENMAX });
+            } else if (b.kind == BK_TMP) {
+                auto it = tmpival.find(b.id);
+                if (it != tmpival.end()) {
+                    edges.push_back({ 0, (int)i, SatSub(0, it->second.first) });
+                    edges.push_back({ (int)i, 0, it->second.second });
+                }
+            } else if (b.kind == BK_VAR) {
+                auto v = varof[b.id];
+                auto t = v->type;
+                if (t && t->kind == TY_INT && IntBits(t->intstorage) < 64) {
+                    auto [lo, hi] = IntRange(t->intstorage);
+                    edges.push_back({ 0, (int)i, -lo });
+                    edges.push_back({ (int)i, 0, hi });
+                }
+                if (Ge0(v)) edges.push_back({ 0, (int)i, 0 });
+                if (IsIndexT(t)) edges.push_back({ 0, (int)i, 0 });   // Unsigned, u64 too.
+                auto it = lelen.find(v);
+                if (it != lelen.end())
+                    for (auto [pid, c] : it->second) {
+                        auto li = idx(LenBase(pid));
+                        if (li >= 0) edges.push_back({ (int)i, li, c });
+                    }
+            }
+        }
+        // Index and bound types: v <= len(P) + slack.
+        if (!ixpid.empty())
+            for (size_t i = 0; i < nodes.size(); i++) {
+                auto [pid, slack] = IndexBoundOf(nodes[i]);
+                if (pid < 0) continue;
+                auto li = idx(LenBase(pid));
+                if (li >= 0) edges.push_back({ (int)i, li, slack });
+            }
+        small_vector<int64_t, 16> dist;
+        dist.resize(nodes.size(), INF);
+        dist[idx(l)] = 0;
+        for (size_t round = 0; round < nodes.size(); round++) {
+            auto changed = false;
+            for (auto &e : edges) {
+                auto a = rev ? e.b : e.a, b = rev ? e.a : e.b;
+                if (dist[a] == INF) continue;
+                auto nd = SatAdd(dist[a], e.w);
+                if (nd < dist[b]) { dist[b] = nd; changed = true; }
+            }
+            if (!changed) break;
+        }
+        small_vector<int64_t, 4> r;
+        for (auto &b : to) r.push_back(dist[idx(b)]);
+        return r;
+    }
+
+    // ------------------------------------------------------------------
+    // Constant intervals. The difference domain relates two bases at a time,
+    // so it cannot name `a * b` or `a + b` at all; what it can do is read off
+    // each operand's constant bounds and combine those, which is enough for
+    // the row-major index shapes (`y * W + x` against a `W * H` length).
+
+    struct Ival { bool ok = false; int64_t lo = 0, hi = 0; };
+
+    // The tightest constant bounds the facts prove for a term's value. Both
+    // ends must be finite: an interval open at either end says nothing a
+    // product or a sum could use, and every bound produced here stays inside
+    // CCAP, so the arithmetic below cannot leave the range the facts and the
+    // machine agree on.
+    Ival BoundsOf(const Term &t) {
+        if (!t.ok) return {};
+        if (t.b.kind == BK_ZERO) return Ival { true, t.off, t.off };
+        auto up = Dist(t.b, Zero());   // b <= up.
+        if (up == INF) return {};
+        auto dn = Dist(Zero(), t.b);   // 0 <= b + dn, i.e. b >= -dn.
+        if (dn == INF) return {};
+        auto hi = SatAdd(up, t.off), lo = SatAdd(SatSub(0, dn), t.off);
+        if (hi == INF || lo == INF || hi > CCAP || lo < -CCAP) return {};
+        if (lo > hi) return {};   // Contradictory facts prove nothing usable.
+        return Ival { true, lo, hi };
+    }
+
+    // Exact i64 product, refused when the result would leave the fact range.
+    static bool MulIn(int64_t a, int64_t b, int64_t &r) {
+        if (a >= CCAP || a <= -CCAP || b >= CCAP || b <= -CCAP) return false;
+        if (a == 0 || b == 0) { r = 0; return true; }
+        auto aa = a < 0 ? -a : a, bb = b < 0 ? -b : b;
+        if (aa > CCAP / bb) return false;
+        r = a * b;
+        return true;
+    }
+
+    // The integer type binary operation b computes and wraps at (§6.2): its
+    // operands', which the checker unified. b's own exprtype is the slot its
+    // value lands in, which can be wider (an i8 sum stored into an i64).
+    static TypeExpr *OpType(Binary *b) { return b->left->exprtype; }
+
+    // An integer type the domain computes at: each of its values is the i64
+    // the facts state, which a u64 above i64.max or a varint is not.
+    static bool MachineInt(TypeExpr *t) {
+        return t && t->kind == TY_INT && t->intstorage != IS_U64 && t->intstorage != IS_VARINT;
+    }
+
+    // A one-shot base carrying [lo, hi], for a value the operation computes
+    // but the domain cannot relate to anything else. The interval is only
+    // stated when the machine's own arithmetic agrees with it: §6.2 wraps at
+    // the operation's width in release builds, so a result the facts place
+    // outside that width is not the value the program computed.
+    static bool FitsType(TypeExpr *t, int64_t lo, int64_t hi) {
+        if (!MachineInt(t)) return false;
+        auto [tlo, thi] = IntRange(t->intstorage);
+        return lo >= tlo && hi <= thi;
+    }
+
+    Term IvalTerm(TypeExpr *t, int64_t lo, int64_t hi) {
+        if (!FitsType(t, lo, hi)) return {};
+        auto m = TmpBase();
+        tmpival[m.id] = { lo, hi };
+        return Term { true, m, 0 };
+    }
+
+    // `a * b` from the operands' constant bounds: the four corner products
+    // bracket the result whatever the signs, so a negative counter is handled
+    // by the same rule as a nonnegative one.
+    Term MulTerm(Binary *b) {
+        if (mode == M_KILLS) return {};
+        auto t = OpType(b);
+        if (!MachineInt(t)) return {};
+        auto lt = TermOf(b->left), rt = TermOf(b->right);
+        if (!lt.ok || !rt.ok) return {};
+        if (rt.b.kind == BK_ZERO && rt.off >= 1) return ScaledTerm(t, lt, rt.off);
+        if (lt.b.kind == BK_ZERO && lt.off >= 1) return ScaledTerm(t, rt, lt.off);
+        auto li = BoundsOf(lt), ri = BoundsOf(rt);
+        if (!li.ok || !ri.ok) return {};
+        int64_t c[4];
+        if (!MulIn(li.lo, ri.lo, c[0]) || !MulIn(li.lo, ri.hi, c[1]) ||
+            !MulIn(li.hi, ri.lo, c[2]) || !MulIn(li.hi, ri.hi, c[3]))
+            return {};
+        auto lo = c[0], hi = c[0];
+        for (auto i = 1; i < 4; i++) {
+            lo = std::min(lo, c[i]);
+            hi = std::max(hi, c[i]);
+        }
+        return IvalTerm(t, lo, hi);
+    }
+
+    // `a + b` / `a - b` where neither side is a constant, so the difference
+    // domain has no term for it: the intervals add. Both ends came out of
+    // BoundsOf inside CCAP, so the sum cannot overflow the i64 the facts are
+    // computed in.
+    Term IvalSumTerm(Binary *b, const Term &lt, const Term &rt) {
+        if (mode == M_KILLS) return {};
+        auto li = BoundsOf(lt), ri = BoundsOf(rt);
+        if (!li.ok || !ri.ok) return {};
+        auto minus = b->op == T_MINUS;
+        auto lo = minus ? li.lo - ri.hi : li.lo + ri.lo;
+        auto hi = minus ? li.hi - ri.lo : li.hi + ri.hi;
+        if (lo < -CCAP || hi > CCAP) return {};
+        auto s = IvalTerm(OpType(b), lo, hi);
+        if (!s.ok) return {};
+        // Against an operand whose partner varies little, the result is that
+        // operand plus a small range: `i * 4 + b` for b in 0..3 stays within
+        // three of `i * 4`, which a length of `n * 4` bounds. The partner
+        // lies in [plo, phi] (negated for a subtrahend).
+        auto near = [&](const Term &x, int64_t plo, int64_t phi) {
+            if (!SmallOff(plo) || !SmallOff(phi) || !SmallOff(phi - plo)) return;
+            AddFactB(s.b, x.b, SatAdd(x.off, phi));               // s <= x + phi.
+            AddFactB(x.b, s.b, SatSub(0, SatAdd(x.off, plo)));    // x + plo <= s.
+        };
+        if (minus) {
+            near(lt, -ri.hi, -ri.lo);
+        } else {
+            near(lt, ri.lo, ri.hi);
+            near(rt, li.lo, li.hi);
+        }
+        return s;
+    }
+
+    // ------------------------------------------------------------------
+    // Scaled and quotient bases (Lin).
+
+    static Base TmpB(int id) { return Base { BK_TMP, id, 0 }; }
+    static constexpr size_t MAXLINS = 16;
+
+    Lin *LinOf(const Base &b) {
+        if (b.kind != BK_TMP) return nullptr;
+        for (auto &l : flow.lins) if (l.tmp == b.id) return &l;
+        return nullptr;
+    }
+
+    // Whether a quotient's operand term is the value the machine shifted.
+    // A sum with a positive offset is, once the quotient is known to be
+    // nonnegative: the i64 sum could only have wrapped to a value near
+    // -2^63, which every shift short of 63 leaves negative.
+    bool LinExact(Lin &l) {
+        if (!l.exact && l.quot && l.x.off > 0 && Query(Zero(), TmpB(l.tmp), 0)) l.exact = true;
+        return l.exact;
+    }
+
+    // Records l, making room by dropping one no fact names any more.
+    void AddLin(const Lin &l) {
+        auto &ls = flow.lins;
+        if (ls.size() >= MAXLINS) {
+            size_t drop = 0;
+            for (size_t i = 0; i < ls.size(); i++)
+                if (!Mentioned(TmpB(ls[i].tmp))) { drop = i; break; }
+            ls.erase(ls.begin() + drop);
+        }
+        ls.push_back(l);
+    }
+
+    // States what the operands of a new Lin base and of each earlier one
+    // with the same m show about the two bases, then records the new one:
+    // `x <= y + c` gives `x * m <= y * m + c * m`, and for floor quotients
+    // `x / m <= y / m + ceil(c / m)`. Only bases some fact names are worth
+    // relating; the others can no longer meet a length or a bound.
+    void LinRelate(Lin l) {
+        small_vector<Base, 4> to;
+        small_vector<int, 4> who;
+        if (LinExact(l))
+            for (size_t i = 0; i < flow.lins.size(); i++) {
+                auto &e = flow.lins[i];
+                if (e.m == l.m && e.quot == l.quot && Mentioned(TmpB(e.tmp)) && LinExact(e)) {
+                    to.push_back(e.x.b);
+                    who.push_back((int)i);
+                }
+            }
+        if (!to.empty()) {
+            auto fwd = DistsFrom(l.x.b, to), bwd = DistsFrom(l.x.b, to, true);
+            // From `xb <= yb + d` and the operands' offsets, the bound
+            // between the Lin bases.
+            auto scaled = [&](int64_t d, int64_t xoff, int64_t yoff) -> int64_t {
+                if (d == INF) return INF;
+                auto c = SatAdd(d, SatSub(xoff, yoff));
+                if (c == INF || c <= -CCAP || c >= CCAP) return INF;
+                if (l.quot) return c >= 0 ? (c + l.m - 1) / l.m : -((-c) / l.m);
+                int64_t r;
+                return MulIn(c, l.m, r) ? r : INF;
+            };
+            for (size_t k = 0; k < to.size(); k++) {
+                auto &e = flow.lins[who[k]];
+                auto c1 = scaled(fwd[k], l.x.off, e.x.off);
+                if (c1 != INF) AddFactB(TmpB(l.tmp), TmpB(e.tmp), c1);
+                auto c2 = scaled(bwd[k], e.x.off, l.x.off);
+                if (c2 != INF) AddFactB(TmpB(e.tmp), TmpB(l.tmp), c2);
+            }
+        }
+        AddLin(l);
+    }
+
+    // `x * m` for a constant m >= 1, where x's bounds show the product fits
+    // its type: the base of an earlier multiple of the same operand base,
+    // offset by m times the operands' difference (so `4 * i` and
+    // `4 * i + 4` share one), or a new base related to the earlier ones.
+    Term ScaledTerm(TypeExpr *t, const Term &x, int64_t m) {
+        auto xi = BoundsOf(x);
+        int64_t lo, hi;
+        if (!xi.ok || !MulIn(xi.lo, m, lo) || !MulIn(xi.hi, m, hi) || !FitsType(t, lo, hi))
+            return {};
+        if (x.b.kind == BK_ZERO) return IvalTerm(t, lo, hi);
+        if (m == 1) return x;
+        for (auto &e : flow.lins) {
+            int64_t d;
+            if (!e.quot && e.m == m && e.x.b == x.b && MulIn(x.off - e.x.off, m, d) && SmallOff(d))
+                return Term { true, TmpB(e.tmp), d };
+        }
+        auto r = IvalTerm(t, lo, hi);
+        if (xi.lo >= 0) AddFactB(x.b, r.b, SatSub(0, x.off));   // x <= x * m.
+        LinRelate(Lin { r.b.id, x, m, false, true });
+        return r;
+    }
+
+    // `x << k` for a constant count, masked to the operation's width (§6.2):
+    // x times 2^k.
+    Term ShlTerm(Binary *b) {
+        if (mode == M_KILLS) return {};
+        auto t = OpType(b);
+        if (!MachineInt(t)) return {};
+        auto kt = TermOf(b->right);
+        if (!kt.ok || kt.b.kind != BK_ZERO) return {};
+        auto k = kt.off & (IntBits(t->intstorage) - 1);
+        if (k >= 60) return {};
+        auto xt = TermOf(b->left);
+        if (!xt.ok) return {};
+        return ScaledTerm(t, xt, int64_t(1) << k);
+    }
+
+    // A check or a length that bounds a floor quotient bounds its operand:
+    // q <= U gives x <= U * m + m - 1, and q >= L gives x >= L * m. A sieve
+    // gets the bound on n that its `i << 1` needs from `resize((n + 31) >> 5)`.
+    void QuotBack(const Term &t) {
+        if (!t.ok || mode == M_KILLS) return;
+        auto l = LinOf(t.b);
+        if (!l || !l->quot || !LinExact(*l)) return;
+        auto x = l->x;
+        auto m = l->m;
+        auto up = Dist(t.b, Zero()), dn = Dist(Zero(), t.b);
+        int64_t v;
+        if (up != INF && up < CCAP && MulIn(SatAdd(up, 1), m, v))
+            AddFactB(x.b, Zero(), SatSub(SatSub(v, 1), x.off));
+        if (dn != INF && dn > -CCAP && MulIn(SatSub(0, dn), m, v))
+            AddFactB(Zero(), x.b, SatSub(x.off, v));
+    }
+
+    // ------------------------------------------------------------------
+    // Term extraction: a machine integer expression as base + offset. Offset
+    // arithmetic is accepted at i64 only (narrower widths wrap below the
+    // 64-bit math the facts are stated in).
+
+    Term LenTermOf(Node *obj) {
+        auto t = obj->exprtype;
+        if (t && t->kind == TY_REF) t = t->ref->sub;
+        if (t && t->kind == TY_ARRAY && t->arr->akind == A_FIXED && t->arr->size >= 0)
+            return Term { true, Zero(), t->arr->size };
+        auto pid = PlaceOf(obj);
+        if (pid >= 0) return Term { true, LenBase(pid), 0 };
+        return Term {};
+    }
+
+    // An expression with a state-changing later operand cannot be rebuilt
+    // from the operands' current names: earlier values were already read.
+    set<Node *> effectfulterms;
+
+    Term TermOf(Node *n) {
+        if (!n || effectfulterms.count(n)) return {};
+        if (auto i = Is<IntLit>(n)) {
+            if (i->uns || i->val >= CCAP || i->val <= -CCAP) return {};
+            return Term { true, Zero(), i->val };
+        }
+        if (auto id = Is<Ident>(n)) {
+            if (!IntBaseVar(id->vdef)) return {};
+            return Term { true, VarBase(id->vdef), 0 };
+        }
+        if (auto d = Is<Dot>(n); d && d->member == B_LEN) return LenTermOf(d->obj);
+        if (auto b = Is<Binary>(n); b && (b->op == T_PLUS || b->op == T_MINUS)) {
+            auto t = OpType(b);
+            if (!MachineInt(t)) return {};
+            auto lt = TermOf(b->left), rt = TermOf(b->right);
+            if (!lt.ok || !rt.ok) return {};
+            if (b->op == T_PLUS && lt.b.kind == BK_ZERO) std::swap(lt, rt);
+            // Two moving operands: no difference term, but the intervals add.
+            if (rt.b.kind != BK_ZERO)
+                return Derived(n, [&] { return IvalSumTerm(b, lt, rt); });
+            if (t->intstorage != IS_I64) return {};
+            auto off = b->op == T_PLUS ? SatAdd(lt.off, rt.off) : SatSub(lt.off, rt.off);
+            if (off == INF) return {};
+            if (lt.b.kind != BK_ZERO && !SmallOff(off)) return {};
+            return Term { true, lt.b, off };
+        }
+        if (auto b = Is<Binary>(n); b && b->op == T_MUL)
+            return Derived(n, [&] { return MulTerm(b); });
+        if (auto b = Is<Binary>(n); b && b->op == T_SHL)
+            return Derived(n, [&] { return ShlTerm(b); });
+        if (auto b = Is<Binary>(n); b && (b->op == T_MOD || b->op == T_BITAND))
+            return Derived(n, [&] { return RangedOpTerm(b); });
+        if (auto b = Is<Binary>(n); b && (b->op == T_DIV || b->op == T_SHR))
+            return Derived(n, [&] { return QuotTerm(b); });
+        if (auto ac = Is<AsCast>(n))
+            return Derived(n, [&] {
+                auto t = CastTerm(ac);
+                return t.ok ? t : IndexTypeTerm(ac->totype);
+            });
+        // A spliced-in call body (or a bare block) is its value expression.
+        if (auto ib = Is<InlineBlock>(n)) return BlockValueTerm(ib->body, ib->sf);
+        if (auto bl = Is<Block>(n)) return BlockValueTerm(bl, nullptr);
+        // A value read out of storage or returned by a call has no base, but
+        // a narrow integer type still bounds it.
+        if (Is<Index>(n) || Is<Dot>(n) || Is<Call>(n))
+            return Derived(n, [&] {
+                return IsIndexT(n->exprtype) ? IndexTypeTerm(n->exprtype) : TypeRangeTerm(n);
+            });
+        // Any other value of an index or bound type: a branch's, a match's.
+        if (IsIndexT(n->exprtype)) return Derived(n, [&] { return IndexTypeTerm(n->exprtype); });
+        return {};
+    }
+
+    // The storage range of a value of a sub-64-bit integer type (§6.2: every
+    // operation computes at its type, so no such value lies outside it).
+    Term TypeRangeTerm(Node *n) {
+        if (mode == M_KILLS) return {};
+        auto t = n->exprtype;
+        if (!t || t->kind != TY_INT || t->intstorage == IS_VARINT || IntBits(t->intstorage) >= 64)
+            return {};
+        auto [lo, hi] = IntRange(t->intstorage);
+        return IvalTerm(t, lo, hi);
+    }
+
+    // The value a block produces: its trailing expression, or a final return
+    // to the inlined function. Statements before it were already walked, so
+    // their facts are in place; Derived's generation guard rejects the term
+    // if anything was invalidated after the value was computed.
+    Term BlockValueTerm(Block *b, SFunction *sf) {
+        // A return to the inlined function anywhere else leaves the block
+        // with a value of its own.
+        if (sf) {
+            auto last = !b->tail && !b->stmts.empty() ? Is<Return>(b->stmts.back()) : nullptr;
+            for (auto st : b->stmts)
+                if (st != last && ReturnsTo(st, sf)) return {};
+            if (ReturnsTo(b->tail, sf)) return {};
+            if (last) for (auto v : last->vals) if (ReturnsTo(v, sf)) return {};
+        }
+        if (b->tail) return TermOf(b->tail);
+        if (b->stmts.empty()) return {};
+        auto r = Is<Return>(b->stmts.back());
+        if (sf && r && r->target == sf && r->vals.size() == 1) return TermOf(r->vals[0]);
+        return {};
+    }
+
+    // Memoizes a fact-emitting derivation per node. A repeat visit reuses the
+    // recorded term only while no generation has advanced since: afterwards
+    // the operands are no longer the ones that produced the value, and
+    // re-deriving would attach the old value's bound to new operands.
+    map<Node *, pair<Term, int>> derived;
+
+    template<typename F> Term Derived(Node *n, F f) {
+        if (mode == M_KILLS) return {};   // Never poison the memo from a havoc walk.
+        auto it = derived.find(n);
+        if (it != derived.end()) return it->second.second == nextgen ? it->second.first
+                                                                    : Term {};
+        auto t = f();
+        derived[n] = { t, nextgen };
+        return t;
+    }
+
+    // `a % b` and `a & b` bound their result by b (§6.2): a Euclidean
+    // remainder lies in [0, |b|) whatever the dividend's sign, and a mask can
+    // only pass bits the mask has. Both yield a fresh base carrying the
+    // resulting facts.
+    Term RangedOpTerm(Binary *b) {
+        if (mode == M_KILLS) return {};
+        auto t = OpType(b);
+        if (!t || t->kind != TY_INT || t->intstorage == IS_VARINT) return {};
+        auto rt = TermOf(b->right);
+        if (!rt.ok) return {};
+        auto m = TmpBase();
+        if (b->op == T_MOD) {
+            AddFactB(Zero(), m, 0);   // Euclidean remainder is nonnegative.
+            // A zero divisor aborts (§6.2), so a completed modulo has b != 0.
+            // The upper bound is |b|, which is a term only when the divisor
+            // is provably nonnegative or is a negative constant.
+            if (Query(Zero(), rt.b, rt.off)) AddFactB(m, rt.b, SatSub(rt.off, 1));
+            else if (rt.b.kind == BK_ZERO && rt.off < 0)
+                AddFactB(m, Zero(), SatSub(SatSub(0, rt.off), 1));
+        } else if (CmpAdmissible(rt) && Query(Zero(), rt.b, rt.off)) {
+            // A nonnegative mask clears the sign bit. A negative signed
+            // mask can preserve it, so it proves neither this lower bound
+            // nor the usual upper bound by itself; nor does a mask whose
+            // term may have wrapped to a negative value.
+            AddFactB(Zero(), m, 0);
+            AddFactB(m, rt.b, rt.off);
+        }
+        return Term { true, m, 0 };
+    }
+
+    // `x / k` for a constant k >= 1 and `x >> k` for a constant count, which
+    // is masked to the operation's width (§6.2). The shift is monotone, so it
+    // maps the dividend's constant bounds to the quotient's. For a dividend
+    // the facts place at or above zero, truncating division and either shift
+    // agree, the dividend's constant bounds carry over divided, and the
+    // quotient lies in [0, x], below x once x >= 1 and the divisor is at
+    // least 2. That bounds a halving index such as a heap's parent
+    // `(i - 1) / 2` by its child. The relation needs x's term to be the value
+    // the machine divides, not one that wrapped on the way.
+    //
+    // [0, x] also holds for any other shift count, and for a division by any
+    // divisor the facts place at or above zero, unwrapped as well: a
+    // completed division had one of at least 1 (§6.2).
+    Term QuotTerm(Binary *b) {
+        if (mode == M_KILLS) return {};
+        auto t = OpType(b);
+        if (!MachineInt(t)) return {};
+        auto shift = b->op == T_SHR;
+        auto xt = TermOf(b->left);
+        if (!xt.ok) return {};
+        auto nonneg = NoWrap(xt, t->intstorage) && Query(Zero(), xt.b, xt.off);
+        auto kt = TermOf(b->right);
+        if (!kt.ok || kt.b.kind != BK_ZERO) {
+            if (!nonneg) return {};
+            if (!shift && !(kt.ok && NoWrap(kt, t->intstorage) && Query(Zero(), kt.b, kt.off)))
+                return {};
+            auto q = TmpBase();
+            AddFactB(Zero(), q, 0);
+            AddFactB(q, xt.b, xt.off);
+            return Term { true, q, 0 };
+        }
+        auto k = shift ? kt.off & (IntBits(t->intstorage) - 1) : kt.off;
+        if (!shift && k < 1) return {};
+        if (k == (shift ? 0 : 1)) return xt;
+        auto iv = BoundsOf(xt);
+        auto bounded = iv.ok && (shift || iv.lo >= 0);
+        // As a floor quotient by m: a shift floors whatever the sign (§6.2),
+        // a division where the dividend is nonnegative.
+        auto m = shift ? (k < 60 ? int64_t(1) << k : 0) : k;
+        auto lin = m >= 2 && m < CCAP && xt.b.kind != BK_ZERO && (shift || nonneg);
+        if (!nonneg && !bounded && !lin) return {};
+        auto exact = shift ? NoWrap(xt, t->intstorage) : nonneg;
+        // The same dividend base again: the same quotient, or one whole steps
+        // from it where both operands are exact.
+        if (lin)
+            for (auto &e : flow.lins) {
+                if (!e.quot || e.m != m || !(e.x.b == xt.b)) continue;
+                auto d = xt.off - e.x.off;
+                if (d == 0 || (exact && LinExact(e) && d % m == 0))
+                    return Term { true, TmpB(e.tmp), d / m };
+            }
+        auto q = TmpBase();
+        if (bounded) {
+            tmpival[q.id] = shift ? pair<int64_t, int64_t> { iv.lo >> k, iv.hi >> k }
+                                  : pair<int64_t, int64_t> { iv.lo / k, iv.hi / k };
+        }
+        if (nonneg) {
+            AddFactB(Zero(), q, 0);
+            auto below = (shift || k >= 2) && Query(Zero(), xt.b, SatSub(xt.off, 1));
+            AddFactB(q, xt.b, below ? SatSub(xt.off, 1) : xt.off);
+        }
+        if (lin) LinRelate(Lin { q.id, xt, m, true, exact });
+        return Term { true, q, 0 };
+    }
+
+    // Whether an integer expression is provably nonnegative: its term, or a
+    // difference `a - b` the facts order (`b <= a`) with `b >= 0`, which
+    // then lies in [0, a] and cannot have wrapped. Every term must be the
+    // value the machine computed, not one a release build wrapped (§6.2).
+    bool NonNeg(Node *n) {
+        auto t = TermOf(n);
+        if (t.ok && CmpAdmissible(t) && Query(Zero(), t.b, t.off)) return true;
+        auto b = Is<Binary>(n);
+        if (!b || b->op != T_MINUS || effectfulterms.count(b)) return false;
+        if (!MachineInt(OpType(b))) return false;
+        auto lt = TermOf(b->left), rt = TermOf(b->right);
+        return lt.ok && rt.ok && CmpAdmissible(lt) && CmpAdmissible(rt) &&
+               Query(Zero(), rt.b, rt.off) && Query(rt.b, lt.b, SatSub(lt.off, rt.off));
+    }
+
+    // A signed `/`, `%` or `>>` whose left operand is nonnegative, by a
+    // divisor of at least 1, computes the same unsigned and can neither
+    // divide by zero nor overflow: codegen emits it so (Binary::nonneg), and
+    // the C compiler need not prove the sign itself.
+    void JudgeUnsigned(Binary *b) {
+        if (mode != M_JUDGE || effectfulterms.count(b)) return;
+        auto t = OpType(b);
+        if (!t || t->kind != TY_INT || t->intstorage == IS_VARINT || IsUnsigned(t->intstorage))
+            return;
+        if (!NonNeg(b->left)) return;
+        if (b->op != T_SHR) {
+            auto rt = TermOf(b->right);
+            if (!rt.ok || !CmpAdmissible(rt) || !Query(Zero(), rt.b, SatSub(rt.off, 1))) return;
+        }
+        b->nonneg = true;
+    }
+
+    // A numeric cast whose value is inside the target's range is the
+    // identity, so it carries its operand's term across (§6.3). Each side is
+    // checked only where the source type does not already guarantee it.
+    Term CastTerm(AsCast *ac) {
+        if (mode == M_KILLS) return {};
+        auto tt = ac->totype, st = ac->child->exprtype;
+        if (!tt || tt->kind != TY_INT || tt->intstorage == IS_VARINT) return {};
+        if (!st || st->kind != TY_INT || st->intstorage == IS_VARINT) return {};
+        auto ct = TermOf(ac->child);
+        if (!ct.ok) return {};
+        // Every u64 term the analysis produces is a proven-in-range value,
+        // so IntRange's [0, i64.max] is the window that matters for one.
+        auto [slo, shi] = IntRange(st->intstorage);
+        auto [tlo, thi] = IntRange(tt->intstorage);
+        if (slo < tlo && !Query(Zero(), ct.b, SatSub(ct.off, tlo))) return {};
+        if (shi > thi && !Query(ct.b, Zero(), SatSub(thi, ct.off))) return {};
+        return ct;
+    }
+
+    // A term usable as a comparison side: the machine comparison then equals
+    // the mathematical one. A constant, a bare base and len+small-const
+    // (len <= 2^48) are exact; any other base plus an offset only where the
+    // facts show the i64 addition that formed it cannot have wrapped (offsets
+    // on a moving base are only ever formed at i64, see TermOf).
+    bool CmpAdmissible(const Term &t) {
+        if (!t.ok) return false;
+        if (t.b.kind == BK_ZERO || t.b.kind == BK_LEN || t.off == 0) return true;
+        return NoWrap(t, IS_I64);
+    }
+
+    // ------------------------------------------------------------------
+    // Kills.
+
+    enum Mode { M_KILLS, M_RECORD, M_JUDGE };
+    Mode mode = M_JUDGE;
+    set<int> *ksum = nullptr;          // Killscan summary: bumped place ids...
+    set<int> *shsum = nullptr;         // ...those a non-growing bump can hit...
+    set<VarDef *> *vksum = nullptr;    // ...and re-bound/killed variables.
+    bool anybump = false;
+    // While HasKillEffects runs: the variables its node declares, whose
+    // bumps change nothing a comparison outside could have read.
+    set<VarDef *> *freshvars = nullptr;
+    int loopdepth = 0;          // Inside a loop body or function-value body.
+
+    // A kills-only walk with the summary sinks redirected: the flow it
+    // runs over is discarded, and the mode, the sinks and the bump flag
+    // are restored when the scope ends.
+    struct KillsScope {
+        BCE &b;
+        Flow flow;
+        Mode mode;
+        bool anybump;
+        set<int> *ksum, *shsum;
+        set<VarDef *> *vksum;
+        KillsScope(BCE &b, set<int> *ks = nullptr, set<int> *sh = nullptr,
+                   set<VarDef *> *vks = nullptr)
+            : b(b), flow(b.flow), mode(b.mode), anybump(b.anybump), ksum(b.ksum),
+              shsum(b.shsum), vksum(b.vksum) {
+            b.ksum = ks;
+            b.shsum = sh;
+            b.vksum = vks;
+            b.anybump = false;
+            b.mode = M_KILLS;
+        }
+        ~KillsScope() {
+            b.flow = std::move(flow);
+            b.mode = mode;
+            b.anybump = anybump;
+            b.ksum = ksum;
+            b.shsum = shsum;
+            b.vksum = vksum;
+        }
+    };
+
+    void BumpVar(VarDef *v, bool bridge = true) {
+        if (!freshvars || !freshvars->count(v)) anybump = true;
+        auto old = VarBase(v);
+        flow.vgen.Set(VarId(v), ++nextgen);
+        if (vksum) vksum->insert(v);
+        if (!bridge) return;
+        auto it = mono.find(v);
+        if (it == mono.end()) return;
+        if (it->second > 0) AddFactB(old, VarBase(v), 0);   // old <= new.
+        else AddFactB(VarBase(v), old, 0);                  // new <= old.
+    }
+
+    bool Mentioned(const Base &b) {
+        for (auto &f : flow.facts) if (f.l == b || f.r == b) return true;
+        return false;
+    }
+
+    void BumpPlace(int pid, int dir) {   // dir: +1 grow, -1 shrink, 0 unknown.
+        if (!freshvars || !freshvars->count(places[pid].rootv)) anybump = true;
+        auto old = LenBase(pid);
+        flow.pgen.Set(pid, ++nextgen);
+        if (ksum) ksum->insert(pid);
+        if (shsum && dir <= 0) shsum->insert(pid);
+        // The direction carries the facts about the old length over to the
+        // new one. With none to carry it is left out: a growth of storage
+        // that may be anything bumps every place in the program, and their
+        // facts would crowd the ones this body has out of the table.
+        if (!dir || !Mentioned(old)) return;
+        if (dir > 0) AddFactB(old, LenBase(pid), 0);
+        else AddFactB(LenBase(pid), old, 0);
+    }
+
+    // A length mutation with an exactly known delta: push (+1), or append of
+    // a constant-length source. Only meaningful for a single execution, so
+    // kills-mode walks, which are what collect summaries, fall back to the
+    // directional bump.
+    void ExactLenStep(int pid, int64_t delta) {
+        if (mode == M_KILLS) {
+            BumpPlace(pid, delta >= 0 ? 1 : -1);
+            return;
+        }
+        auto old = LenBase(pid);
+        flow.pgen.Set(pid, ++nextgen);
+        auto nw = LenBase(pid);
+        AddFactB(nw, old, delta);            // new <= old + delta.
+        AddFactB(old, nw, SatSub(0, delta)); // old <= new - delta.
+    }
+
+    // The new length equals term t (clear, resize, a fresh array literal).
+    void ExactLenIs(int pid, const Term &t) {
+        if (mode == M_KILLS || !t.ok) return;
+        auto lb = LenBase(pid);
+        AddFactB(lb, t.b, t.off);
+        AddFactB(t.b, lb, SatSub(0, t.off));
+        QuotBack(t);
+    }
+
+    // Could place P name the same array as a write whose target is the exact
+    // place recvpid (>= 0), storage owned by tu (tk == UK_OWNED), or unknown
+    // storage (tk == UK_OPAQUE)? chainroot additionally hits everything whose
+    // access path starts at that variable (the path itself was overwritten).
+    bool AffectedByWrite(int ppid, int recvpid, int tk, VarDef *tu, VarDef *chainroot) {
+        auto &P = places[ppid];
+        if (P.ultkind == UK_STATIC) return false;
+        if (chainroot && P.rootv == chainroot) return true;
+        if (recvpid >= 0) {
+            if (ppid == recvpid) return true;
+            auto &R = places[recvpid];
+            if (R.ultkind == UK_OWNED) {
+                if (P.ultkind == UK_OWNED && P.ultv == R.ultv)
+                    return P.refcrossed || R.refcrossed;   // Distinct plain paths are distinct arrays.
+                return P.ultkind == UK_OPAQUE && Reach(R.ultv) && !HandedApart(P, R.ultv);
+            }
+            return Reach(P.rootv) || (P.ultkind == UK_OWNED ? Reach(P.ultv) : true);
+        }
+        if (tk == UK_OWNED) {
+            if (P.rootv == tu) return true;
+            if (P.ultkind == UK_OWNED && P.ultv == tu) return true;
+            return P.ultkind == UK_OPAQUE && Reach(tu) && !HandedApart(P, tu);
+        }
+        return Reach(P.rootv) || (P.ultkind == UK_OWNED ? Reach(P.ultv) : true);
+    }
+
+    // Whether two array (or element) types are surely different types: an
+    // array is of one type, so places of two such are different arrays,
+    // whatever reference reaches either.
+    static bool DistinctTypes(TypeExpr *a, TypeExpr *b) {
+        if (!a || !b) return false;
+        if (a->kind != b->kind) return true;
+        switch (a->kind) {
+            case TY_INT:
+                if (a->intstorage != b->intstorage || !a->ix != !b->ix) return true;
+                return a->ix && (a->ix->arr != b->ix->arr || a->ix->upto != b->ix->upto);
+            case TY_FLT: return a->fltstorage != b->fltstorage;
+            case TY_STRUCT: return a->struc->st != b->struc->st;
+            case TY_ENUM: return a->enu->en != b->enu->en;
+            case TY_ARRAY:
+                return a->arr->akind != b->arr->akind || DistinctTypes(a->arr->sub, b->arr->sub);
+            case TY_SLICE: return DistinctTypes(a->sub, b->sub);
+            case TY_REF: return DistinctTypes(a->ref->sub, b->ref->sub);
+            default: return false;
+        }
+    }
+
+    // Kills for a grow/shrink builtin; the receiver itself gets the exact
+    // delta when one is known, possible aliases the directional bump. `alloc`
+    // is a pool's allocation. Returns the receiver's place id (or -1).
+    int GrowShrinkKill(Node *recv, int dir, int64_t exact = INT64_MIN, bool alloc = false) {
+        if (recv) NoteStorage(ExprTarget(recv));
+        auto failidx = false, crossed = false;
+        auto pid = recv ? PlaceOf(recv, &failidx, &crossed) : -1;
+        auto rt = recv ? recv->exprtype : nullptr;
+        if (rt && rt->kind == TY_REF) rt = rt->ref->sub;
+        if (rt && rt->kind != TY_ARRAY) rt = nullptr;
+        // A receiver reached through an element (a[i].f.push(...)) is an
+        // element-interior array, which only references into the element
+        // measure -- unless a reference read on the way led out of the
+        // element, to whatever reachable array it points at.
+        if (pid < 0 && failidx && !crossed) {
+            ElementLvalKill(recv);
+            return -1;
+        }
+        for (size_t i = 0; i < places.size(); i++) {
+            if (!places[i].lenmut) continue;
+            if ((int)i != pid && DistinctTypes(places[i].arr, rt)) continue;
+            if (!AffectedByWrite((int)i, pid, UK_OPAQUE, nullptr, nullptr)) continue;
+            if ((int)i == pid && exact != INT64_MIN) ExactLenStep(pid, exact);
+            else BumpPlace((int)i, dir);
+        }
+        // A limited array grows into slots that a reference kept across an
+        // earlier shrink may still name (§5.3), and a pool allocates slots it
+        // freed (§5.4): such a reference, or a loop walking the element,
+        // measures what is stored there now, as after any element store.
+        if (rt && HoldsLen(rt->arr->sub) &&
+            (alloc || (dir >= 0 && rt->arr->akind == A_LIMITED))) {
+            auto [k, u] = ChainUlt(recv);
+            ElementWriteKill(k, u);
+        }
+        return pid;
+    }
+
+    void StorageWriteKill(int tk, VarDef *tu, VarDef *chainroot, TypeExpr *only = nullptr) {
+        NoteStorage(UltTarget(tk, tu));
+        for (size_t i = 0; i < places.size(); i++)
+            if (!OtherArray((int)i, only) && AffectedByWrite((int)i, -1, tk, tu, chainroot))
+                BumpPlace((int)i, 0);
+    }
+
+    // Whether place i is surely not an array of type `only`, the one a write
+    // can change (null: any).
+    bool OtherArray(int i, TypeExpr *only) {
+        return only && places[i].arr && DistinctTypes(places[i].arr, only);
+    }
+
+    // A slice stored into a slot: a slice variable, a field or element in
+    // storage tu owns (tk == UK_OWNED), or a slot unknown here. Whatever
+    // names the slot measures the new slice -- the variable, and every
+    // reference to it -- while the arrays the slices view keep their
+    // lengths.
+    void SlotWriteKill(int tk, VarDef *tu) {
+        if (tk == UK_STATIC) return;   // Static data is never writable.
+        NoteStorage(UltTarget(tk, tu));
+        for (size_t i = 0; i < places.size(); i++)
+            if (places[i].slice && AffectedByWrite((int)i, -1, tk, tu, nullptr))
+                BumpPlace((int)i, 0);
+    }
+
+    void RebindKill(VarDef *root) {
+        NoteStorage(OwnerTarget(root));
+        for (size_t i = 0; i < places.size(); i++)
+            if (places[i].rootv == root) BumpPlace((int)i, 0);
+    }
+
+    // A reference stored into a field or element slot, in storage tu owns
+    // (tk == UK_OWNED) or storage unknown here: whatever is read through the
+    // slot, under any name, is a place whose path reads a stored reference.
+    void RefSlotWriteKill(int tk, VarDef *tu, VarDef *chainroot) {
+        if (tk == UK_STATIC) return;   // Static data is never writable.
+        NoteStorage(UltTarget(tk, tu));
+        for (size_t i = 0; i < places.size(); i++)
+            if (places[i].readsref && AffectedByWrite((int)i, -1, tk, tu, chainroot))
+                BumpPlace((int)i, 0);
+    }
+
+    // The blanket kill for a call whose effects are unknown.
+    void KillByCall() {
+        StorageWriteKill(UK_OPAQUE, nullptr, nullptr);
+        OpaqueIntWriteKill();
+    }
+
+    // Rendering calls can reach an argument's nested values without an
+    // explicit reference node. Until those paths have ordinary call-site
+    // mappings, conservatively invalidate their facts between arguments.
+    void KillRendering() {
+        NoteStorage({ TG_OPAQUE });
+        NoteInt({ TG_OPAQUE });
+        for (size_t i = 0; i < places.size(); i++) BumpPlace((int)i, 0);
+        for (auto v : intvars) BumpVar(v);
+    }
+
+    // ------------------------------------------------------------------
+    // Effects: where a write lands, as the caller of this body sees it.
+
+    enum TargetKind { TG_NONE, TG_OWN, TG_VAR, TG_CLASS, TG_OPAQUE };
+    struct Target { TargetKind kind = TG_OPAQUE; VarDef *v = nullptr; };
+
+    // Storage owned by variable v: this body's own variables are its
+    // business, anything else is a global or a captured outer local.
+    Target OwnerTarget(VarDef *v) {
+        if (!v) return { TG_OPAQUE };
+        if (v->isglobal || !ownvars.count(v)) return { TG_VAR, v };
+        return { TG_OWN, v };
+    }
+
+    // Storage as UltOf classifies it: static data is nothing to report, a
+    // synthetic class root stands for whatever its arguments name, and a
+    // missing root is storage unknown here.
+    Target UltTarget(int k, VarDef *u) {
+        if (k == UK_STATIC) return { TG_NONE };
+        if (k == UK_OWNED) return OwnerTarget(u);
+        return u ? Target { TG_CLASS, u } : Target { TG_OPAQUE };
+    }
+
+    // A receiver or lvalue chain, followed down through fields and elements
+    // to its root variable -- unless a stored reference is read on the way
+    // (a reference-typed field or element), whose pointee is unknown -- and
+    // classified as UltOf does. The chain's head counts as read too, except
+    // for `slot`: the location itself, which a rebind or a slice stored into
+    // it writes, rather than what it points at.
+    pair<int, VarDef *> ChainUlt(Node *n, bool slot = false) {
+        for (auto cur = n;;) {
+            if (auto id = Is<Ident>(cur)) {
+                if (!id->vdef) return { UK_OPAQUE, nullptr };
+                return UltOf(id->vdef, slot && cur == n);
+            }
+            Node *obj = nullptr;
+            if (auto d = Is<Dot>(cur)) obj = d->obj;
+            else if (auto ix = Is<Index>(cur)) obj = ix->obj;
+            else return { UK_OPAQUE, nullptr };
+            if ((cur != n || !slot) && ReadsStoredRef(cur)) return { UK_OPAQUE, nullptr };
+            cur = obj;
+        }
+    }
+
+    Target ExprTarget(Node *n, bool slot = false) {
+        auto [k, u] = ChainUlt(n, slot);
+        return UltTarget(k, u);
+    }
+
+    // The storage an argument hands a callee: the lvalue behind `&`, the
+    // pointee of a reference or slice variable, the array a slice
+    // expression views. A literal is a temporary; a stored reference read
+    // out of a field, or a reference-returning call, is unknown.
+    Target ArgTarget(Node *a) {
+        if (auto u = Is<Unary>(a); u && u->op == T_BITAND) return ExprTarget(u->child);
+        if (Is<Ident>(a)) return ExprTarget(a);
+        if (auto se = Is<SliceExpr>(a)) return ExprTarget(se->obj);
+        if (Is<ArrayLit>(a) || Is<StrLit>(a)) return { TG_NONE };
+        return { TG_OPAQUE };
+    }
+
+    // A class root that is no parameter's (the checker's sentinel roots)
+    // names storage this summary cannot describe.
+    void NoteClass(set<int> &into, bool &opaque, VarDef *cls) {
+        auto it = classparams.find(cls);
+        if (it == classparams.end()) { opaque = true; return; }
+        into.insert(it->second.begin(), it->second.end());
+    }
+
+    void NoteStorage(const Target &t) {
+        if (!effsum) return;
+        switch (t.kind) {
+            case TG_VAR:    effsum->vars.insert(t.v); break;
+            case TG_CLASS:  NoteClass(effsum->params, effsum->opaque, t.v); break;
+            case TG_OPAQUE: effsum->opaque = true; break;
+            default:        break;
+        }
+    }
+
+    void NoteInt(const Target &t) {
+        if (!effsum) return;
+        switch (t.kind) {
+            case TG_VAR:    effsum->intvars.insert(t.v); break;
+            case TG_CLASS:  NoteClass(effsum->intparams, effsum->intopaque, t.v); break;
+            case TG_OPAQUE: effsum->intopaque = true; break;
+            default:        break;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Applying a callee's effects at a call.
+
+    // A write into the storage place recvpid names, by the aliasing rules of
+    // a direct write to it.
+    void KillPlaceWrite(int recvpid, TypeExpr *only = nullptr) {
+        for (size_t i = 0; i < places.size(); i++)
+            if (!OtherArray((int)i, only) &&
+                AffectedByWrite((int)i, recvpid, UK_OPAQUE, nullptr, nullptr))
+                BumpPlace((int)i, 0);
+    }
+
+    // A write into storage a parameter root class names. None of this
+    // body's own classes names one of its own variables (the arguments were
+    // formed before it ran), so storage an own local owns survives, and
+    // anything reached through a reference or owned by a global or an outer
+    // local may be hit. Any other class -- the one an inlined body's
+    // parameter kept, which stands for this body's arguments to it -- may
+    // name whatever is reachable.
+    void KillClassWrite(VarDef *cls, TypeExpr *only = nullptr) {
+        auto own = ownclasses.count(cls) != 0;
+        for (size_t i = 0; i < places.size(); i++) {
+            if (OtherArray((int)i, only)) continue;
+            auto &P = places[i];
+            auto hit = own ? P.ultkind == UK_OPAQUE ||
+                                 (P.ultkind == UK_OWNED && OwnerTarget(P.ultv).kind == TG_VAR)
+                           : AffectedByWrite((int)i, -1, UK_OPAQUE, nullptr, nullptr);
+            if (hit) BumpPlace((int)i, 0);
+        }
+    }
+
+    void KillReachableInts() {
+        for (auto v : intvars) if (Reach(v)) BumpVar(v);
+    }
+
+    // An integer written in storage unknown here: any reachable one.
+    void OpaqueIntWriteKill() {
+        NoteInt({ TG_OPAQUE });
+        KillReachableInts();
+    }
+
+    // A write into the elements of storage tu owns (tk == UK_OWNED), or of
+    // storage unknown here. No place lies in an element, but a reference to
+    // one, or into one, measures the slice or array it holds -- which is
+    // never a resizable array (§3.4).
+    void ElementWriteKill(int tk, VarDef *tu) {
+        if (tk == UK_STATIC) return;   // Static data is never writable.
+        NoteStorage(UltTarget(tk, tu));
+        for (size_t i = 0; i < places.size(); i++) {
+            auto &P = places[i];
+            if (P.refcrossed && P.inelem && AffectedByWrite((int)i, -1, tk, tu, nullptr))
+                BumpPlace((int)i, 0);
+        }
+    }
+
+    // A store or a resize at an lvalue inside an element: of the array the
+    // chain indexes, or wherever a stored reference read after the element
+    // leads, which may be any reachable storage.
+    void ElementLvalKill(Node *lval) {
+        auto [k, u] = ChainUlt(lval, true);
+        if (k == UK_OPAQUE && !u) StorageWriteKill(UK_OPAQUE, nullptr, nullptr);
+        else ElementWriteKill(k, u);
+    }
+
+    // Whether a value of type t holds a length by value: a slice, an array
+    // other than a fixed one, or a fixed array, struct or enum holding one.
+    // A nominal type whose instance is not at hand counts as one. With
+    // `refs`, a reference anywhere in it counts too: storing one redirects
+    // whatever place is reached through it. Without `lens`, only a
+    // reference does.
+    static bool HoldsLen(TypeExpr *t, bool refs = false, bool lens = true, int depth = 0) {
+        if (!t || depth > 32) return true;
+        auto any = [&](const vector<TypeExpr *> &fts) {
+            for (auto ft : fts) if (ft && HoldsLen(ft, refs, lens, depth + 1)) return true;
+            return false;
+        };
+        switch (t->kind) {
+            case TY_SLICE:
+                return lens;
+            case TY_REF:
+                return refs;
+            case TY_ARRAY:
+                return (lens && t->arr->akind != A_FIXED) ||
+                       HoldsLen(t->arr->sub, refs, lens, depth + 1);
+            case TY_STRUCT:
+                return !t->struc->inst || any(t->struc->inst->ftypes);
+            case TY_ENUM: case TY_VARIANT: {
+                auto inst = t->kind == TY_ENUM ? t->enu->inst : t->var->adt->enu->inst;
+                if (!inst) return true;
+                for (auto &fts : inst->vftypes) if (any(fts)) return true;
+                return false;
+            }
+            case TY_GENERIC:
+                return true;
+            default:
+                return false;   // Scalars, references, functions.
+        }
+    }
+
+    static bool HoldsRef(TypeExpr *t) { return HoldsLen(t, true, false); }
+
+    // The slot a reference to a slice passed as `a` names: the slice lvalue
+    // behind `&`, or where a reference variable points. One read out of a
+    // field or an element, or returned by a call, points somewhere unknown.
+    pair<int, VarDef *> ArgSlot(Node *a, Node *lv) {
+        if (auto id = Is<Ident>(lv)) {
+            if (id->vdef) return UltOf(id->vdef, true);
+        } else if (lv != a && lv->exprtype && lv->exprtype->kind == TY_SLICE) {
+            return ChainUlt(lv, true);
+        }
+        return { UK_OPAQUE, nullptr };
+    }
+
+    // A slice argument, or a reference to one, other than a slice
+    // expression. The callee resizes neither: it may store another slice
+    // into the slot a reference names, and write the elements the slice
+    // views, where only references to elements measure a length or read the
+    // references the elements hold.
+    bool KillSliceArg(Node *a, Node *lv) {
+        auto t = a->exprtype;
+        auto st = IsSliceRef(t) ? t->ref->sub : t;
+        if (!st || st->kind != TY_SLICE) return false;
+        if (Is<ArrayLit>(lv) || Is<StrLit>(lv)) return true;   // A temporary.
+        if (st != t) {
+            auto [k, u] = ArgSlot(a, lv);
+            SlotWriteKill(k, u);
+        }
+        auto lens = HoldsLen(st->sub), refs = HoldsRef(st->sub);
+        if (lens || refs) {
+            auto [k, u] = ChainUlt(lv);
+            if (lens) ElementWriteKill(k, u);
+            if (refs) RefSlotWriteKill(k, u, nullptr);
+        }
+        return true;
+    }
+
+    // A callee's resize or overwrite of the storage behind one of its
+    // reference parameters, at the argument bound to it.
+    void KillArgStorage(Node *a) {
+        auto lv = a;
+        if (auto u = Is<Unary>(a); u && u->op == T_BITAND) lv = u->child;
+        if (!Is<SliceExpr>(lv) && KillSliceArg(a, lv)) return;
+        auto t = ArgTarget(a);
+        NoteStorage(t);
+        // An array of scalars holds no other array, so a write through it
+        // changes the length of an array of its own type only.
+        auto at = lv->exprtype;
+        if (at && at->kind == TY_REF) at = at->ref->sub;
+        auto sub = at && at->kind == TY_ARRAY ? at->arr->sub : nullptr;
+        auto only = sub && (sub->kind == TY_INT || sub->kind == TY_FLT || sub->kind == TY_BOOL)
+                        ? at : nullptr;
+        switch (t.kind) {
+            case TG_NONE:
+                return;
+            case TG_OWN: case TG_VAR: {
+                // The argument's own place is the precise target; a struct
+                // or a slice expression has none, so all of the variable goes.
+                auto pid = Is<SliceExpr>(lv) ? -1 : PlaceOf(lv);
+                if (pid >= 0) KillPlaceWrite(pid, only);
+                else StorageWriteKill(UK_OWNED, t.v, t.v, only);
+                return;
+            }
+            case TG_CLASS:
+                KillClassWrite(t.v, only);
+                return;
+            default:
+                StorageWriteKill(UK_OPAQUE, nullptr, nullptr, only);
+                return;
+        }
+    }
+
+    // A callee's write of the integer behind one of its reference
+    // parameters. Only a variable is a tracked base: the argument names one
+    // directly or through a reference variable, or a stored reference read
+    // on the way could lead to any reachable one.
+    void KillArgInt(Node *a) {
+        auto lv = a;
+        if (auto u = Is<Unary>(a); u && u->op == T_BITAND) lv = u->child;
+        if (auto id = Is<Ident>(lv); id && id->vdef) {
+            auto v = id->vdef;
+            if (IntBaseVar(v)) {
+                NoteInt(OwnerTarget(v));
+                if (mode == M_RECORD) RecordSet(v, Term {}, false);   // As in PointeeWriteKill.
+                BumpVar(v);
+                return;
+            }
+            if (!v->type || v->type->kind != TY_REF) return;
+            auto [k, u] = UltOf(v);
+            if (k == UK_STATIC) return;
+            if (k == UK_OWNED) {
+                if (IntBaseVar(u)) {
+                    NoteInt(OwnerTarget(u));
+                    if (mode == M_RECORD) RecordSet(u, Term {}, false);
+                    BumpVar(u);
+                }
+                return;
+            }
+            NoteInt(UltTarget(k, u));
+            KillReachableInts();
+            return;
+        }
+        auto t = ExprTarget(lv);
+        if (t.kind == TG_OPAQUE || t.kind == TG_CLASS) {
+            NoteInt(t);
+            KillReachableInts();
+        }
+    }
+
+    // Kills for a call with known effects, each translated to what it names
+    // here: a parameter's to the argument bound to it, a global's or outer
+    // local's to that variable. The translated effects are recorded on the
+    // same paths, so a summary includes what the body's callees do.
+    void ApplyEffects(const Effects &e, const vector<Node *> &an) {
+        if (e.opaque) { KillByCall(); return; }
+        for (auto j : e.params) {
+            if (j >= (int)an.size()) { KillByCall(); return; }
+            KillArgStorage(an[j]);
+        }
+        for (auto v : e.vars) StorageWriteKill(UK_OWNED, v, v);
+        if (e.intopaque) {
+            OpaqueIntWriteKill();
+            return;
+        }
+        for (auto j : e.intparams) {
+            if (j >= (int)an.size()) {
+                OpaqueIntWriteKill();
+                return;
+            }
+            KillArgInt(an[j]);
+        }
+        for (auto v : e.intvars) {
+            NoteInt(OwnerTarget(v));
+            BumpVar(v);
+        }
+    }
+
+    // Kills for a call into user code: the summarized effects of its target
+    // (of every target, for a tag dispatch), or the blanket kill where there
+    // is no summary to consult.
+    void CallKills(Call *c) {
+        Effects e;
+        auto known = c->spec || !c->dispatch.empty();
+        auto merge = [&](FnSpec *sp) {
+            auto it = effects.find(sp);
+            if (it == effects.end()) known = false;
+            else e.Merge(it->second);
+        };
+        if (c->spec) merge(c->spec);
+        for (auto d : c->dispatch) merge(d);
+        if (!known) { KillByCall(); return; }
+        // The callee writes the variables this call passes for its free
+        // variables, where the optimizer copied them.
+        if (!c->fvremap.empty()) {
+            auto passed = [&](set<VarDef *> &vs) {
+                set<VarDef *> out;
+                for (auto v : vs) out.insert(c->FreeVarArg(v));
+                vs = std::move(out);
+            };
+            passed(e.vars);
+            passed(e.intvars);
+        }
+        ApplyEffects(e, c->ArgNodes());
+    }
+
+    // ------------------------------------------------------------------
+    // Call sites: what a caller proves about the arguments it passes.
+
+    static bool LenTrackable(TypeExpr *t) {
+        if (t && t->kind == TY_REF) t = t->ref->sub;
+        return t && (t->kind == TY_SLICE || (t->kind == TY_ARRAY && t->arr->akind != A_FIXED));
+    }
+
+    const Iface &InterfaceOf(FnSpec *sp) {
+        auto it = ifaces.find(sp);
+        if (it != ifaces.end()) return it->second;
+        auto &f = ifaces[sp];
+        f.bases.push_back({ false, -1 });
+        for (size_t j = 0; j < sp->params.size(); j++) {
+            auto p = sp->params[j];
+            if (IntBaseVar(p)) f.bases.push_back({ false, (int)j });
+            else if (LenTrackable(p->type)) f.bases.push_back({ true, (int)j });
+        }
+        return f;
+    }
+
+    // The length a slice or reference variable takes from the place it is
+    // bound to: `let w = &a` and `let v = s` name arrays whose length the
+    // facts may already know. This is what carries a length through the
+    // parameter bindings of an inlined call.
+    Term BoundLenOf(Node *init) {
+        if (auto u = Is<Unary>(init); u && u->op == T_BITAND) init = u->child;
+        if (!Is<Ident>(init) && !Is<Dot>(init)) return {};
+        // A field converted to the slice it binds views the field's array
+        // whole: its length is that array's, at the place `.len` of the
+        // field names.
+        if (auto d = Is<Dot>(init); d && init->exprtype && init->exprtype->kind == TY_SLICE) {
+            auto ft = FieldTypeOf(d);
+            if (ft && ft->kind == TY_ARRAY && ft->arr->akind != A_FIXED) {
+                auto pid = PlaceOf(init, nullptr, nullptr, ft);
+                return pid >= 0 ? Term { true, LenBase(pid), 0 } : Term {};
+            }
+        }
+        return LenTermOf(init);
+    }
+
+    // The length of the array an argument passes, in the caller's current
+    // state -- the callee reads it at entry, after every argument has been
+    // evaluated. Behind `&` or a reference variable it is the place's
+    // length; a slice expression's is what its bounds just stated; a
+    // literal's is its element count.
+    Term ArgLenTerm(Node *a, const Term &slen) {
+        if (auto u = Is<Unary>(a); u && u->op == T_BITAND) a = u->child;
+        if (Is<SliceExpr>(a)) return slen;
+        if (auto t = FreshLenOf(a); t.ok) return t;
+        return LenTermOf(a);
+    }
+
+    // Records what this site proves about each target's interface bases,
+    // as the meet with what earlier sites proved (see Sites). `ints` holds
+    // each integer argument's term as sampled right after its evaluation,
+    // which is the value the callee receives. Lengths are read from the
+    // arguments' current state, which `moved` says a later argument changed.
+    void RecordSite(Call *c, const vector<Node *> &an, const vector<Term> &ints,
+                    const vector<Term> &slens, bool moved) {
+        auto record = [&](FnSpec *sp) {
+            auto &S = sites[sp];
+            S.seen++;
+            if (!S.viable) return;
+            auto &bases = InterfaceOf(sp).bases;
+            auto n = (int)bases.size();
+            if (n <= 1 || an.size() < sp->params.size()) { S.viable = false; return; }
+            if (S.c.empty()) S.c.assign(n * n, INT64_MIN);
+            vector<Term> terms(n);
+            terms[0] = Term { true, Zero(), 0 };
+            for (auto k = 1; k < n; k++) {
+                auto [islen, j] = bases[k];
+                terms[k] = islen ? (moved ? Term {} : ArgLenTerm(an[j], slens[j])) : ints[j];
+            }
+            auto anyfinite = false;
+            for (auto x = 0; x < n; x++) {
+                vector<Base> to;
+                vector<int> ys;
+                if (terms[x].ok)
+                    for (auto y = 0; y < n; y++)
+                        if (y != x && terms[y].ok) {
+                            to.push_back(terms[y].b);
+                            ys.push_back(y);
+                        }
+                auto d = to.empty() ? small_vector<int64_t, 4> {} : DistsFrom(terms[x].b, to);
+                for (auto y = 0; y < n; y++) {
+                    if (y == x) continue;
+                    auto &cell = S.c[x * n + y];
+                    auto cv = INF;
+                    auto yit = std::find(ys.begin(), ys.end(), y);
+                    // `bx <= by + d` for the bases is `X - offx <= Y - offy + d`.
+                    if (yit != ys.end() && d[yit - ys.begin()] != INF)
+                        cv = SatAdd(d[yit - ys.begin()], terms[x].off - terms[y].off);
+                    if (cv > cell) cell = cv;
+                    if (cell != INF) anyfinite = true;
+                }
+            }
+            if (!anyfinite) S.viable = false;
+        };
+        if (c->spec) record(c->spec);
+        for (auto d : c->dispatch) record(d);
+    }
+
+    // Grants a specialization, at entry, what all of its call sites proved
+    // about its parameters -- once every site has been analyzed, and only
+    // when nothing reaches it any other way.
+    void SeedEntryFacts(FnSpec *sp) {
+        if (opaquesites.count(sp)) return;
+        auto sit = sites.find(sp);
+        auto nit = nsites.find(sp);
+        if (sit == sites.end() || nit == nsites.end()) return;
+        auto &S = sit->second;
+        if (!S.viable || S.seen == 0 || S.seen != nit->second) return;
+        auto &bases = InterfaceOf(sp).bases;
+        auto n = (int)bases.size();
+        vector<Base> bs(n);
+        vector<bool> ok(n, true);
+        bs[0] = Zero();
+        for (auto k = 1; k < n; k++) {
+            auto [islen, j] = bases[k];
+            auto p = sp->params[j];
+            if (islen) {
+                auto pid = PlaceOfVar(p);
+                ok[k] = pid >= 0;
+                if (pid >= 0) bs[k] = LenBase(pid);
+            } else {
+                bs[k] = VarBase(p);
+            }
+        }
+        for (auto x = 0; x < n; x++)
+            for (auto y = 0; y < n; y++) {
+                auto cv = S.c[x * n + y];
+                if (x != y && ok[x] && ok[y] && cv != INF && cv != INT64_MIN)
+                    AddFactB(bs[x], bs[y], cv);
+            }
+    }
+
+    // ------------------------------------------------------------------
+    // Variable writes: shifts, sets, and invariant recording.
+
+    void RecordShift(VarDef *v, int64_t c) {
+        auto cp = CandOf(v);
+        if (!cp) return;
+        auto &st = *cp;
+        auto [lo, hi] = IntRange(v->type->intstorage);
+        if (c > 0) {
+            auto nowrap = Query(VarBase(v), Zero(), SatSub(hi, c));   // v <= hi - c.
+            st.wrapfree = st.wrapfree && nowrap;
+            st.ge0 = st.ge0 && nowrap;
+            for (auto pit = st.le.begin(); pit != st.le.end();)
+                if (Query(VarBase(v), LenBase(pit->first), SatSub(pit->second, c))) ++pit;
+                else pit = st.le.erase(pit);
+        } else if (c < 0) {
+            auto nowrap = Query(Zero(), VarBase(v), SatSub(c, lo));   // v >= lo - c.
+            st.wrapfree = st.wrapfree && nowrap;
+            st.ge0 = st.ge0 && Query(Zero(), VarBase(v), c);          // v >= -c.
+            if (!nowrap) st.le.clear();
+        }
+    }
+
+    void RecordSet(VarDef *v, const Term &t, bool isdecl) {
+        auto cp = CandOf(v);
+        if (!cp) return;
+        auto &st = *cp;
+        // A term that may have wrapped says nothing about the value.
+        auto exact = NoWrap(t, v->type->intstorage);
+        // The declaration's value decides how far above len(P) the bound
+        // sits: `var j = 1` before a loop that strides j up to `j + 4 <=
+        // len` stays within len + 1, and a value below len, such as a masked
+        // index, can keep strictly below it, which bounds an index by
+        // itself.
+        if (isdecl && !st.declseen) {
+            vector<pair<int, int64_t>> le;
+            for (auto [pid, c] : st.le) {
+                auto d = exact ? Dist(t.b, LenBase(pid)) : INF;
+                if (d == INF) continue;
+                auto need = SatAdd(d, t.off);
+                if (!SmallOff(need)) continue;
+                le.push_back({ pid, std::max<int64_t>(need, 0) });
+                if (need < 0) le.push_back({ pid, -1 });
+            }
+            st.le = std::move(le);
+        }
+        if (isdecl) st.declseen = true;
+        st.ge0 = st.ge0 && exact && Query(Zero(), t.b, t.off);
+        for (auto pit = st.le.begin(); pit != st.le.end();)
+            if (exact && Query(t.b, LenBase(pit->first), SatSub(pit->second, t.off))) ++pit;
+            else pit = st.le.erase(pit);
+    }
+
+    // Which way a plain assignment moves v, measured against v's value just
+    // before it. A term that may have wrapped says nothing about the value.
+    void RecordSetDir(VarDef *v, const Term &t) {
+        auto cp = CandOf(v);
+        if (!cp) return;
+        auto &st = *cp;
+        auto exact = t.ok && NoWrap(t, v->type->intstorage);
+        st.setdec = st.setdec && exact && Query(t.b, VarBase(v), SatSub(0, t.off));   // e <= v.
+        st.setinc = st.setinc && exact && Query(VarBase(v), t.b, t.off);              // v <= e.
+    }
+
+    // Re-assert granted axioms as stored facts so a shift transports them.
+    void Materialize(VarDef *v) {
+        if (mode != M_JUDGE) return;
+        auto vb = VarBase(v);
+        if (Ge0(v)) AddFactB(Zero(), vb, 0);
+        auto it = lelen.find(v);
+        if (it != lelen.end())
+            for (auto [pid, c] : it->second) AddFactB(vb, LenBase(pid), c);
+    }
+
+    // Whether base + off is the value computed at storage s, rather than one
+    // a release build wrapped around. Facts are clamped to CCAP, so a bound
+    // at the clamp is no bound at all for a 64-bit value.
+    bool NoWrap(const Term &t, IntStorage s) {
+        if (!t.ok || !t.off || t.b.kind == BK_ZERO) return t.ok;
+        auto [lo, hi] = IntRange(s);
+        hi = std::min(hi, CCAP - 1);
+        lo = std::max(lo, 1 - CCAP);
+        return t.off > 0 ? Query(t.b, Zero(), SatSub(hi, t.off))
+                         : Query(Zero(), t.b, SatSub(t.off, lo));
+    }
+
+    void ShiftCore(VarDef *v, int64_t c) {
+        if (!SmallOff(c)) { BumpVar(v, false); return; }
+        auto [lo, hi] = IntRange(v->type->intstorage);
+        auto ok = c > 0 ? Query(VarBase(v), Zero(), SatSub(hi, c))
+                        : Query(Zero(), VarBase(v), SatSub(c, lo));
+        if (!ok) { BumpVar(v); return; }
+        Materialize(v);
+        // The base keeps its generation and is reinterpreted as the new value
+        // (every fact mentioning it shifts below), so any memoized term built
+        // on it must not be reused past this point.
+        nextgen++;
+        auto vb = VarBase(v);
+        for (auto &f : flow.facts) {
+            auto l = f.l == vb, r = f.r == vb;
+            if (l == r) continue;
+            f.c = SatAdd(f.c, l ? c : -c);
+        }
+        for (auto &l : flow.lins)
+            if (l.x.b == vb) l.x.off = SatSub(l.x.off, c);
+        erase_if(flow.lins, [](const Lin &l) { return !SmallOff(l.x.off); });
+    }
+
+    void ShiftWrite(VarDef *v, int64_t c) {
+        NoteInt(OwnerTarget(v));
+        if (mode == M_RECORD) RecordShift(v, c);
+        if (mode == M_KILLS) { BumpVar(v); return; }
+        if (c == 0) return;
+        ShiftCore(v, c);
+    }
+
+    // A declaration starts the variable over, so only a plain assignment
+    // bridges the generations of a monotone one.
+    void SetWrite(VarDef *v, Node *rhs, bool isdecl) {
+        NoteInt(OwnerTarget(v));
+        auto t = mode == M_KILLS ? Term {} : TermOf(rhs);
+        if (mode == M_RECORD) {
+            if (t.ok && t.b == VarBase(v)) RecordShift(v, t.off);
+            else RecordSet(v, t, isdecl);
+            if (!isdecl) RecordSetDir(v, t);
+        }
+        if (mode == M_KILLS) { BumpVar(v, !isdecl); return; }
+        if (t.ok && t.b == VarBase(v)) { ShiftCore(v, t.off); return; }
+        BumpVar(v, !isdecl);
+        if (NoWrap(t, v->type->intstorage)) {
+            auto nb = VarBase(v);
+            AddFactB(nb, t.b, t.off);
+            AddFactB(t.b, nb, SatSub(0, t.off));
+        }
+    }
+
+    // `v + rhs` for the compound assignment `v += rhs` (or `-=`), which a
+    // plain assignment's rules then read: one node per assignment, so that
+    // terms derived from it are memoized like any other operand's.
+    map<Assign *, Binary *> compoundsums;
+    Binary *CompoundSum(Assign *a) {
+        auto &bin = compoundsums[a];
+        if (!bin) {
+            bin = ast.New<Binary>(a->line, a->op == T_PLUSEQ ? T_PLUS : T_MINUS, a->lval, a->rhs);
+            bin->exprtype = a->lval->exprtype;
+        }
+        return bin;
+    }
+
+    void VarKillWrite(VarDef *v) {
+        if (IntBaseVar(v)) NoteInt(OwnerTarget(v));
+        if (mode == M_RECORD) RecordSet(v, Term {}, false);
+        BumpVar(v, false);
+    }
+
+    // A variable whose value is a base (TermOf), so that every write of it
+    // has to reach the facts: a machine integer, or a u64 of an index type,
+    // which is below a length and so within i64.
+    static bool IntBaseVar(VarDef *v) {
+        return v && (MachineInt(v->type) || IsIndexT(v->type));
+    }
+
+    // ------------------------------------------------------------------
+    // Unit steps: `v += s` with s always 0 or 1, the counter of a branchless
+    // partition or compaction (`lt += if less { 1 } else { 0 }`).
+
+    // An expression whose value is 0 or 1 whichever way it goes: the
+    // literals, and a branch all of whose arms are such.
+    static bool InUnit(Node *n) {
+        if (auto lit = Is<IntLit>(n)) return !lit->uns && (lit->val == 0 || lit->val == 1);
+        if (auto bl = Is<Block>(n)) return bl->stmts.empty() && bl->tail && InUnit(bl->tail);
+        if (auto ie = Is<IfExpr>(n)) return ie->elseb && InUnit(ie->thenb) && InUnit(ie->elseb);
+        return false;
+    }
+
+    // Whether evaluating n can assign v, as one of its writes or by
+    // declaring it anew.
+    static bool WritesVar(Node *n, VarDef *v) {
+        if (!n) return false;
+        if (auto a = Is<Assign>(n)) {
+            auto id = Is<Ident>(a->lval);
+            if (id && id->vdef == v) return true;
+        } else if (auto inc = Is<IncDec>(n)) {
+            auto id = Is<Ident>(inc->lval);
+            if (id && id->vdef == v) return true;
+        } else if (auto vd = Is<VarDecl>(n)) {
+            for (auto d : vd->defs) if (d == v) return true;
+        }
+        auto found = false;
+        n->Children([&](Node *ch) { found = found || WritesVar(ch, v); });
+        return found;
+    }
+
+    static bool IsUnitStep(Assign *a, VarDef *v) {
+        return a->op == T_PLUSEQ && !a->pointee && InUnit(a->rhs) && !WritesVar(a->rhs, v);
+    }
+
+    // The most writes to v one execution of n can make, where each is a unit
+    // step or `v++`; INF if any write is something else, or sits in a loop
+    // or a function value of n, which may run it any number of times.
+    static int64_t StepsOf(Node *n, VarDef *v) {
+        if (!n) return 0;
+        if (auto a = Is<Assign>(n)) {
+            auto id = Is<Ident>(a->lval);
+            if (id && id->vdef == v) return IsUnitStep(a, v) ? 1 : INF;
+        } else if (auto inc = Is<IncDec>(n)) {
+            auto id = Is<Ident>(inc->lval);
+            if (id && id->vdef == v) return inc->op == T_INC ? 1 : INF;
+        } else if (auto vd = Is<VarDecl>(n)) {
+            for (auto d : vd->defs) if (d == v) return INF;
+        } else if (Is<While>(n) || Is<LoopExpr>(n) || Is<ForLoop>(n) || Is<FunVal>(n)) {
+            return WritesVar(n, v) ? INF : 0;
+        } else if (auto ie = Is<IfExpr>(n)) {
+            return SatAdd(StepsOf(ie->cond, v),
+                          std::max(StepsOf(ie->thenb, v), StepsOf(ie->elseb, v)));
+        } else if (auto me = Is<MatchExpr>(n)) {
+            int64_t arms = 0;
+            for (auto &arm : me->arms) arms = std::max(arms, StepsOf(arm.body, v));
+            return SatAdd(StepsOf(me->scrutinee, v), arms);
+        }
+        int64_t s = 0;
+        n->Children([&](Node *ch) { s = SatAdd(s, StepsOf(ch, v)); });
+        return s;
+    }
+
+    // `v += s` for a unit step s: as a shift by 1 for the invariants (the
+    // worst case for wrapping and for `v <= len`), and otherwise a new value
+    // between the old one and one more, where that cannot wrap.
+    void StepWrite(VarDef *v) {
+        NoteInt(OwnerTarget(v));
+        if (mode == M_RECORD) RecordShift(v, 1);
+        if (mode == M_KILLS) { BumpVar(v); return; }
+        auto hi = IntRange(v->type->intstorage).second;
+        auto nowrap = Query(VarBase(v), Zero(), SatSub(hi, 1));
+        auto old = VarBase(v);
+        BumpVar(v, false);
+        if (!nowrap) return;
+        auto nw = VarBase(v);
+        AddFactB(old, nw, 0);
+        AddFactB(nw, old, 1);
+    }
+
+    // The variables a counted loop's body steps by at most one per
+    // iteration, which a for loop ties to its index (ForLoop::BceWalk).
+    vector<VarDef *> StepCounters(Node *body) {
+        vector<VarDef *> written;
+        function<void(Node *)> scan = [&](Node *n) {
+            if (!n) return;
+            Ident *id = nullptr;
+            if (auto a = Is<Assign>(n)) id = Is<Ident>(a->lval);
+            else if (auto inc = Is<IncDec>(n)) id = Is<Ident>(inc->lval);
+            if (id && id->vdef && std::find(written.begin(), written.end(), id->vdef) == written.end())
+                written.push_back(id->vdef);
+            n->Children(scan);
+        };
+        scan(body);
+        vector<VarDef *> out;
+        for (auto v : written)
+            if (IntBaseVar(v) && !v->captured && !v->isglobal && !addrof.count(v) &&
+                StepsOf(body, v) <= 1)
+                out.push_back(v);
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // Lvalue chains (for kill targeting).
+
+    enum ChainKind { CH_OK, CH_INDEX, CH_FAIL };
+    struct Chain {
+        ChainKind kind = CH_FAIL;
+        VarDef *root = nullptr;
+        bool anycross = false, rootonlycross = false;
+    };
+
+    // A chain of fields down to its root variable. A field read on the way
+    // that holds a reference crosses into wherever that points
+    // (ReadsStoredRef); the field the chain ends in is the slot written, and
+    // a root reference variable's own crossing names the storage it points
+    // into, as for a place through it (PlaceFor).
+    Chain ChainOf(Node *n) {
+        Chain ch;
+        auto midcross = false;
+        for (auto cur = n;;) {
+            if (auto id = Is<Ident>(cur)) {
+                ch.root = id->vdef;
+                if (!ch.root) return ch;
+                auto rootref = ch.root->type && ch.root->type->kind == TY_REF;
+                ch.anycross = midcross || rootref;
+                ch.rootonlycross = rootref && !midcross;
+                ch.kind = CH_OK;
+                return ch;
+            }
+            if (auto d = Is<Dot>(cur); d && d->fieldidx >= 0) {
+                if (cur != n && ReadsStoredRef(d)) midcross = true;
+                cur = d->obj;
+                continue;
+            }
+            if (Is<Index>(cur)) { ch.kind = CH_INDEX; return ch; }
+            return ch;
+        }
+    }
+
+    void PointeeWriteKill(Node *lval, TypeExpr *pt) {
+        // A slice stored through a reference to one replaces the slice its
+        // slot holds; what that slice viewed is not written.
+        auto slice = pt && pt->kind == TY_SLICE;
+        int tk = UK_OPAQUE;
+        VarDef *tu = nullptr;
+        if (auto id = Is<Ident>(lval); id && id->vdef) {
+            auto [k, u] = UltOf(id->vdef, slice);
+            tk = k;
+            tu = u;
+        }
+        if (tk == UK_STATIC) return;   // Static data is never writable.
+        if (slice) {
+            SlotWriteKill(tk, tu);
+            return;
+        }
+        // A value holding no length and no reference changes no length
+        // where it lands, whatever else it overwrites.
+        if (HoldsLen(pt, true)) StorageWriteKill(tk, tu, nullptr);
+        if (pt && pt->kind == TY_INT) {
+            if (tk == UK_OWNED) {
+                if (tu->type && tu->type->kind == TY_INT) {
+                    NoteInt(OwnerTarget(tu));
+                    // No invariant candidate has its address taken, which a
+                    // reference to it needs, but should one have, this write
+                    // of a value unknown here ends its invariant.
+                    if (mode == M_RECORD) RecordSet(tu, Term {}, false);
+                    BumpVar(tu, false);
+                }
+            } else {
+                NoteInt(UltTarget(tk, tu));
+                for (auto v : intvars) if (Reach(v)) BumpVar(v, false);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Judging.
+
+    void RecordLine(Line l, bool elided) {
+        auto &e = lineout[{ l.fileidx, l.line }];
+        if (elided) e.first++;
+        else e.second++;
+    }
+
+    void JudgeIndex(Index *ix, const Term &lent) {
+        if (mode == M_KILLS) return;
+        auto it = TermOf(ix->idx);
+        auto proven = [&] {
+            return lent.ok && it.ok && Query(Zero(), it.b, it.off) &&
+                   Query(it.b, lent.b, SatSub(SatSub(lent.off, it.off), 1));
+        };
+        // A probed operand runs no checks, so none completes to state facts.
+        if (probing) {
+            if (!proven() && !IndexInRangeByType(ix)) probefail = true;
+            return;
+        }
+        if (mode == M_JUDGE) {
+            idxtotal++;
+            auto ok = proven();
+            if (ok) { ix->nobc = true; idxelided++; }
+            RecordLine(ix->line, ok);
+            if (!ok) KeptInCheckfree(ix->line, KeptWhy(ix->idx, ix->obj, it, lent, -1));
+        }
+        CheckedFacts(it, lent, -1);
+    }
+
+    // A conversion into an index or bound type (§3.11): the check `a[x]`
+    // would make, or for a bound, that x <= a.len.
+    void JudgeIndexCast(AsCast *ac) {
+        if (mode == M_KILLS) return;
+        auto t = ac->totype;
+        auto pit = ixpid.find(t->ix->arr);
+        auto lent = pit != ixpid.end() && pit->second >= 0
+                        ? Term { true, LenBase(pit->second), 0 } : Term {};
+        auto slack = t->ix->upto ? 0 : -1;
+        auto xt = TermOf(ac->child);
+        auto proven = [&] {
+            return lent.ok && xt.ok && Query(Zero(), xt.b, xt.off) &&
+                   Query(xt.b, lent.b, SatAdd(SatSub(lent.off, xt.off), slack));
+        };
+        if (probing) {
+            if (!proven()) probefail = true;
+            return;
+        }
+        if (mode == M_JUDGE) {
+            idxtotal++;
+            auto ok = proven();
+            if (ok) { ac->nobc = true; idxelided++; }
+            RecordLine(ac->line, ok);
+            if (!ok) KeptInCheckfree(ac->line, KeptWhy(ac->child, nullptr, xt, lent, slack, t));
+        }
+        CheckedFacts(xt, lent, slack);
+    }
+
+    // ------------------------------------------------------------------
+    // checkfree: why a check stayed, in the terms of the analysis's known
+    // limits (docs/implementation.md §9.1).
+
+    string ExprText(Node *n) {
+        string s;
+        dumpwritten = true;
+        n->Dump(s, 0);
+        dumpwritten = false;
+        return s;
+    }
+
+    void KeptInCheckfree(Line l, const string &why) {
+        // The innermost function whose text holds the line.
+        const Span *in = nullptr;
+        for (auto &sp : checkfreespans)
+            if (sp.file == l.fileidx && l.line >= sp.lo && l.line <= sp.hi &&
+                (!in || sp.hi - sp.lo < in->hi - in->lo))
+                in = &sp;
+        if (!in) return;
+        auto msg = cat("checkfree fn ", in->sf->qname, " keeps a bounds check: ", why);
+        for (auto &f : checkfreefails)
+            if (f.line.fileidx == l.fileidx && f.line.line == l.line && f.why == msg) return;
+        checkfreefails.push_back({ l, msg });
+    }
+
+    // Index (or converted value) x against the length lent of obj, or for a
+    // conversion (obj null) of the array index type `into` names, which a
+    // check with this slack compared it with.
+    string KeptWhy(Node *x, Node *obj, const Term &xt, const Term &lent, int64_t slack,
+                   TypeExpr *into = nullptr) {
+        auto xs = ExprText(x);
+        auto against = obj ? cat(ExprText(obj), ".len") : cat(into->ix->arr->name, ".len");
+        if (!lent.ok)
+            return cat("the length of ", obj ? ExprText(obj) : string(into->ix->arr->name),
+                       " is not one the analysis tracks here");
+        auto t = x->exprtype;
+        // Its type's range is all a loaded plain integer is known by.
+        if ((Is<Index>(x) || Is<Dot>(x) || Is<Call>(x)) && !IsIndexT(t))
+            return cat(xs, " is read out of an element, a field or a call result, whose "
+                       "value the analysis does not know; an index type (`u32 in a`) for "
+                       "what is stored there carries it (§3.11)");
+        if (!xt.ok) {
+            if (Is<Ident>(x) && t && t->kind == TY_INT && t->intstorage == IS_U64)
+                return cat(xs, " is a u64 variable, which the analysis does not track; an i64 "
+                           "or an index type is");
+            return cat("the analysis cannot relate ", xs, " to ", against);
+        }
+        if (!Query(Zero(), xt.b, xt.off)) return cat("nothing shows ", xs, " >= 0");
+        auto rel = slack < 0 ? " < " : " <= ";
+        if (IsIndexT(t) && obj)
+            return cat("nothing shows ", xs, rel, against, "; ", xs, " is a ", TypeName(t),
+                       ", so `assert(", ExprText(obj), ".len >= ", t->ix->arr->name,
+                       ".len)` where neither changes after it would settle it");
+        return cat("nothing shows ", xs, rel, against);
+    }
+
+    // The errors, each where the check is, with its source line.
+    // The checks kept in checkfree functions, as one error reporting them
+    // all: each at its line, which the text echoes.
+    CompileError CheckfreeError() {
+        CompileError e;
+        for (auto &f : checkfreefails) {
+            Diagnostic d;
+            d.where = LocOf(f.line);
+            d.message = f.why;
+            d.text = ast.DiagnosticText(d, true);
+            if (!e.msg.empty()) e.msg += "\n";
+            e.msg += d.text;
+            e.diags.push_back(std::move(d));
+        }
+        return e;
+    }
+
+    static string TypeName(TypeExpr *t) {
+        string s;
+        t->Dump(s);
+        return s;
+    }
+
+    // What a completed check proves: execution only continues past one with
+    // 0 <= x <= len + slack (-1 for an index, 0 for a slice bound), so these
+    // hold afterwards. A term's value is the machine's here even where the
+    // addition forming it could have wrapped: a wrapped i64 value lies
+    // outside [0, 2^48], which the check would have rejected.
+    void CheckedFacts(const Term &x, const Term &lent, int64_t slack) {
+        if (!x.ok) return;
+        AddFactB(Zero(), x.b, x.off);
+        if (lent.ok) AddFactB(x.b, lent.b, SatAdd(SatSub(lent.off, x.off), slack));
+        QuotBack(x);
+    }
+
+    // One bound of a slice expression, as a term in the state at the moment
+    // that bound is evaluated: absent means 0 (lower) or the length snapshot
+    // (upper), and a from-end bound is that snapshot minus the term.
+    Term SliceBound(Node *bn, bool fromend, const Term &lent, Term dflt) {
+        if (!bn) return dflt;
+        auto t = TermOf(bn);
+        if (!t.ok) return {};
+        if (!fromend) return t;
+        if (t.b.kind != BK_ZERO || !lent.ok) return {};
+        return Term { true, lent.b, SatSub(lent.off, t.off) };
+    }
+
+    // A completed `p[lo..hi]` has length exactly hi - lo: the check aborts
+    // unless 0 <= lo <= hi <= len, so on any path that continues the
+    // difference is the new length, and a slice's length never moves
+    // afterwards (growing p leaves the slice's own header alone). The domain
+    // can name that difference when both bounds sit on one base -- the
+    // `src[lo..lo + W]` row idiom, a constant length -- or when the lower
+    // bound is a constant, leaving a length offset from the upper bound's.
+    static Term SliceLenTerm(const Term &lot, const Term &hit) {
+        if (!lot.ok || !hit.ok) return {};
+        auto d = SatSub(hit.off, lot.off);
+        if (!SmallOff(d)) return {};
+        // A constant difference below zero is a slice that always aborts;
+        // stating it as a length would only contradict `0 <= len`.
+        if (lot.b == hit.b) return d < 0 ? Term {} : Term { true, Zero(), d };
+        if (lot.b.kind == BK_ZERO) return Term { true, hit.b, d };
+        return {};
+    }
+
+    // The length of the value the last walked SliceExpr produced, consumed by
+    // the declaration or assignment that binds it.
+    Term slicelen;
+
+    void JudgeSlice(SliceExpr *se, const Term &lent, const Term &lot, const Term &hit) {
+        if (probing) {
+            probefail = true;
+            return;
+        }
+        sltotal++;
+        auto ok = lent.ok && lot.ok && hit.ok &&
+                  Query(Zero(), lot.b, lot.off) &&
+                  Query(lot.b, hit.b, SatSub(hit.off, lot.off)) &&
+                  Query(hit.b, lent.b, SatSub(lent.off, hit.off));
+        if (ok) { se->nobc = true; slelided++; }
+        RecordLine(se->line, ok);
+        if (!ok) {
+            string why;
+            if (!lent.ok)
+                why = cat("the length of ", ExprText(se->obj),
+                          " is not one the analysis tracks here");
+            else if (!lot.ok || !hit.ok)
+                why = "the analysis cannot relate the slice's bounds to the length";
+            else if (!Query(Zero(), lot.b, lot.off))
+                why = "nothing shows the lower bound >= 0";
+            else if (!Query(lot.b, hit.b, SatSub(hit.off, lot.off)))
+                why = "nothing shows the lower bound <= the upper bound";
+            else
+                why = cat("nothing shows the upper bound <= ", ExprText(se->obj), ".len");
+            KeptInCheckfree(se->line, cat("slice ", ExprText(se), ": ", why));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Condition facts. Only added when evaluating the condition could not
+    // have changed tracked state (the caller checks HasKillEffects), since
+    // the comparisons ran against pre-kill values otherwise.
+
+    void CondFacts(Node *c, bool truth) {
+        if (mode == M_KILLS) return;
+        if (auto u = Is<Unary>(c); u && u->op == T_NOT) { CondFacts(u->child, !truth); return; }
+        auto b = Is<Binary>(c);
+        if (!b) return;
+        if ((b->op == T_ANDAND && truth) || (b->op == T_OROR && !truth)) {
+            CondFacts(b->left, truth);
+            CondFacts(b->right, truth);
+            return;
+        }
+        auto op = b->op;
+        if (op != T_LT && op != T_GT && op != T_LTEQ && op != T_GTEQ && op != T_EQ &&
+            op != T_NEQ)
+            return;
+        if (!MachineInt(b->left->exprtype) || !MachineInt(b->right->exprtype)) return;
+        auto lt = TermOf(b->left), rt = TermOf(b->right);
+        if (!lt.ok || !rt.ok || !CmpAdmissible(lt) || !CmpAdmissible(rt)) return;
+        if (!truth) {
+            switch (op) {
+                case T_LT:   op = T_GTEQ; break;
+                case T_LTEQ: op = T_GT; break;
+                case T_GT:   op = T_LTEQ; break;
+                case T_GTEQ: op = T_LT; break;
+                case T_EQ:   op = T_NEQ; break;
+                default:     op = T_EQ; break;
+            }
+        }
+        auto le = [&](const Term &x, const Term &y, int64_t d) {   // x <= y + d.
+            AddFactB(x.b, y.b, SatAdd(SatSub(y.off, x.off), d));
+        };
+        switch (op) {
+            case T_LT:   le(lt, rt, -1); break;
+            case T_LTEQ: le(lt, rt, 0); break;
+            case T_GT:   le(rt, lt, -1); break;
+            case T_GTEQ: le(rt, lt, 0); break;
+            case T_EQ:   le(lt, rt, 0); le(rt, lt, 0); break;
+            default:
+                // != alone bounds nothing, but against a side the facts
+                // already order it is strict: `len != 0` is `len >= 1`.
+                if (Query(rt.b, lt.b, SatSub(lt.off, rt.off))) le(rt, lt, -1);
+                else if (Query(lt.b, rt.b, SatSub(rt.off, lt.off))) le(lt, rt, -1);
+                break;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Speculation probes (Binary::specidx).
+
+    bool probing = false;       // Walking a right operand for ProbeRight.
+    bool probefail = false;     // A bounds check in it did not hold.
+
+    // A right operand worth probing: operators, variables, fields, elements,
+    // casts and constants only, with an index among them. Walking these
+    // changes nothing but the flow and the memo of derived terms.
+    static bool ProbeShape(Node *n, bool &index) {
+        if (Is<Index>(n)) index = true;
+        else if (!Is<Binary>(n) && !Is<Unary>(n) && !Is<Ident>(n) && !Is<Dot>(n) &&
+                 !Is<AsCast>(n) && !Is<IntLit>(n) && !Is<FltLit>(n) && !Is<BoolLit>(n) &&
+                 !Is<NullLit>(n))
+            return false;
+        auto ok = true;
+        n->Children([&](Node *ch) { ok = ok && ProbeShape(ch, index); });
+        return ok;
+    }
+
+    // Whether every bounds check in the right operand of && or || holds in
+    // the state after the left operand, without the facts the left
+    // establishes or those of a && or || nested in the right operand, whose
+    // own right operands codegen may evaluate unconditionally too. The walk
+    // judges nothing for the program and leaves the state as it was.
+    void ProbeRight(Binary *bn) {
+        auto index = false;
+        if (!ProbeShape(bn->right, index) || !index) return;
+        auto savedflow = flow;
+        auto savedderived = derived;
+        auto savedslicelen = slicelen;
+        probing = true;
+        probefail = false;
+        Walk(bn->right);
+        probing = false;
+        flow = std::move(savedflow);
+        derived = std::move(savedderived);
+        slicelen = savedslicelen;
+        bn->specidx = probefail || bn->specidx < 0 ? -1 : 1;
+    }
+
+    // ------------------------------------------------------------------
+    // Prescans.
+
+    void NoteVar(VarDef *v) {
+        if (IntBaseVar(v)) intvars.insert(v);
+    }
+
+    void MarkAddr(Node *n) {
+        for (auto cur = n;;) {
+            if (auto id = Is<Ident>(cur)) {
+                auto v = id->vdef;
+                if (!v) return;
+                addrof.insert(v);
+                auto [k, u] = UltOf(v);
+                if (k == UK_OWNED && u && u != v) addrof.insert(u);
+                return;
+            }
+            if (auto d = Is<Dot>(cur)) { cur = d->obj; continue; }
+            if (auto ix = Is<Index>(cur)) { cur = ix->obj; continue; }
+            if (auto u2 = Is<Unary>(cur)) { cur = u2->child; continue; }
+            return;
+        }
+    }
+
+    // Names the place ahead of the walks, so a kill summary can report it.
+    void NotePlace(Node *n) { PlaceOf(n); }
+
+    // Which variable an index/bound expression pivots on, for relating it to
+    // the array it indexes when selecting `v <= len(P)` invariant candidates.
+    static VarDef *PivotVar(Node *n) {
+        if (auto id = Is<Ident>(n)) return id->vdef;
+        if (auto b = Is<Binary>(n); b && (b->op == T_PLUS || b->op == T_MINUS)) {
+            if (auto v = PivotVar(b->left)) return v;
+            return PivotVar(b->right);
+        }
+        return nullptr;
+    }
+
+    void NoteRel(Node *obj, Node *idx) {
+        if (!idx) return;
+        auto v = PivotVar(idx);
+        if (!v) return;
+        auto pid = PlaceOf(obj);
+        if (pid >= 0) relpids[v].insert(pid);
+    }
+
+    // ------------------------------------------------------------------
+    // The two walks. Both dispatch to the per-node overrides at the end of
+    // this file; a null child is simply nothing to analyze.
+
+    // Analyzes `n` in its program position; false when control provably does
+    // not continue past it. Value positions discard that (an expression only
+    // fails to complete by diverging, which the enclosing statement sees).
+    bool Walk(Node *n) { return n ? n->BceWalk(*this) : true; }
+
+    void Mark(Node *n) { if (n) n->BceMark(*this); }
+
+    // The parts of an assignment target that are themselves evaluated: the
+    // location is written rather than read, but an index into it is computed
+    // and bounds-checked like any other.
+    void WalkLvalParts(Node *n) {
+        if (Is<Ident>(n)) return;
+        if (auto d = Is<Dot>(n)) { Walk(d->obj); return; }
+        if (auto ix = Is<Index>(n)) { Walk(ix); return; }
+        Walk(n);
+    }
+
+    // Jumps that would bind a loop/block whose body is `n` (stops at nested
+    // loops; inlined bodies are transparent, over-approximating is fine):
+    // breaks, and with `iteration` the continues that cut an iteration short
+    // as well. A `block { }` binds the breaks inside it but not the
+    // continues, which still go to the loop around it.
+    bool HasJumps(Node *n, bool breaks, bool continues) {
+        if (!n) return false;
+        if ((breaks && Is<Break>(n)) || (continues && Is<Continue>(n))) return true;
+        if (Is<While>(n) || Is<LoopExpr>(n) || Is<ForLoop>(n)) return false;
+        if (Is<EarlyBlock>(n)) breaks = false;
+        if (!breaks && !continues) return false;
+        auto found = false;
+        RunChildren(n, [&](Node *ch) { found = found || HasJumps(ch, breaks, continues); });
+        return found;
+    }
+
+    bool HasBreaks(Node *n) { return HasJumps(n, true, false); }
+
+    // A break or continue makes a loop body's per-iteration push count
+    // unreliable; a return does not (it leaves the loop for good, and the
+    // facts are stated after it).
+    bool HasIterationJumps(Node *n) { return HasJumps(n, true, true); }
+
+    // Collects the place ids `n` can invalidate into `out`.
+    void SummarizeInto(Node *n, set<int> &out) {
+        KillsScope ks(*this, &out);
+        Walk(n);
+    }
+
+    // Reference variables `n` indexes, whose pointee is an array with a
+    // length worth reading once (a fixed array's is a constant).
+    void RefIndexed(Node *n, vector<VarDef *> &out) {
+        if (!n) return;
+        if (auto ix = Is<Index>(n))
+            if (auto id = Is<Ident>(ix->obj); id && id->vdef && id->vdef->type) {
+                auto t = id->vdef->type;
+                auto s = t->kind == TY_REF ? t->ref->sub : nullptr;
+                if (s && s->kind == TY_ARRAY && s->arr->akind != A_FIXED &&
+                    std::find(out.begin(), out.end(), id->vdef) == out.end())
+                    out.push_back(id->vdef);
+            }
+        RunChildren(n, [&](Node *ch) { RefIndexed(ch, out); });
+    }
+
+    // The references to structs `n` binds to just another variable, which
+    // they stand for while they live: `let r = v`, `let r = &v`, as an
+    // inlined callee's reference parameter is bound to its argument.
+    static void BoundRefs(Node *n, unordered_map<VarDef *, VarDef *> &out) {
+        if (!n) return;
+        if (auto vd = Is<VarDecl>(n); vd && vd->defs.size() == 1 && vd->inits.size() == 1) {
+            auto d = vd->defs[0];
+            auto init = vd->inits[0];
+            if (auto u = Is<Unary>(init); u && u->op == T_BITAND) init = u->child;
+            auto id = Is<Ident>(init);
+            auto pointee = [](TypeExpr *t) { return t && t->kind == TY_REF ? t->ref->sub : t; };
+            auto a = d && d->type && d->type->kind == TY_REF ? d->type->ref->sub : nullptr;
+            auto b = id && id->vdef ? pointee(id->vdef->type) : nullptr;
+            if (a && b && !d->isvar && !d->type->ref->optional && id->vdef != d &&
+                a->kind == TY_STRUCT && b->kind == TY_STRUCT && a->struc->st == b->struc->st &&
+                a->struc->inst == b->struc->inst)
+                out[d] = id->vdef;
+        }
+        RunChildren(n, [&](Node *ch) { BoundRefs(ch, out); });
+    }
+
+    // The grow-only and grow-shrink arrays `n` indexes that are fields of a
+    // struct a variable holds or references, reached by fields alone (no
+    // stored reference read on the way): the variable and the field indices.
+    // A root `bound` maps to another variable is named by that one, so that a
+    // reference bound afresh at every iteration, such as an inlined callee's
+    // parameter, names the storage it stands for.
+    void FieldIndexed(Node *n, const unordered_map<VarDef *, VarDef *> &bound,
+                      vector<FieldPath> &out) {
+        if (!n) return;
+        auto ix = Is<Index>(n);
+        auto d = ix ? Is<Dot>(ix->obj) : nullptr;
+        auto ft = d && d->fieldidx >= 0 ? FieldTypeOf(d) : nullptr;
+        if (ft && ft->kind == TY_ARRAY &&
+            (ft->arr->akind == A_GROW || ft->arr->akind == A_GROWSHRINK)) {
+            vector<int> path;
+            Node *cur = d;
+            auto ok = true;
+            while (auto dd = Is<Dot>(cur)) {
+                auto ot = dd->obj->exprtype;
+                if (dd->fieldidx < 0 || ReadsStoredRef(dd) || !ot) { ok = false; break; }
+                path.push_back(dd->fieldidx);
+                cur = dd->obj;
+                // Only the root may be a reference.
+                if (ot->kind == TY_REF ? !Is<Ident>(cur) : ot->kind != TY_STRUCT) ok = false;
+                if (!ok || ot->kind == TY_REF) break;
+            }
+            auto id = Is<Ident>(cur);
+            if (ok && id && id->vdef) {
+                auto root = id->vdef;
+                for (auto guard = 0; guard < 16; guard++) {
+                    auto it = bound.find(root);
+                    if (it == bound.end()) break;
+                    root = it->second;
+                }
+                std::reverse(path.begin(), path.end());
+                FieldPath fp { root, path };
+                if (std::find(out.begin(), out.end(), fp) == out.end()) out.push_back(fp);
+            }
+        }
+        RunChildren(n, [&](Node *ch) { FieldIndexed(ch, bound, out); });
+    }
+
+    // Which of the reference variables a loop indexes keep the same array,
+    // base and length throughout: an array behind a reference has both halves
+    // of its view in memory the C backend must reload after every byte store
+    // (§6.5 also makes growth during iteration legal), and only a grow, a
+    // shrink, a whole-value write or a call that can reach the array changes
+    // them -- exactly what the kill summary reports. Codegen reads the view of
+    // each variable named here once, before the loop. The same holds for the
+    // arrays it indexes in fields (`fout`), whose header sits in the struct.
+    void LoopViewRefs(Node *body, Node *cond, vector<VarDef *> &out, vector<FieldPath> &fout) {
+        out.clear();
+        fout.clear();
+        if (mode != M_JUDGE) return;
+        vector<VarDef *> vars;
+        RefIndexed(body, vars);
+        RefIndexed(cond, vars);
+        unordered_map<VarDef *, VarDef *> bound;
+        BoundRefs(body, bound);
+        BoundRefs(cond, bound);
+        vector<FieldPath> fields;
+        FieldIndexed(body, bound, fields);
+        FieldIndexed(cond, bound, fields);
+        // The summary only reports kills for places that already exist, so
+        // name them all before walking.
+        vector<pair<VarDef *, int>> named;
+        for (auto v : vars) {
+            auto pid = PlaceOfVar(v);
+            if (pid >= 0) named.push_back({ v, pid });
+        }
+        vector<pair<FieldPath *, int>> fnamed;
+        for (auto &fp : fields) {
+            auto rt = fp.first->type;
+            if (!rt) continue;
+            vector<int> path;
+            if (rt->kind == TY_REF) path.push_back(-1);
+            path.insert(path.end(), fp.second.begin(), fp.second.end());
+            // The declared type of the last field, which FieldIndexed checked.
+            auto st = rt->kind == TY_REF ? rt->ref->sub : rt;
+            TypeExpr *ft = nullptr;
+            for (auto f : fp.second) {
+                if (!st || st->kind != TY_STRUCT) { ft = nullptr; break; }
+                auto inst = st->struc->inst;
+                ft = inst ? inst->ftypes[f] : st->struc->st->fields[f].type;
+                st = ft;
+            }
+            auto pid = ft ? PlaceFor(fp.first, path, ft) : -1;
+            if (pid >= 0) fnamed.push_back({ &fp, pid });
+        }
+        if (named.empty() && fnamed.empty()) return;
+        set<int> kills;
+        SummarizeInto(body, kills);
+        SummarizeInto(cond, kills);
+        for (auto &[v, pid] : named) if (!kills.count(pid)) out.push_back(v);
+        for (auto &[fp, pid] : fnamed) if (!kills.count(pid)) fout.push_back(*fp);
+    }
+
+    // The variables declared anywhere inside `n`.
+    static void DeclaredIn(Node *n, set<VarDef *> &out) {
+        if (!n) return;
+        if (auto vd = Is<VarDecl>(n)) for (auto d : vd->defs) if (d) out.insert(d);
+        if (auto fl = Is<ForLoop>(n)) {
+            if (fl->vdef) out.insert(fl->vdef);
+            if (fl->idxdef) out.insert(fl->idxdef);
+        }
+        if (auto m = Is<MatchExpr>(n))
+            for (auto &arm : m->arms) if (arm.binder) out.insert(arm.binder);
+        if (auto c = Is<Call>(n)) for (auto p : c->fvparams) if (p) out.insert(p);
+        RunChildren(n, [&](Node *ch) { DeclaredIn(ch, out); });
+    }
+
+    // Runs the walk over `n` recording only kill effects into a scratch flow;
+    // returns whether anything tracked was changed. A variable `n` declares
+    // itself does not count: the comparisons a condition contributes facts
+    // from cannot name it (it is out of their scope) except through a block
+    // operand that declares it, whose value is read after the declaration.
+    bool HasKillEffects(Node *n) {
+        set<VarDef *> fresh;
+        DeclaredIn(n, fresh);
+        KillsScope ks(*this);
+        auto savedfresh = freshvars;
+        freshvars = &fresh;
+        Walk(n);
+        freshvars = savedfresh;
+        return anybump;
+    }
+
+    // Applies the kill effects of `n` to the current flow (loop-entry havoc).
+    void StripKills(Node *n) {
+        auto saved = mode;
+        mode = M_KILLS;
+        Walk(n);
+        mode = saved;
+    }
+
+    Flow Meet(const Flow &a, const Flow &b) {
+        Flow r;
+        for (auto &f : a.facts)
+            for (auto &g : b.facts)
+                if (f.l == g.l && f.r == g.r) {
+                    r.facts.push_back({ f.l, f.r, std::max(f.c, g.c) });
+                    break;
+                }
+        for (auto &l : a.lins)
+            for (auto &k : b.lins)
+                if (l.tmp == k.tmp && l.x.b == k.x.b && l.x.off == k.x.off) {
+                    r.lins.push_back(l);
+                    r.lins.back().exact = l.exact && k.exact;
+                    break;
+                }
+        r.vgen = Gens::Max(a.vgen, b.vgen);
+        r.pgen = Gens::Max(a.pgen, b.pgen);
+        return r;
+    }
+
+    // ------------------------------------------------------------------
+    // Per-specialization driver.
+
+    // Everything the prescan and the walks collect for one body.
+    void ResetSpecState() {
+        // Place IDs and their generations belong to this body's prescan.
+        // Interprocedural summaries use variables/parameter indices, never
+        // these IDs. Keeping old places makes every kill scan earlier bodies.
+        flow = Flow {};
+        places.clear();
+        placeids.clear();
+        addrof.clear();
+        intvars.clear();
+        wdecl.clear();
+        wbad.clear();
+        wkinds.clear();
+        relpids.clear();
+        derived.clear();
+        effectfulterms.clear();
+        cands.clear();
+        ge0.clear();
+        lelen.clear();
+        mono.clear();
+        ownvars.clear();
+        classparams.clear();
+        ownclasses.clear();
+    }
+
+    void NoteOwn(VarDef *v) { if (v) ownvars.insert(v); }
+
+    // Fresh per-body state plus the prescan: the parameters are the body's
+    // own variables, grouped by root class for the effect summary.
+    void SetupSpec(FnSpec *sp) {
+        ResetSpecState();
+        for (size_t j = 0; j < sp->params.size(); j++) {
+            auto p = sp->params[j];
+            ownvars.insert(p);
+            if (p->type && IsRefOrSlice(p->type) && p->ref.Root())
+                classparams[p->ref.Root()].push_back((int)j);
+        }
+        for (auto cr : sp->classroots) if (cr) ownclasses.insert(cr);
+        IndexPlaces();
+        Mark(sp->body);
+    }
+
+    void RunSpec(FnSpec *sp) {
+        if (!sp->body) return;   // An extern fn (§7.10).
+        SetupSpec(sp);
+        for (auto &[v, ok] : gge0) if (ok) ge0.insert(v);
+        // Whole-body kill summary: which places and variables any path can
+        // invalidate or re-bind.
+        set<int> bumped, shrunk;
+        set<VarDef *> vbumped;
+        {
+            KillsScope ks(*this, &bumped, &shrunk, &vbumped);
+            flow = Flow {};
+            Walk(sp->body);
+        }
+        // Invariant candidates: eligible variables against this spec's
+        // never-invalidated places.
+        auto eligible = [&](VarDef *v) {
+            return v && wdecl.count(v) && !wbad.count(v) && !v->captured && !v->isglobal &&
+                   !v->isparam && !addrof.count(v) && IntBaseVar(v);
+        };
+        for (auto v : wdecl) {
+            if (!eligible(v)) continue;
+            auto &c = cands[v];
+            auto rit = relpids.find(v);
+            if (rit != relpids.end())
+                for (auto pid : rit->second) {
+                    // `v <= len(P)` survives any growth of P, so only a
+                    // shrink (or a re-bound access path) rules P out.
+                    if (shrunk.count(pid) || vbumped.count(places[pid].rootv)) continue;
+                    if (c.le.size() >= 8) break;
+                    c.le.push_back({ pid, 0 });
+                }
+        }
+        if (!cands.empty()) {
+            mode = M_RECORD;
+            flow = Flow {};
+            SeedEntryFacts(sp);
+            derived.clear();
+            Walk(sp->body);
+            for (auto &[v, c] : cands) {
+                if (!c.declseen) continue;
+                if (c.ge0) ge0.insert(v);
+                if (!c.le.empty()) lelen[v] = c.le;
+                // Shifts are monotone by their sign; a plain assignment
+                // counts only where the recording walk proved its direction.
+                auto &wk = wkinds[v];
+                auto dec = !wk.inc && (!wk.setw || c.setdec);
+                auto inc = !wk.dec && (!wk.setw || c.setinc);
+                if (c.wrapfree && dec != inc) mono[v] = inc ? 1 : -1;
+            }
+        }
+        mode = M_JUDGE;
+        flow = Flow {};
+        SeedEntryFacts(sp);
+        derived.clear();
+        Walk(sp->body);
+    }
+
+    // ------------------------------------------------------------------
+    // Whole-program drivers: the call graph, the effect summaries.
+
+    // Call sites in one tree, for the caller `from` (null for a global
+    // initializer or field default): the graph edges, the site counts, and
+    // the optimizer-style use count that checks them.
+    void ScanCalls(Node *n, FnSpec *from, map<FnSpec *, int> &uses) {
+        if (!n) return;
+        if (auto c = Is<Call>(n)) {
+            if (c->spec) {
+                if (c->builtin < 0) {
+                    nsites[c->spec]++;
+                    uses[c->spec]++;
+                    if (from) callees[from].push_back(c->spec);
+                } else {
+                    opaquesites.insert(c->spec);   // A thread's entry point (thread_spawn).
+                }
+            }
+            for (auto &fs : c->fmtspecs) {
+                opaquesites.insert(fs.second);
+                uses[fs.second]++;
+            }
+            for (auto d : c->dispatch) {
+                nsites[d]++;
+                uses[d]++;
+                if (from) callees[from].push_back(d);
+            }
+        }
+        RunChildren(n, [&](Node *ch) { ScanCalls(ch, from, uses); });
+    }
+
+    void BuildCallGraph() {
+        map<FnSpec *, int> uses;
+        for (auto sp : ast.fnspecs)
+            if (sp->live && sp->body) ScanCalls(sp->body, sp, uses);
+        ast.ForEachRootTree([&](Node *n) { ScanCalls(n, nullptr, uses); });
+        // The optimizer's count is the authority on how a specialization is
+        // reached: a use this scan did not see is one it cannot describe.
+        // An export's C wrapper passes whatever its C caller does.
+        for (auto sp : ast.fnspecs)
+            if (sp->live && (uses[sp] != sp->uses || sp->sf->isexport)) opaquesites.insert(sp);
+        set<FnSpec *> visited;
+        function<void(FnSpec *)> visit = [&](FnSpec *sp) {
+            if (!visited.insert(sp).second) return;
+            for (auto c : callees[sp]) visit(c);
+            calleesfirst.push_back(sp);
+        };
+        for (auto sp : ast.fnspecs) if (sp->live) visit(sp);
+    }
+
+    // One body's effects given its callees' current summaries: the
+    // kills-only walk, recording.
+    Effects SummarizeSpec(FnSpec *sp) {
+        SetupSpec(sp);
+        Effects e;
+        effsum = &e;
+        flow = Flow {};
+        mode = M_KILLS;
+        Walk(sp->body);
+        mode = M_JUDGE;
+        effsum = nullptr;
+        return e;
+    }
+
+    // Effect summaries for every live specialization, to a fixpoint: a
+    // body's summary only grows as its callees' do, so a round that changes
+    // nothing is the answer, and recursion converges the same way from
+    // empty. An extern fn (§7.10) has no body to walk: it may resize or
+    // write whatever it is handed by reference, and reaches nothing else.
+    void ComputeEffects() {
+        for (auto sp : ast.fnspecs) {
+            if (!sp->live) continue;
+            auto &e = effects[sp];
+            if (sp->body) continue;
+            for (size_t j = 0; j < sp->argtypes.size(); j++)
+                if (sp->argtypes[j]->kind == TY_REF) {
+                    e.params.insert((int)j);
+                    e.intparams.insert((int)j);
+                }
+        }
+        for (auto changed = true; changed;) {
+            changed = false;
+            for (auto sp : calleesfirst) {
+                if (!sp->body) continue;
+                auto e = SummarizeSpec(sp);
+                auto &cur = effects[sp];
+                e.Merge(cur);
+                if (!(e == cur)) {
+                    cur = e;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Fresh state plus the prescan for the global initializers, each walked
+    // as a tree of its own. They need their own prescan once a body's places
+    // have been discarded, including places a call can invalidate.
+    void SetupRootTrees() {
+        ResetSpecState();
+        IndexPlaces();
+        ast.ForEachRootTree([&](Node *n) { Mark(n); });
+    }
+
+    // Seeds gge0 from the globals' initializers, then drops every candidate
+    // some write fails to preserve, in a live body or in a global's
+    // initializer. The candidates are assumed while checking each write
+    // (ordinary induction: the initializer is the base case, every write
+    // the step), all of them at once: a write checked by another candidate
+    // that some write then drops is checked again, in rounds until none is.
+    void ValidateGlobalInvariants() {
+        for (auto g : ast.globals) {
+            if (g->defs.size() != 1 || g->inits.size() != 1) continue;
+            auto v = g->defs[0];
+            if (!IntBaseVar(v)) continue;
+            auto lit = Is<IntLit>(g->inits[0]);
+            gge0[v] = lit && !lit->uns && lit->val >= 0;
+        }
+        if (gge0.empty()) return;
+        // Any address-taking anywhere admits writes this pass cannot see.
+        for (auto sp : ast.fnspecs) {
+            if (!sp->live || !sp->body) continue;
+            SetupSpec(sp);
+            for (auto v : addrof) gaddr.insert(v);
+        }
+        SetupRootTrees();
+        for (auto v : addrof) gaddr.insert(v);
+        for (auto &[v, ok] : gge0) if (gaddr.count(v)) ok = false;
+        // Walks one tree recording; whether a write in it dropped a candidate.
+        auto check = [&](Node *n) {
+            cands.clear();
+            ge0.clear();
+            // The inductive hypothesis: every candidate standing (seedglobals).
+            seedglobals = true;
+            mode = M_RECORD;
+            flow = Flow {};
+            Walk(n);
+            mode = M_JUDGE;
+            seedglobals = false;
+            auto dropped = false;
+            for (auto &[v, c] : cands) {
+                auto it = gge0.find(v);
+                if (it != gge0.end() && it->second && !c.ge0) {
+                    it->second = false;
+                    dropped = true;
+                }
+            }
+            return dropped;
+        };
+        auto live = [&] {
+            for (auto &[v, ok] : gge0) if (ok) return true;
+            return false;
+        };
+        for (auto dropped = true; dropped && live();) {
+            dropped = false;
+            SetupRootTrees();
+            ast.ForEachRootTree([&](Node *n) { dropped = check(n) || dropped; });
+            for (auto sp : ast.fnspecs) {
+                if (!sp->live || !sp->body) continue;
+                // Every write that can drop a candidate notes the global in
+                // the body's effect summary, so a body whose summary names
+                // none of the live candidates has nothing to check.
+                auto &writes = effects[sp].intvars;
+                auto here = false;
+                for (auto &[v, ok] : gge0) here = here || (ok && writes.count(v));
+                if (!here) continue;
+                SetupSpec(sp);
+                dropped = check(sp->body) || dropped;
+            }
+        }
+        ge0.clear();
+        cands.clear();
+    }
+
+    void RunAll() {
+        for (auto t : ast.alltypes)
+            if (IsIndexT(t) && t->ix->arr) indexarrays.insert(t->ix->arr);
+        CheckfreeSpans();
+        BuildCallGraph();
+        ComputeEffects();
+        ValidateGlobalInvariants();
+        // Callers first: a specialization's entry facts come from its call
+        // sites, which have to have been judged.
+        for (auto it = calleesfirst.rbegin(); it != calleesfirst.rend(); ++it)
+            if ((*it)->live && (*it)->body) RunSpec(*it);
+        // Global initializers: judged with no surrounding context.
+        SetupRootTrees();
+        mode = M_JUDGE;
+        ast.ForEachRootTree([&](Node *n) {
+            flow = Flow {};
+            Walk(n);
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // --bce-test: verify `// bce:elide` and `// bce:keep` source annotations
+    // (every check on such a line must have the annotated outcome).
+
+    int VerifyAnnotations() {
+        auto fails = 0;
+        for (size_t fi = 0; fi < ast.sources.size(); fi++) {
+            auto &src = *ast.sources[fi].second;
+            auto line = 1;
+            size_t pos = 0;
+            while (pos <= src.size()) {
+                auto eol = src.find('\n', pos);
+                auto len = (eol == string::npos ? src.size() : eol) - pos;
+                auto sv = string_view(src).substr(pos, len);
+                auto want = 0;
+                if (sv.find("bce:elide") != string_view::npos) want = 1;
+                else if (sv.find("bce:keep") != string_view::npos) want = 2;
+                if (want) {
+                    auto it = lineout.find({ (int)fi, line });
+                    auto el = it == lineout.end() ? 0 : it->second.first;
+                    auto kp = it == lineout.end() ? 0 : it->second.second;
+                    auto ok = want == 1 ? el > 0 && kp == 0 : kp > 0 && el == 0;
+                    if (!ok) {
+                        fprintf(stderr,
+                                "bce-test: %s:%d: annotated %s, but %d elided / %d kept\n",
+                                ast.sources[fi].first.c_str(), line,
+                                want == 1 ? "bce:elide" : "bce:keep", el, kp);
+                        fails++;
+                    }
+                }
+                if (eol == string::npos) break;
+                pos = eol + 1;
+                line++;
+            }
+        }
+        return fails;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// BceMark: the prescan, one override per node kind that contributes to it.
+// The default recurses over Children, which is all a node whose only role is
+// to hold subexpressions needs.
+
+inline void Node::BceMark(BCE &b) { Children([&](Node *ch) { b.Mark(ch); }); }
+
+inline void Ident::BceMark(BCE &b) { b.NoteVar(vdef); }
+
+inline void Unary::BceMark(BCE &b) {
+    if (op == T_BITAND) b.MarkAddr(child);
+    Node::BceMark(b);
+}
+
+inline void Dot::BceMark(BCE &b) {
+    if (member == B_LEN) b.NotePlace(obj);
+    Node::BceMark(b);
+}
+
+inline void Call::BceMark(BCE &b) {
+    for (auto p : fvparams) b.NoteOwn(p);
+    RunChildren(this, [&](Node *ch) { b.Mark(ch); });
+}
+
+inline void Index::BceMark(BCE &b) {
+    b.NotePlace(obj);
+    b.NoteRel(obj, idx);
+    Node::BceMark(b);
+}
+
+inline void SliceExpr::BceMark(BCE &b) {
+    b.NotePlace(obj);
+    b.NoteRel(obj, lo);
+    b.NoteRel(obj, hi);
+    Node::BceMark(b);
+}
+
+inline void MatchExpr::BceMark(BCE &b) {
+    for (auto &arm : arms) {
+        if (arm.pat.byref) b.MarkAddr(scrutinee);
+        b.NoteVar(arm.binder);
+        b.NoteOwn(arm.binder);
+    }
+    Node::BceMark(b);
+}
+
+inline void ForLoop::BceMark(BCE &b) {
+    if ((iterkind == IK_ARRAY || iterkind == IK_SLICE) && !vdef->copybind) b.MarkAddr(iter);
+    b.NoteVar(vdef);
+    b.NoteVar(idxdef);
+    b.NoteOwn(vdef);
+    b.NoteOwn(idxdef);
+    Node::BceMark(b);
+}
+
+inline void VarDecl::BceMark(BCE &b) {
+    for (auto d : defs) {
+        b.NoteVar(d);
+        b.NoteOwn(d);
+    }
+    if (defs.size() == 1 && inits.size() == 1 && defs[0]) b.wdecl.insert(defs[0]);
+    else for (auto d : defs) if (d) b.wbad.insert(d);
+    Node::BceMark(b);
+}
+
+inline void Assign::BceMark(BCE &b) {
+    if (auto id = Is<Ident>(lval); id && id->vdef && !pointee) {
+        auto v = id->vdef;
+        auto lit = Is<IntLit>(rhs);
+        if (op == T_ASSIGN) {
+            b.wkinds[v].setw = true;
+        } else if ((op == T_PLUSEQ || op == T_MINUSEQ) && lit && !lit->uns &&
+                   BCE::SmallOff(lit->val)) {
+            // A step the walk shifts by, whose recording checks it cannot
+            // wrap (RecordShift); a larger literal is a sum, as below.
+            auto c = op == T_PLUSEQ ? lit->val : -lit->val;
+            (c >= 0 ? b.wkinds[v].inc : b.wkinds[v].dec) = true;
+        } else if (BCE::IsUnitStep(this, v)) {
+            b.wkinds[v].inc = true;
+        } else if ((op == T_PLUSEQ || op == T_MINUSEQ) && !BCE::WritesVar(rhs, v)) {
+            b.wkinds[v].setw = true;   // v = v + rhs (Assign::BceWalk).
+        } else {
+            b.wbad.insert(v);
+        }
+    }
+    Node::BceMark(b);
+}
+
+inline void IncDec::BceMark(BCE &b) {
+    if (auto id = Is<Ident>(lval); id && id->vdef &&
+        (!id->vdef->type || id->vdef->type->kind != TY_REF))
+        (op == T_INC ? b.wkinds[id->vdef].inc : b.wkinds[id->vdef].dec) = true;
+    Node::BceMark(b);
+}
+
+// ---------------------------------------------------------------------------
+// BceWalk: the analysis proper, one override per node kind that carries facts,
+// kills, or a bounds check. The default evaluates the children left to right
+// and falls through, which is exactly right for every operand-holding node.
+
+inline bool Node::BceWalk(BCE &b) {
+    Children([&](Node *ch) { b.Walk(ch); });
+    return true;
+}
+
+// A function-value template is never analyzed: the checked instance reached
+// through its call site is (Call::BceWalk).
+inline bool FunVal::BceWalk(BCE &) { return true; }
+
+inline bool Binary::BceWalk(BCE &b) {
+    if ((op == T_ANDAND || op == T_OROR) && b.mode != BCE::M_KILLS) {
+        // The right side runs only when the left settled it one way, so its
+        // facts and effects merge against the short-circuit path.
+        b.Walk(left);
+        auto after = b.flow;
+        if (b.mode == BCE::M_JUDGE && !b.probing) b.ProbeRight(this);
+        // Like an if/while condition, a short-circuit operand may have
+        // compared an earlier read against a later state-changing call. A
+        // probe takes no facts from the left (ProbeRight).
+        if (!b.probing && !b.HasKillEffects(left)) b.CondFacts(left, op == T_ANDAND);
+        b.Walk(right);
+        b.flow = b.Meet(after, b.flow);
+        return true;
+    }
+    b.Walk(left);
+    auto gen = b.nextgen;
+    b.Walk(right);
+    if (b.mode != BCE::M_KILLS && b.nextgen != gen)
+        b.effectfulterms.insert(this);
+    if (op == T_DIV || op == T_MOD || op == T_SHR) b.JudgeUnsigned(this);
+    return true;
+}
+
+inline bool Index::BceWalk(BCE &b) {
+    b.Walk(obj);
+    auto lent = b.mode == BCE::M_KILLS ? BCE::Term {} : b.LenTermOf(obj);
+    auto gen = b.nextgen;
+    b.Walk(idx);
+    // The receiver is evaluated before its index. A rebind or growth in
+    // the index must not replace that earlier receiver's length proof.
+    if (b.nextgen != gen && lent.b.kind != BCE::BK_ZERO) lent = BCE::Term {};
+    b.JudgeIndex(this, lent);
+    return true;
+}
+
+inline bool AsCast::BceWalk(BCE &b) {
+    b.Walk(child);
+    if (totype && totype->ix) b.JudgeIndexCast(this);
+    return true;
+}
+
+inline bool SliceExpr::BceWalk(BCE &b) {
+    auto kills = b.mode == BCE::M_KILLS;
+    b.Walk(obj);
+    // The runtime check compares against a length snapshot taken before the
+    // bound expressions run, and each bound against the state it is evaluated
+    // in; capture all three at those moments.
+    auto lent = kills ? BCE::Term {} : b.LenTermOf(obj);
+    b.slicelen = BCE::Term {};
+    b.Walk(lo);
+    auto lot = kills ? BCE::Term {}
+                     : b.SliceBound(lo, lo_from_end, lent,
+                                    BCE::Term { true, BCE::Zero(), 0 });
+    auto gen = b.nextgen;
+    b.Walk(hi);
+    auto hit = kills ? BCE::Term {} : b.SliceBound(hi, hi_from_end, lent, lent);
+    // Evaluating the upper bound may have re-pinned what the lower one names,
+    // in which case the captured term no longer denotes the value compared.
+    if (b.nextgen != gen) lot = BCE::Term {};
+    if (!kills) b.slicelen = BCE::SliceLenTerm(lot, hit);
+    if (b.mode == BCE::M_JUDGE) b.JudgeSlice(this, lent, lot, hit);
+    if (!kills) {
+        // A completed slice has 0 <= lo <= hi <= len.
+        b.CheckedFacts(lot, BCE::Term {}, 0);
+        b.CheckedFacts(hit, lent, 0);
+        if (lot.ok && hit.ok) b.AddFactB(lot.b, hit.b, BCE::SatSub(hit.off, lot.off));
+    }
+    return true;
+}
+
+inline bool Call::BceWalk(BCE &b) {
+    Node *recv = nullptr;
+    // A call into user code is a site (RecordSite): each integer argument's
+    // term is sampled as it is evaluated, a slice argument's length as its
+    // bounds state it. The C backend may read a plain variable argument
+    // after a later argument's call has run, and each length was read at its
+    // own argument, so both are only trusted when evaluating the arguments
+    // moved nothing.
+    auto site = b.mode == BCE::M_JUDGE && builtin < 0 && !fvbody && (spec || !dispatch.empty());
+    vector<BCE::Term> ints, slens;
+    auto gen0 = b.nextgen;
+    auto walkarg = [&](Node *a) {
+        b.Walk(a);
+        if (!site) return;
+        auto t = a->exprtype;
+        auto isint = BCE::MachineInt(t);
+        auto it = isint ? b.TermOf(a) : BCE::Term {};
+        ints.push_back(isint && b.NoWrap(it, t->intstorage) ? it : BCE::Term {});
+        slens.push_back(Is<SliceExpr>(a) ? b.slicelen : BCE::Term {});
+    };
+    if (auto d = Is<Dot>(callee)) {
+        recv = d->obj;
+        walkarg(recv);
+        if (!fmtspecs.empty() && builtin != B_FORMAT) b.KillRendering();
+    }
+    // A push, append, resize or pop_n changes the array its receiver named
+    // when it was evaluated, ahead of the other arguments (codegen resolves
+    // the receiver first). Once those arguments move the receiver's place --
+    // a rebind on its path, a length change -- the place may name another
+    // array, so the operation only kills and states no length. The place is
+    // named before the arguments are walked, since kills only reach places
+    // that exist.
+    auto pinrecv = b.mode != BCE::M_KILLS &&
+                   (builtin == B_PUSH || builtin == B_APPEND || builtin == B_RESIZE ||
+                    builtin == B_POP_N);
+    auto recvpid = -1, recvgen = 0;
+    auto pin = [&](Node *rn) {
+        recvpid = b.PlaceOf(rn);
+        if (recvpid >= 0) recvgen = b.LenBase(recvpid).gen;
+    };
+    if (pinrecv && recv) pin(recv);
+    // The generation just after each argument: a later argument that moves
+    // anything leaves an earlier sample describing a different state.
+    vector<decltype(b.nextgen)> argsgen;
+    for (auto a : args) {
+        walkarg(a);
+        if (!fmtspecs.empty()) b.KillRendering();
+        argsgen.push_back(b.nextgen);
+        if (pinrecv && !recv && argsgen.size() == 1) pin(a);
+    }
+    auto recvmoved = recvpid >= 0 && b.LenBase(recvpid).gen != recvgen;
+    auto moved = site && b.nextgen != gen0;
+    if (moved) {
+        for (auto &t : ints) t = BCE::Term {};
+        for (auto &t : slens) t = BCE::Term {};
+    }
+    if (builtin >= 0) {
+        if (defaultinit) {
+            // Array defaults and pool fills execute zero or many times.
+            // Judge their code without entry facts, then retain only kills.
+            if (builtin != B_DEFAULT || rettypes[0]->kind == TY_ARRAY) {
+                if (b.mode != BCE::M_KILLS) {
+                    auto saved = std::move(b.flow);
+                    b.flow = BCE::Flow {};
+                    b.loopdepth++;
+                    b.Walk(defaultinit);
+                    b.loopdepth--;
+                    b.flow = std::move(saved);
+                }
+                b.StripKills(defaultinit);
+            } else b.Walk(defaultinit);
+        }
+        auto rn = recv ? recv : (args.empty() ? nullptr : args[0]);
+        // The first non-receiver argument, in either call spelling.
+        auto arg0 = recv ? (args.empty() ? nullptr : args[0])
+                         : (args.size() > 1 ? args[1] : nullptr);
+        switch (builtin) {
+            case B_PUSH:
+                if (recvmoved) b.GrowShrinkKill(rn, 0);
+                else b.GrowShrinkKill(rn, 1, 1);
+                break;
+            case B_APPEND: {
+                auto st = arg0 ? b.LenTermOf(arg0) : BCE::Term {};
+                if (recvmoved) b.GrowShrinkKill(rn, 0);
+                else b.GrowShrinkKill(rn, 1, st.ok && st.b.kind == BCE::BK_ZERO ? st.off
+                                                                               : INT64_MIN);
+                break;
+            }
+            case B_ALLOC_INDEX: case B_ALLOC_REF: case B_ALLOC_SLICE: case B_REALLOC_SLICE:
+                b.GrowShrinkKill(rn, 1, INT64_MIN, true);
+                break;
+            case B_FORMAT:
+                b.GrowShrinkKill(rn, 1);
+                break;
+            case B_TO_BYTES:
+                // to_bytes(a, out) appends the image to `out`, which is the
+                // argument rather than the receiver; the one-argument form
+                // builds a fresh value and grows nothing.
+                if (arg0) b.GrowShrinkKill(arg0, 1);
+                break;
+            case B_THREAD_WAIT:
+                // thread_wait(id, msg) appends the abort's message to msg.
+                if (arg0) b.GrowShrinkKill(arg0, 1);
+                break;
+            case B_POP: {
+                // A pop that returns proves its own precondition: popping an
+                // empty array aborts (§9.3), so the length was at least one
+                // and the new one is exactly one less.
+                auto lt = b.mode == BCE::M_KILLS || !rn ? BCE::Term {} : b.LenTermOf(rn);
+                b.GrowShrinkKill(rn, -1, -1);
+                if (lt.ok && lt.b.kind != BCE::BK_ZERO)
+                    b.AddFactB(BCE::Zero(), lt.b, lt.off - 1);
+                break;
+            }
+            case B_POP_N: {
+                // A completed pop_n proves 0 <= n <= old length, as a pop
+                // proves the array was non-empty; a constant n is the exact
+                // step down. Both terms are of the state the operation ran
+                // in, which a count that moved the receiver no longer is.
+                auto fresh = b.mode != BCE::M_KILLS && rn && !recvmoved;
+                auto lt = fresh ? b.LenTermOf(rn) : BCE::Term {};
+                auto nt = fresh ? b.TermOf(arg0) : BCE::Term {};
+                auto k = nt.ok && nt.b.kind == BCE::BK_ZERO && nt.off >= 0 ? nt.off : -1;
+                b.GrowShrinkKill(rn, -1, k >= 0 ? -k : INT64_MIN);
+                b.CheckedFacts(nt, lt, 0);
+                break;
+            }
+            case B_CLEAR: {
+                auto pid = b.GrowShrinkKill(rn, -1);
+                if (pid >= 0) b.ExactLenIs(pid, BCE::Term { true, BCE::Zero(), 0 });
+                break;
+            }
+            case B_RESIZE: {
+                // The count's term is only trusted when the fill value moved nothing.
+                size_t ai = recv ? 0 : 1;
+                auto countmoved = ai < argsgen.size() && argsgen[ai] != b.nextgen;
+                auto nt = b.mode == BCE::M_KILLS || countmoved || recvmoved ? BCE::Term {}
+                                                                            : b.TermOf(arg0);
+                auto pid = b.GrowShrinkKill(rn, 0);
+                if (pid >= 0) b.ExactLenIs(pid, nt);
+                break;
+            }
+            case B_ASSERT: {
+                auto cond = FirstArg();
+                if (b.mode != BCE::M_KILLS && !b.HasKillEffects(cond)) b.CondFacts(cond, true);
+                // A statically false assertion ends the path.
+                if (auto bl = Is<BoolLit>(cond); bl && !bl->val) return false;
+                break;
+            }
+            case B_ABORT: case B_EXIT:
+                return false;   // The program ends here (§9.3).
+            default:
+                break;   // len/cap/print/free/queues/threads: no tracked effect.
+        }
+        return true;
+    }
+    if (fvbody) {
+        // The function value is this body's own code, bound to the call's
+        // arguments: its checks are judged from scratch (it runs inside the
+        // callee, possibly repeatedly and after arbitrary callee effects),
+        // and its kills are exactly its own.
+        if (b.mode != BCE::M_KILLS) {
+            auto saved = std::move(b.flow);
+            b.flow = BCE::Flow {};
+            b.loopdepth++;
+            for (auto p : fvparams) if (p) b.BumpVar(p, false);   // Re-bound per call.
+            b.Walk(fvbody);
+            b.loopdepth--;
+            b.flow = std::move(saved);
+        }
+        for (auto p : fvparams) if (p) b.BumpVar(p, false);
+        b.StripKills(fvbody);
+        return true;
+    }
+    if (site) b.RecordSite(this, ArgNodes(), ints, slens, moved);
+    b.CallKills(this);
+    return true;
+}
+
+inline bool Block::BceWalk(BCE &b) {
+    auto fell = true;
+    auto defers = false;
+    for (auto st : stmts) {
+        fell = b.Walk(st);
+        if (!fell) break;
+        defers = defers || Is<Defer>(st);
+    }
+    if (fell) b.Walk(tail);
+    // The deferred bodies run as the block ends (Defer::BceWalk).
+    if (fell && defers)
+        for (auto st : stmts)
+            if (auto d = Is<Defer>(st)) b.StripKills(d->body);
+    return fell;
+}
+
+inline bool IfExpr::BceWalk(BCE &b) {
+    b.Walk(cond);
+    if (b.mode == BCE::M_KILLS) {
+        b.Walk(thenb);
+        b.Walk(elseb);
+        return true;
+    }
+    auto killfree = !b.HasKillEffects(cond);
+    auto base = b.flow;
+    if (killfree) b.CondFacts(cond, true);
+    auto fellthen = b.Walk(thenb);
+    auto thenf = std::move(b.flow);
+    b.flow = std::move(base);
+    if (killfree) b.CondFacts(cond, false);
+    auto fellelse = b.Walk(elseb);
+    if (fellthen && !fellelse) { b.flow = std::move(thenf); return true; }
+    if (!fellthen && fellelse) return true;   // b.flow is already the else path.
+    if (!fellthen && !fellelse) return false;
+    b.flow = b.Meet(thenf, b.flow);
+    return true;
+}
+
+inline bool MatchExpr::BceWalk(BCE &b) {
+    b.Walk(scrutinee);
+    if (b.mode == BCE::M_KILLS) {
+        for (auto &arm : arms) {
+            if (arm.binder) b.BumpVar(arm.binder, false);   // Re-bound per execution.
+            b.Walk(arm.body);
+        }
+        return true;
+    }
+    auto st = b.TermOf(scrutinee);
+    auto stt = scrutinee->exprtype;
+    auto admissible = st.ok && b.CmpAdmissible(st) && stt && stt->kind == TY_INT &&
+                      stt->intstorage != IS_U64;
+    auto base = b.flow;
+    BCE::Flow acc;
+    auto anyfell = false;
+    for (auto &arm : arms) {
+        b.flow = base;
+        if (admissible && arm.pat.kind != P_WILDCARD) {
+            // Several values and ranges bound the scrutinee by their hull.
+            auto lo = arm.ranges[0].lo, hi = arm.ranges[0].hi;
+            for (auto &r : arm.ranges) {
+                lo = std::min(lo, r.lo);
+                hi = std::max(hi, r.hi);
+            }
+            b.AddFactB(BCE::Zero(), st.b, BCE::SatSub(st.off, lo));
+            b.AddFactB(st.b, BCE::Zero(), BCE::SatSub(hi, st.off));
+        }
+        if (b.Walk(arm.body)) {
+            if (!anyfell) acc = std::move(b.flow);
+            else acc = b.Meet(acc, b.flow);
+            anyfell = true;
+        }
+    }
+    if (!anyfell) { b.flow = std::move(base); return false; }
+    b.flow = std::move(acc);
+    return true;
+}
+
+inline bool EarlyBlock::BceWalk(BCE &b) {
+    if (b.mode == BCE::M_KILLS) {
+        b.Walk(body);
+        return true;
+    }
+    if (!b.HasBreaks(body)) return b.Walk(body);
+    auto entry = b.flow;
+    b.Walk(body);
+    b.flow = std::move(entry);
+    b.StripKills(body);
+    return true;
+}
+
+inline bool While::BceWalk(BCE &b) {
+    b.loopdepth++;
+    if (b.mode == BCE::M_KILLS) {
+        b.Walk(cond);
+        b.Walk(body);
+        b.loopdepth--;
+        return true;
+    }
+    b.LoopViewRefs(body, cond, hoistrefs, hoistfields);
+    b.StripKills(cond);
+    b.StripKills(body);
+    // A break in the condition leaves with only part of it run, where what
+    // its evaluation states need not hold yet: only the state at the top of
+    // an iteration does.
+    auto condbreaks = b.HasBreaks(cond);
+    auto top = condbreaks ? b.flow : BCE::Flow {};
+    b.Walk(cond);
+    auto exitf = b.flow;
+    auto killfree = !b.HasKillEffects(cond);
+    if (killfree) b.CondFacts(cond, true);
+    b.Walk(body);
+    if (condbreaks) {
+        b.flow = std::move(top);
+    } else {
+        b.flow = std::move(exitf);
+        // A break in the body leaves after any part of it ran, which may have
+        // moved what the condition's evaluation stated. The loop depth still
+        // counts a redeclaration in the body as a kill, as at entry.
+        if (b.HasBreaks(body)) b.StripKills(body);
+        else if (killfree) b.CondFacts(cond, false);
+    }
+    b.loopdepth--;
+    return true;
+}
+
+inline bool LoopExpr::BceWalk(BCE &b) {
+    b.loopdepth++;
+    if (b.mode == BCE::M_KILLS) {
+        b.Walk(body);
+        b.loopdepth--;
+        return true;
+    }
+    b.LoopViewRefs(body, nullptr, hoistrefs, hoistfields);
+    b.StripKills(body);
+    auto exitf = b.flow;
+    b.Walk(body);
+    b.flow = std::move(exitf);
+    b.loopdepth--;
+    return true;
+}
+
+inline bool ForLoop::BceWalk(BCE &b) {
+    if (b.mode == BCE::M_KILLS) {
+        b.Walk(iter);
+        b.loopdepth++;
+        if (vdef) b.BumpVar(vdef, false);
+        if (idxdef) b.BumpVar(idxdef, false);
+        b.Walk(body);
+        b.loopdepth--;
+        return true;
+    }
+    // Range and count loops compare the variable against loop-entry snapshots,
+    // so capture those terms before the body havoc; array and slice loops
+    // re-read the length every iteration, so capture after.
+    BCE::Term lot, hit;
+    if (iterkind == IK_RANGE) {
+        if (auto r = Is<RangeExpr>(iter)) {
+            // Codegen saves each endpoint when it is evaluated. In particular,
+            // the upper endpoint must not replace an earlier lower read.
+            // An endpoint is only the term's value where the addition that
+            // formed it cannot have wrapped, which is decided in the state
+            // it was evaluated in.
+            b.Walk(r->lo);
+            lot = b.TermOf(r->lo);
+            if (!b.CmpAdmissible(lot)) lot = BCE::Term {};
+            auto gen = b.nextgen;
+            b.Walk(r->hi);
+            hit = b.TermOf(r->hi);
+            if (!b.CmpAdmissible(hit)) hit = BCE::Term {};
+            // A shift keeps its variable's generation, so an upper endpoint
+            // that moved anything may have changed what the lower term names.
+            if (b.nextgen != gen && lot.b.kind != BCE::BK_ZERO) lot = BCE::Term {};
+        }
+    } else {
+        b.Walk(iter);
+        if (iterkind == IK_COUNT) {
+            lot = BCE::Term { true, BCE::Zero(), 0 };
+            hit = b.TermOf(iter);
+            if (!b.CmpAdmissible(hit)) hit = BCE::Term {};
+        }
+    }
+    // Counted push loops `for _ in n { ...; a.push(x); ...; }`: when no other
+    // statement can touch a's length and no break or continue skips an
+    // iteration, the loop grows a by its push count per iteration, so
+    // afterwards len(a) == len-before + k*n. A push also bumps every place
+    // that may name its receiver's array (GrowShrinkKill), so pushes onto
+    // two places that may be one array rule each other out.
+    vector<pair<int, int64_t>> pushpids;
+    vector<BCE::Term> prelens;
+    if ((iterkind == IK_COUNT || iterkind == IK_RANGE) && !body->tail &&
+        !b.HasIterationJumps(body)) {
+        // Each counted push's receiver, named before any statement is
+        // summarized, since a summary only reports places that exist.
+        vector<int> pushed;
+        for (auto st : body->stmts) {
+            auto pid = -1;
+            if (auto pc = Is<Call>(st); pc && pc->builtin == B_PUSH) {
+                auto pan = pc->ArgNodes();
+                pid = pan.size() == 2 ? b.PlaceOf(pan[0]) : -1;
+                if (pid >= 0 && b.HasKillEffects(pan[1])) pid = -1;
+            }
+            pushed.push_back(pid);
+        }
+        map<int, int64_t> counts;
+        set<int> otherbumps;
+        for (size_t i = 0; i < body->stmts.size(); i++) {
+            set<int> bumps;
+            b.SummarizeInto(body->stmts[i], bumps);
+            if (pushed[i] >= 0) {
+                counts[pushed[i]]++;
+                bumps.erase(pushed[i]);
+            }
+            otherbumps.insert(bumps.begin(), bumps.end());
+        }
+        for (auto &[pid, k] : counts)
+            if (!otherbumps.count(pid)) {
+                pushpids.push_back({ pid, k });
+                prelens.push_back(BCE::Term { true, b.LenBase(pid), 0 });
+            }
+    }
+    // Growth during iteration is legal (§6.5), so the length is re-read every
+    // iteration unless nothing in the body can change it -- which is what the
+    // kill summary answers, calls included.
+    if (b.mode == BCE::M_JUDGE && (iterkind == IK_ARRAY || iterkind == IK_SLICE)) {
+        auto pid = b.PlaceOf(iter);
+        if (pid < 0) pid = b.ElemPlaceOf(iter);
+        if (pid >= 0) {
+            set<int> kills;
+            b.SummarizeInto(body, kills);
+            fixedlen = !kills.count(pid);
+        }
+    }
+    auto iv = iterkind == IK_ARRAY || iterkind == IK_SLICE ? idxdef : vdef;
+    // A counter the body steps by at most one per iteration (StepsOf) keeps
+    // the distance to the index it had on entry from growing: v <= start + c
+    // there gives v <= i + c on every iteration, the `lt <= i` that the swap
+    // index of a branchless partition needs. The index moves by exactly one
+    // per iteration, as long as nothing but the loop can write it.
+    vector<pair<VarDef *, int64_t>> stepped;
+    if (iv && BCE::IntBaseVar(iv) && !iv->captured && !b.addrof.count(iv)) {
+        auto start = iterkind == IK_ARRAY || iterkind == IK_SLICE
+                         ? BCE::Term { true, BCE::Zero(), 0 } : lot;
+        if (start.ok && b.CmpAdmissible(start))
+            for (auto v : b.StepCounters(body)) {
+                auto c = BCE::SatSub(b.Dist(b.VarBase(v), start.b), start.off);
+                if (BCE::SmallOff(c)) stepped.push_back({ v, c });
+            }
+    }
+    b.loopdepth++;
+    // Codegen reads the views ahead of the whole loop, the iteration
+    // expression included, so what that expression changes counts too.
+    b.LoopViewRefs(body, iter, hoistrefs, hoistfields);
+    b.StripKills(body);
+    if (iterkind == IK_ARRAY || iterkind == IK_SLICE) {
+        lot = BCE::Term { true, BCE::Zero(), 0 };
+        hit = b.LenTermOf(iter);
+        // With the body's kills stripped, what bounds the length now bounds
+        // it wherever an iteration tests it.
+        if (b.mode == BCE::M_JUDGE) {
+            lenbound = -1;
+            lenexact = false;
+            auto up = hit.ok ? b.Dist(hit.b, BCE::Zero()) : BCE::INF;
+            auto ub = up == BCE::INF ? BCE::INF : BCE::SatAdd(up, hit.off);
+            if (ub >= 0 && ub < BCE::LENMAX) {
+                lenbound = ub;
+                lenexact = b.Query(BCE::Zero(), hit.b, BCE::SatSub(hit.off, ub));
+            }
+        }
+    }
+    auto exitf = b.flow;
+    if (iv) {
+        auto vb = b.VarBase(iv);
+        if (lot.ok) b.AddFactB(lot.b, vb, BCE::SatSub(0, lot.off));
+        if (hit.ok) b.AddFactB(vb, hit.b, BCE::SatSub(hit.off, 1));
+        for (auto &[v, c] : stepped) b.AddFactB(b.VarBase(v), vb, c);
+    }
+    if ((iterkind == IK_RANGE || iterkind == IK_COUNT) && idxdef)
+        b.AddFactB(BCE::Zero(), b.VarBase(idxdef), 0);
+    b.Walk(body);
+    b.flow = std::move(exitf);
+    b.loopdepth--;
+    if (!pushpids.empty()) {
+        BCE::Term iters;
+        if (iterkind == IK_COUNT) {
+            iters = hit;
+        } else if (lot.ok && hit.ok) {
+            if (lot.b == hit.b)
+                iters = BCE::Term { true, BCE::Zero(), BCE::SatSub(hit.off, lot.off) };
+            else if (lot.b.kind == BCE::BK_ZERO)
+                iters = BCE::Term { true, hit.b, BCE::SatSub(hit.off, lot.off) };
+        }
+        // A negative count runs zero iterations; facts only when it is >= 0.
+        if (iters.ok && b.CmpAdmissible(iters) &&
+            b.Query(BCE::Zero(), iters.b, iters.off)) {
+            for (size_t i = 0; i < pushpids.size(); i++) {
+                auto [pid, k] = pushpids[i];
+                auto &pre = prelens[i];
+                auto post = b.LenBase(pid);
+                if (iters.b.kind == BCE::BK_ZERO) {
+                    auto total = iters.off;
+                    for (auto m = int64_t(1); m < k && total != BCE::INF; m++)
+                        total = BCE::SatAdd(total, iters.off);
+                    if (total == BCE::INF) continue;
+                    b.AddFactB(post, pre.b, total);              // post == pre + k*n.
+                    b.AddFactB(pre.b, post, BCE::SatSub(0, total));
+                } else if (k == 1) {
+                    b.AddFactB(iters.b, post, BCE::SatSub(0, iters.off));   // n <= post.
+                    if (b.Query(pre.b, BCE::Zero(), 0))                     // pre == 0:
+                        b.AddFactB(post, iters.b, iters.off);               // post == n.
+                }
+            }
+        }
+    }
+    return true;
+}
+
+inline bool InlineBlock::BceWalk(BCE &b) {
+    if (b.mode == BCE::M_KILLS) {
+        b.Walk(body);
+        return true;
+    }
+    // A trailing return to this block is its one normal exit and needs no
+    // havoc; earlier ones join the end from other states.
+    auto &stmts = body->stmts;
+    Node *last = stmts.empty() ? nullptr : stmts.back();
+    auto lastret = Is<Return>(last) && ((Return *)last)->target == sf;
+    auto early = false;
+    for (size_t i = 0; i + 1 < stmts.size(); i++)
+        early = early || ReturnsTo(stmts[i], sf);
+    if (last) {
+        if (lastret) {
+            for (auto v : ((Return *)last)->vals)
+                early = early || ReturnsTo(v, sf);
+        } else {
+            early = early || ReturnsTo(last, sf);
+        }
+    }
+    if (body->tail) early = early || ReturnsTo(body->tail, sf);
+    if (!early) {
+        b.Walk(body);
+        return true;
+    }
+    auto entry = b.flow;
+    b.Walk(body);
+    b.flow = std::move(entry);
+    b.StripKills(body);
+    return true;
+}
+
+inline bool Return::BceWalk(BCE &b) {
+    for (auto v : vals) b.Walk(v);
+    return false;
+}
+
+inline bool Break::BceWalk(BCE &b) {
+    b.Walk(val);
+    return false;
+}
+
+inline bool Continue::BceWalk(BCE &) { return false; }
+
+// A deferred body runs at every exit of its block, not where it is written
+// (§6.6). Its checks are judged without the facts that hold here, since a
+// write between here and an exit may have undone them, and what it kills is
+// killed from here on, which covers the exits inside the block, and once
+// more at the block's end for the facts stated after it (Block::BceWalk). A
+// loop or `block` left by a break strips its whole body's kills after it,
+// this body's among them, and a loop's entry strips its body's, which a
+// continue returns to.
+inline bool Defer::BceWalk(BCE &b) {
+    if (b.mode != BCE::M_KILLS) {
+        auto saved = std::move(b.flow);
+        b.flow = BCE::Flow {};
+        b.loopdepth++;
+        b.Walk(body);
+        b.loopdepth--;
+        b.flow = std::move(saved);
+    }
+    b.StripKills(body);
+    return true;
+}
+
+inline bool VarDecl::BceWalk(BCE &b) {
+    for (auto i : inits) b.Walk(i);
+    if (defs.size() == 1 && inits.size() == 1 && defs[0]) {
+        auto v = defs[0];
+        auto lt = b.mode != BCE::M_KILLS && v->type && v->type->kind == TY_ARRAY
+                      ? b.FreshLenOf(inits[0]) : BCE::Term {};
+        // A slice binding takes the length its bounds just stated; a slice
+        // or reference bound to a place, that place's.
+        if (b.mode != BCE::M_KILLS && v->type && v->type->kind == TY_SLICE &&
+            Is<SliceExpr>(inits[0]))
+            lt = b.slicelen;
+        else if (b.mode != BCE::M_KILLS && v->type && IsRefOrSlice(v->type))
+            lt = b.BoundLenOf(inits[0]);
+        if (BCE::IntBaseVar(v)) {
+            b.SetWrite(v, inits[0], true);
+        } else if (b.loopdepth > 0 && v->type && IsRefOrSlice(v->type)) {
+            b.RebindKill(v);   // Loop-repeated redeclaration rebinds.
+        } else if (b.loopdepth > 0 && v->type && v->type->kind != TY_FLT &&
+                   v->type->kind != TY_BOOL && v->type->kind != TY_INT) {
+            b.StorageWriteKill(BCE::UK_OWNED, v, v);   // Loop-repeated reconstruction.
+        }
+        if (lt.ok) {
+            auto pid = b.PlaceOfVar(v);
+            if (pid >= 0) b.ExactLenIs(pid, lt);
+        }
+        // A slice of a whole limited array is no longer than its capacity.
+        if (b.mode != BCE::M_KILLS && v->type && v->type->kind == TY_SLICE) {
+            auto cap = BCE::DeclCap(inits[0]);
+            auto pid = cap >= 0 ? b.PlaceOfVar(v) : -1;
+            if (pid >= 0) b.AddFactB(b.LenBase(pid), BCE::Zero(), cap);
+        }
+    } else {
+        for (auto d : defs) if (d) b.VarKillWrite(d);
+    }
+    return true;
+}
+
+inline bool Assign::BceWalk(BCE &b) {
+    b.WalkLvalParts(lval);
+    auto gen = b.nextgen;
+    b.Walk(rhs);
+    if (op == T_DOTASSIGN) {
+        auto ch = b.ChainOf(lval);
+        if (Is<Ident>(lval) && ch.kind == BCE::CH_OK) {
+            // Only the places rooted at a reference variable read it.
+            b.RebindKill(ch.root);
+            // A reference variable rebound to a place has that place's length.
+            if (b.mode != BCE::M_KILLS) {
+                auto lt = b.BoundLenOf(rhs);
+                auto pid = lt.ok ? b.PlaceOfVar(ch.root) : -1;
+                if (pid >= 0) b.ExactLenIs(pid, lt);
+            }
+            return true;
+        }
+        // A field or element slot lies in storage that other names may reach
+        // too (`p.r` is `h.r` where `p = &h`). The kill reports that storage
+        // in the summary even where no place tracks it.
+        auto [k, u] = b.ChainUlt(lval, true);
+        b.RefSlotWriteKill(k, u, ch.root);
+        return true;
+    }
+    if (pointee) {
+        auto pt = lval->exprtype;
+        b.PointeeWriteKill(lval, pt && pt->kind == TY_REF ? pt->ref->sub : nullptr);
+        return true;
+    }
+    if (auto id = Is<Ident>(lval)) {
+        auto v = id->vdef;
+        if (!v) return true;
+        if (BCE::IntBaseVar(v)) {
+            if (op == T_ASSIGN) {
+                b.SetWrite(v, rhs, false);
+            } else if (op == T_PLUSEQ || op == T_MINUSEQ) {
+                auto lit = Is<IntLit>(rhs);
+                if (lit && !lit->uns && BCE::SmallOff(lit->val))
+                    b.ShiftWrite(v, op == T_PLUSEQ ? lit->val : -lit->val);
+                else if (BCE::IsUnitStep(this, v)) b.StepWrite(v);
+                // As `v = v + rhs`, unless the rhs changed what v + rhs
+                // would read (Binary::BceWalk's effectful terms).
+                else b.SetWrite(v, b.nextgen == gen ? b.CompoundSum(this) : nullptr, false);
+            } else {
+                b.VarKillWrite(v);
+            }
+            return true;
+        }
+        auto t = v->type;
+        auto fresh = b.mode != BCE::M_KILLS && t && t->kind == TY_ARRAY && op == T_ASSIGN
+                         ? b.FreshLenOf(rhs) : BCE::Term {};
+        if (b.mode != BCE::M_KILLS && t && t->kind == TY_SLICE && op == T_ASSIGN)
+            fresh = Is<SliceExpr>(rhs) ? b.slicelen : b.BoundLenOf(rhs);
+        // A slice variable is the slot that references to it measure too.
+        if (t && t->kind == TY_SLICE) b.SlotWriteKill(BCE::UK_OWNED, v);
+        else if (t && t->kind != TY_FLT && t->kind != TY_BOOL && t->kind != TY_INT)
+            b.StorageWriteKill(BCE::UK_OWNED, v, v);
+        if (fresh.ok) {
+            auto pid = b.PlaceOfVar(v);
+            if (pid >= 0) b.ExactLenIs(pid, fresh);
+        }
+        return true;
+    }
+    auto lt = lval->exprtype;
+    // A value stored in or into an element changes a length only if it holds
+    // one, which only a reference into the element measures, and redirects
+    // what such a reference reads through the element only if it holds a
+    // reference.
+    auto elemwrite = [&] {
+        if (BCE::HoldsLen(lt)) b.ElementLvalKill(lval);
+        if (BCE::HoldsRef(lt)) {
+            auto [k, u] = b.ChainUlt(lval, true);
+            b.RefSlotWriteKill(k, u, nullptr);
+        }
+        return true;
+    };
+    if (Is<Index>(lval)) return elemwrite();
+    if (lt && !BCE::HoldsLen(lt, true))
+        return true;                    // Nor can a field write of a value without one.
+    auto ch = b.ChainOf(lval);
+    if (ch.kind == BCE::CH_INDEX) return elemwrite();
+    if (ch.kind == BCE::CH_FAIL || !ch.root) {
+        b.StorageWriteKill(BCE::UK_OPAQUE, nullptr, nullptr);
+        return true;
+    }
+    if (!ch.anycross) {
+        b.StorageWriteKill(BCE::UK_OWNED, ch.root, ch.root);
+    } else if (ch.rootonlycross) {
+        auto [k, u] = b.UltOf(ch.root);
+        if (k != BCE::UK_STATIC) b.StorageWriteKill(k, u, ch.root);
+        else b.RebindKill(ch.root);
+    } else {
+        b.StorageWriteKill(BCE::UK_OPAQUE, nullptr, ch.root);
+    }
+    return true;
+}
+
+inline bool IncDec::BceWalk(BCE &b) {
+    b.WalkLvalParts(lval);
+    auto lt = lval->exprtype;
+    if (lt && lt->kind == TY_REF) {
+        b.PointeeWriteKill(lval, lt->ref->sub);
+        return true;
+    }
+    if (auto id = Is<Ident>(lval); id && id->vdef) {
+        if (BCE::IntBaseVar(id->vdef)) b.ShiftWrite(id->vdef, op == T_INC ? 1 : -1);
+        else b.VarKillWrite(id->vdef);
+    }
+    // A field or element integer is not a tracked base.
+    return true;
+}
+
+}  // namespace goose

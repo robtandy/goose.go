@@ -1,1 +1,9 @@
 .issue_attack/
+﻿build
+build-*
+bench/gen
+samples/*.ppm
+samples/*.pgm
+samples/*.png
+__pycache__
+build/
