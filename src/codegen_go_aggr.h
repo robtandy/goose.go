@@ -525,7 +525,11 @@ inline void CodeGenGo::GenForArray(ForLoop *f) {
         }
     }
     OpenLabeled(SC_LOOP);
-    auto gi = f->idxdef && !typedix ? LocalName(f->idxdef) : T();
+    // The index is the loop's own counter, and its binder a copy declared in
+    // the body, as every local is (Decl): one whose address the body takes
+    // then lives in the function's frame (FinishBody), where a header's
+    // would be on Go's moving stack.
+    auto gi = T();
     LabelHere();
     if (!cur.empty())
         L("for ", gi, " := int64(0); ", gi, " < ", len, "; ", gi, ", ", cur, " = ", gi, "+1, unsafe.Add(", cur,
@@ -533,9 +537,10 @@ inline void CodeGenGo::GenForArray(ForLoop *f) {
     else
         L("for ", gi, " := int64(0); ", gi, " < ", len, "; ", gi, "++ {");
     ind++;
-    if (typedix) {
+    if (f->idxdef) {
         auto it = f->idxdef->type;
-        Decl(LocalName(f->idxdef), LocalT(it, f->line), Coerce(gi, ast.inttypes[IS_I64], it, f->line));
+        Decl(LocalName(f->idxdef), LocalT(it, f->line),
+             typedix ? Coerce(gi, ast.inttypes[IS_I64], it, f->line) : gi);
     }
     if (!cur.empty()) {
         if (moves) {

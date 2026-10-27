@@ -1793,13 +1793,15 @@ int Main(int argc, char **argv) {
             }
             go.stacks = stackcfg;
             // Named relative to the Go, as the C names its headers, where -o
-            // writes it (or absolute, where a build or a run does).
+            // writes it, and absolute where a build or a run does, in its
+            // build directory: Go reads a //line directive's relative name
+            // from the directory of the file it is in.
             for (auto &inc : includes) {
                 GoOptions::Include gi;
                 if (!LoadFile(inc, gi.text))
                     throw CompileError { cat("cannot read the --include file ", inc) };
-                gi.name = !outfile.empty() && !filesystem::path(inc).is_absolute()
-                              ? ForwardSlashes(RelativeTo(inc, DirOf(outfile))) : ForwardSlashes(inc);
+                gi.name = ForwardSlashes(!outfile.empty() && verb != "build" && !gorun
+                                             ? RelativeTo(inc, DirOf(outfile)) : AbsolutePath(inc));
                 go.includes.push_back(std::move(gi));
             }
             // goose run: the entry source's directory is the resources', as

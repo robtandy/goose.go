@@ -550,11 +550,16 @@ inline void CodeGenGo::GenFor(ForLoop *f) {
     GoT(vt, f->line);
     auto wide = !SameGoT(vt, ct);
     OpenLabeled(SC_LOOP);
-    auto ctr = wide ? T() : LocalName(f->vdef);
-    string head;
+    // The counters are the loop's own, and the binders copies of them
+    // declared in its body, as every local is (Decl): one whose address the
+    // body takes then lives in the function's frame (FinishBody), one slot
+    // for every iteration, as C's does, where a header's would be on Go's
+    // moving stack.
+    auto ctr = T();
+    string head, ix;
     if (f->idxdef) {
         auto it = f->idxdef->type;
-        auto ix = LocalName(f->idxdef);
+        ix = T();
         head = cat("for ", ctr, ", ", ix, " := ", lov, ", ", GoIntLit(0, false, it, f->line), "; ",
                    ctr, " < ", hiv, "; ", ctr, ", ", ix, " = ", ctr, "+1, ", ix, "+1 {");
     } else {
@@ -563,7 +568,8 @@ inline void CodeGenGo::GenFor(ForLoop *f) {
     LabelHere();
     L(head);
     ind++;
-    if (wide) Decl(LocalName(f->vdef), LocalT(vt, f->line), cat(GoT(vt, f->line), "(", ctr, ")"));
+    Decl(LocalName(f->vdef), LocalT(vt, f->line), wide ? cat(GoT(vt, f->line), "(", ctr, ")") : ctr);
+    if (f->idxdef) Decl(LocalName(f->idxdef), LocalT(f->idxdef->type, f->line), ix);
     GenLoopBody(f->body);
     ind--;
     LS("}");
@@ -775,6 +781,71 @@ inline void CodeGenGo::GenExitValue(Node *val, int si) {
         LandValue(d.s, ScopeTop0(si), start, d.t ? d.t : val->exprtype, d.lenlv);
 }
 
+// A call's results forwarded as the function's own, by the types rets they
+// go out as, into the channels chans (CodeGen::GenForward), whatever is
+// called: a result the call gives as its own type is built straight into
+// its channel; one of another type (a variable array for a resizable, say)
+// lands in a temporary of its own type first, and is built from there
+// into its channel or read as its type. The fixed results' values, by
+// result ("" for the others).
+inline vector<string> CodeGenGo::GenForward(Call *c, const vector<TypeExpr *> &rets, const vector<GoDst> &chans) {
+    auto ln = c->line;
+    auto &ctypes = c->rettypes;
+    if (ctypes.size() != rets.size()) Fail(ln, "internal: a return forwarding another count of results");
+    vector<GoDst> dsts;
+    vector<GoLoc> arrived(rets.size());
+    for (size_t i = 0; i < rets.size(); i++) {
+        auto ct = ctypes[i];
+        if (TEq(ct, rets[i])) {
+            auto d = chans[i];
+            if (d.k == GD_DISCARD) {
+                d = GoDst { GD_LVALUE, T(), ct };
+                Decl(d.s, LocalT(ct, ln));
+            }
+            dsts.push_back(d);
+            continue;
+        }
+        if (ct->kind == TY_VARIANT && IsBytesT(ct))
+            Unsupported(ln, cat("forwarding a ", TypeText(ct), " result as a ", TypeText(rets[i])));
+        auto &lv = arrived[i];
+        string stk;
+        if (IsResz(ct)) {
+            auto h = RzTemp(ct, stk);
+            lv = RzTempLoc(ct, h, stk);
+            dsts.push_back(GoDst { GD_STACK, stk, ct, RzLenLv(ct, h) });
+        } else if (IsBytesT(ct)) {
+            lv = BytesLoc(BytesTemp(stk), ct, GoLoc {});
+            lv.stk = stk;
+            dsts.push_back(GoDst { GD_STACK, stk, ct });
+        } else {
+            auto v = T();
+            Decl(v, LocalT(ct, ln));
+            lv = AtVar(v, ct);
+            dsts.push_back(GoDst { GD_LVALUE, v, ct });
+        }
+    }
+    auto res = GenCallVals(c, dsts[0], &dsts);
+    vector<string> vals(rets.size());
+    if (Unreached()) return vals;
+    for (size_t i = 0; i < rets.size(); i++) {
+        auto rt = rets[i];
+        auto r = i < res.size() ? res[i] : string();
+        if (auto lv = arrived[i]; lv.t) {
+            // Where the call left the value: its Go result, say.
+            auto ct = ctypes[i];
+            if (!IsResz(ct) && !r.empty()) {
+                if (IsBytesT(ct)) lv.addr = r;
+                else lv = AtVar(r, ct);
+            }
+            if (IsBytesT(rt)) ConstructFromLoc(lv, rt, chans[i].s, chans[i].lenlv, ln);
+            else vals[i] = LoadLoc(lv, rt, ln);
+        } else if (!IsBytesT(rt)) {
+            vals[i] = CoerceVal(!r.empty() ? r : dsts[i].s, ctypes[i], rt, ln);
+        }
+    }
+    return vals;
+}
+
 inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
     if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
     auto sp = curspec;
@@ -786,10 +857,44 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
     if (vals.size() == 1 && sp->rets.size() > 1) {
         // A single call forwards all its results (§7.1).
         auto c = Is<Call>(vals[0]);
+        // A builtin's (from_bytes's value and its bool), a dispatch's that
+        // are not all fixed-size, a function value's: each result into its
+        // channel, a non-fixed one built at this function's destination for
+        // it, its count into gs_rl<i>, by the call's own convention
+        // (GenCallVals), as the C backend forwards them (GenForward).
+        if (c && c->rettypes.size() == sp->rets.size() &&
+            (c->builtin >= 0 || c->fvbody || NonFixedDispatch(c))) {
+            vector<GoDst> chans(sp->rets.size());
+            vector<string> starts(sp->rets.size());
+            for (size_t i = 0; i < sp->rets.size(); i++) {
+                auto rt = sp->rets[i];
+                auto dst = cat("gs_dst", i);
+                if (IsResz(rt)) chans[i] = GoDst { GD_STACK, dst, rt, dstcounts[i] };
+                else if (IsBytesT(rt)) chans[i] = GoDst { GD_STACK, dst, rt };
+                else continue;
+                starts[i] = ExitStart(c, dst, chans[i].lenlv, 0);
+            }
+            auto fixed = GenForward(c, sp->rets, chans);
+            if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
+            for (size_t i = 0; i < sp->rets.size(); i++)
+                if (!starts[i].empty())
+                    LandValue(cat("gs_dst", i), DstTop0((int)i), starts[i], sp->rets[i], chans[i].lenlv);
+            for (size_t i = 0; i < sp->rets.size(); i++) {
+                auto rt = sp->rets[i];
+                if (IsResz(rt)) rv.push_back(dstcounts[i]);
+                else if (!IsBytesT(rt)) rv.push_back(Snapshot(rt, fixed[i]));
+            }
+            EmitExitRestores(0);
+            string list;
+            for (size_t i = 0; i < rv.size(); i++) Append(list, i ? ", " : "", rv[i]);
+            L(list.empty() ? string("return") : cat("return ", list));
+            dead = true;
+            return;
+        }
         if (c && !c->dispatch.empty() && c->dispatch[0]->rets.size() == sp->rets.size()) {
             // A case-function call's results, which its cases deliver into
             // temporaries.
-            auto res = GenDispatch(c);
+            auto res = GenDispatch(c, GoDst {}, nullptr);
             for (size_t i = 0; i < sp->rets.size(); i++)
                 rv.push_back(Coerce(res[i], c->dispatch[0]->rets[i], sp->rets[i], c->line));
             if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });

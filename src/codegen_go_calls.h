@@ -319,11 +319,7 @@ inline vector<string> CodeGenGo::GenCallVals(Call *c, const GoDst &d0, vector<Go
         if (rv.empty()) return {};
         return { rv };
     }
-    if (!c->dispatch.empty()) {
-        for (auto rt : c->dispatch[0]->rets)
-            if (IsBytesT(rt)) Unsupported(c->line, "a case-function dispatch with a non-fixed result");
-        return GenDispatch(c);
-    }
+    if (!c->dispatch.empty()) return GenDispatch(c, d0, alldst);
     if (!c->spec) Fail(c->line, "internal: unresolved call");
     if (c->spec->sf->isextern && !PlainSig(c->spec)) Unsupported(c->line, "a call to an extern fn");
     if (PlainSig(c->spec)) {
@@ -353,7 +349,7 @@ inline vector<string> CodeGenGo::GenCallVals(Call *c, const GoDst &d0, vector<Go
 // value converts to the type the receiver wants.
 inline string CodeGenGo::CallVal0(Call *c, const string &r0, TypeExpr *want) {
     auto rt = c->rettypes.empty() ? nullptr : c->rettypes[0];
-    if (c->builtin >= 0 || c->fvbody || !c->dispatch.empty()) rt = c->exprtype;
+    if (c->builtin >= 0 || c->fvbody) rt = c->exprtype;
     auto et = want ? want : c->exprtype;
     if (!rt || !et) return r0;
     // A result that is not fixed-size (or the one a reference result points
@@ -371,7 +367,7 @@ inline string CodeGenGo::CallVal0(Call *c, const string &r0, TypeExpr *want) {
 // otherwise; a reference is its pointee (CodeGen::CallResLoc).
 inline CodeGenGo::GoLoc CodeGenGo::CallResLoc(Call *c, const string &r0) {
     auto rt = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
-    if (c->builtin >= 0 || c->fvbody || !c->dispatch.empty()) rt = c->exprtype;
+    if (c->builtin >= 0 || c->fvbody) rt = c->exprtype;
     if (IsPlainRef(rt)) return AtRef(r0, rt);
     if (IsResz(rt)) return RzTempLoc(rt, r0, "");
     if (IsBytesT(rt)) {
@@ -399,8 +395,14 @@ static string FirstResult(const string &t, size_t n) {
 // gets the payload's address in it; one taking it by value a copy, taken
 // before the later arguments run -- of the whole image, on a stack of its
 // own, where a by-value case takes a variable-size payload, else of each
-// fixed-size payload a by-value case takes (CodeGen::EmitDispatch).
-inline vector<string> CodeGenGo::GenDispatch(Call *c) {
+// fixed-size payload a by-value case takes (CodeGen::EmitDispatch). The
+// results are a specialization's call's (EmitSpecCall): a non-fixed one is
+// built at its destination's top, d0 for the first and alldst's for every
+// one where given, a temporary's otherwise, which every case is handed; a
+// variable array a run receiver takes arrives in the cases' value form,
+// its prefix slid out after (the dispatch has no element-run form, C.3),
+// and one in a slot of another length storage is re-prefixed after.
+inline vector<string> CodeGenGo::GenDispatch(Call *c, const GoDst &d0, vector<GoDst> *alldst) {
     auto ln = c->line;
     auto sp0 = c->dispatch[0];
     auto an = CallArgNodes(c, sp0->params.size());
@@ -476,11 +478,48 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
         if (!IsGoConst(x) && x != "nil") x = Snapshot(pt, x);
         args[i] = x;
     }
-    vector<string> res;
-    for (auto rt : sp0->rets) {
-        auto t = T();
-        Decl(t, LocalT(rt, ln));
-        res.push_back(t);
+    // Where each result goes, set up once the arguments have run: what it
+    // is afterwards (res, "" where its count went to its destination's), a
+    // non-fixed one's stack, and a resizable one's receiving count.
+    auto nr = sp0->rets.size();
+    vector<string> res(nr), stks(nr), counts(nr);
+    string slidebase, reprefixbase;
+    GoDst slide, reprefix;
+    for (size_t i = 0; i < nr; i++) {
+        auto rt = sp0->rets[i];
+        GoDst dd = alldst && i < alldst->size() ? (*alldst)[i] : (i == 0 ? d0 : GoDst {});
+        if (i == 0 && dd.k == GD_STACK && !dd.lenlv.empty() && rt->kind == TY_ARRAY &&
+            rt->arr->akind == A_VAR) {
+            slide = dd;
+            stks[i] = dd.s;
+            slidebase = T();
+            Decl(slidebase, "unsafe.Pointer", Top(dd.s));
+            continue;
+        }
+        if (IsResz(rt)) {
+            if (dd.k == GD_STACK && !dd.lenlv.empty()) {
+                stks[i] = dd.s;
+                counts[i] = dd.lenlv;
+            } else {
+                res[i] = RzTemp(rt, stks[i]);
+                counts[i] = RzLenLv(rt, res[i]);
+            }
+        } else if (IsBytesT(rt)) {
+            if (dd.k == GD_STACK) {
+                stks[i] = dd.s;
+                res[i] = T();
+                Decl(res[i], "unsafe.Pointer", Top(dd.s));
+            } else {
+                res[i] = BytesTemp(stks[i]);
+            }
+            if (i == 0 && NeedsReprefix(dd, rt)) {
+                reprefix = dd;
+                reprefixbase = res[i];
+            }
+        } else {
+            res[i] = T();
+            Decl(res[i], LocalT(rt, ln));
+        }
     }
     auto chain = [&] {
         auto tag = T();
@@ -515,14 +554,19 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
             for (size_t i = 0; i < an.size(); i++)
                 Append(list, list.empty() ? "" : ", ", (int)i == pos ? pv : args[i]);
             for (auto fv : ki.freevars) Append(list, list.empty() ? "" : ", ", FreeVarArg(c->FreeVarArg(fv)));
+            for (size_t i = 0; i < nr; i++)
+                if (IsBytesT(sp->rets[i])) Append(list, list.empty() ? "" : ", ", stks[i]);
             auto call = cat(ki.name, "(", list, ")");
-            if (res.empty()) {
-                L(call);
-            } else {
-                string names;
-                for (size_t i = 0; i < res.size(); i++) Append(names, i ? ", " : "", res[i]);
-                L(names, " = ", call);
+            // The Go results: each fixed one's value, each resizable one's
+            // count (or frame object); a bytes value is where it was built.
+            string names;
+            for (size_t i = 0; i < nr; i++) {
+                auto rt = sp->rets[i];
+                if (IsBytesT(rt) && !IsResz(rt)) continue;
+                Append(names, names.empty() ? "" : ", ", IsResz(rt) ? counts[i] : res[i]);
             }
+            if (names.empty()) L(call);
+            else L(names, " = ", call);
             if (ki.hasrf) EmitRfCheck(sp);
             PopSc();
             ind--;
@@ -536,19 +580,34 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
         }
         LS("}");
         dead = false;
+        // A run receiver's elements slid out of the cases' prefix, or the
+        // value given the slot's own.
+        if (!slidebase.empty()) EmitSlidePrefix(slidebase, LenStore(sp0->rets[0]->arr), slide.s, slide.lenlv);
+        if (!reprefixbase.empty()) EmitReprefix(sp0, reprefix, reprefixbase, "");
     };
     if (Unreached()) GenUnreached(chain);
     else chain();
     return res;
 }
 
+// Whether a call is a case-function dispatch any of whose results is not
+// fixed-size: one whose results go by the full convention (GenCallVals).
+inline bool CodeGenGo::NonFixedDispatch(Call *c) {
+    if (c->dispatch.empty()) return false;
+    for (auto rt : c->dispatch[0]->rets)
+        if (IsBytesT(rt)) return true;
+    return false;
+}
+
 // A call as a value: made at this point, its first result in a temporary.
 inline string CodeGenGo::GenCall(Call *c) {
     if (c->builtin >= 0 || c->fvbody) return CtlValX(c);
     if (!c->dispatch.empty()) {
-        auto res = GenDispatch(c);
+        auto res = GenDispatch(c, GoDst {}, nullptr);
         if (res.empty()) Fail(c->line, "internal: a call without results as a value");
-        return Coerce(res[0], c->dispatch[0]->rets[0], c->exprtype, c->line);
+        auto rt = c->dispatch[0]->rets[0];
+        if (IsBytesT(rt)) return LoadLoc(CallResLoc(c, res[0]), c->exprtype, c->line);
+        return Coerce(res[0], rt, c->exprtype, c->line);
     }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
     auto sp = c->spec;
@@ -582,8 +641,24 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
     }
     if (c->builtin >= 0) { GenBuiltin(c, d); return; }
     if (c->fvbody) { GenFvCall(c, d); return; }
+    if (NonFixedDispatch(c)) {
+        // By the full convention, its non-fixed results built on
+        // temporaries and read as the slot's type.
+        auto rets = GenDispatch(c, GoDst {}, nullptr);
+        if (d.k == GD_DISCARD || rets.empty() || Unreached()) return;
+        auto want = d.t ? d.t : c->exprtype;
+        if (IsRelRef(want)) {
+            auto pt = ast.RefTo(want->ref->sub, c->line, want->ref->optional);
+            auto v = Snapshot(pt, CallVal0(c, rets[0], pt));
+            EmitRelStore(AtVar(d.s, want), v, NonNullRef(c), false, c->line);
+            return;
+        }
+        auto x = CallVal0(c, rets[0], want);
+        if (x != d.s) L(d.s, " = ", x);
+        return;
+    }
     if (!c->dispatch.empty()) {
-        auto res = GenDispatch(c);
+        auto res = GenDispatch(c, GoDst {}, nullptr);
         if (d.k == GD_DISCARD || res.empty()) return;
         auto want = d.t ? d.t : c->exprtype;
         auto rt = c->dispatch[0]->rets[0];
@@ -645,19 +720,20 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
 // its variable, through temporaries of the callee's types where those are
 // not the variables'.
 inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
-    if (!c->dispatch.empty()) {
+    auto nonfixed = NonFixedDispatch(c);
+    if (!c->dispatch.empty() && !nonfixed) {
         auto rets = c->dispatch[0]->rets;
         if (rets.size() != defs.size()) Fail(c->line, "internal: result count of a binding");
-        auto res = GenDispatch(c);
+        auto res = GenDispatch(c, GoDst {}, nullptr);
         for (size_t i = 0; i < defs.size(); i++)
             Decl(LocalName(defs[i]), LocalT(defs[i]->type, defs[i]->line),
                  Coerce(res[i], rets[i], defs[i]->type, c->line));
         return;
     }
-    if (c->fvbody || (c->builtin < 0 && !c->spec) || (c->builtin >= 0 && c->builtin != B_FROM_BYTES))
+    if (c->fvbody || (c->builtin < 0 && !c->spec && !nonfixed) || (c->builtin >= 0 && c->builtin != B_FROM_BYTES))
         Unsupported(c->line, "a multiple binding from this call");
     auto sp = c->spec;
-    if (c->builtin >= 0 || !PlainSig(sp)) {
+    if (nonfixed || c->builtin >= 0 || !PlainSig(sp)) {
         // Each result where a declaration of its variable alone would build
         // it: a non-fixed one on a stack of its own (DeclStackLocal), a
         // fixed one in its variable (VarDecl::CgStmt).
@@ -673,7 +749,7 @@ inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
         }
         auto rets = GenCallVals(c, dsts.empty() ? GoDst {} : dsts[0], &dsts);
         if (Unreached()) return;
-        auto rtypes = c->builtin >= 0 ? c->rettypes : sp->rets;
+        auto rtypes = c->builtin >= 0 || nonfixed ? c->rettypes : sp->rets;
         for (size_t i = 0; i < dsts.size() && i < rets.size(); i++) {
             if (dsts[i].k != GD_LVALUE || rets[i].empty()) continue;
             auto x = CoerceVal(rets[i], rtypes[i], dsts[i].t, c->line);

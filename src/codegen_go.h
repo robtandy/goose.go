@@ -906,6 +906,7 @@ struct CodeGenGo {
     void GenContinue(Continue *c);
     void GenReturn(Return *r);
     void GenExitValue(Node *val, int si);
+    vector<string> GenForward(Call *c, const vector<TypeExpr *> &rets, const vector<GoDst> &chans);
     void GenNormalReturn(const vector<Node *> &vals);
     void GenVarDecl(VarDecl *vd);
     string LocalName(VarDef *vd);
@@ -953,7 +954,8 @@ struct CodeGenGo {
     vector<string> GenCallVals(Call *c, const GoDst &d0, vector<GoDst> *alldst = nullptr);
     string CallVal0(Call *c, const string &r0, TypeExpr *want);
     GoLoc CallResLoc(Call *c, const string &r0);
-    vector<string> GenDispatch(Call *c);
+    vector<string> GenDispatch(Call *c, const GoDst &d0, vector<GoDst> *alldst);
+    bool NonFixedDispatch(Call *c);
     string GenCall(Call *c);
     void GenCallAny(Call *c, const GoDst &d);
     void GenCallInto(Call *c, const vector<VarDef *> &defs);

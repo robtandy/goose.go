@@ -528,6 +528,19 @@ supported, 64-bit only. The design is in [DESIGN.md](../DESIGN.md).
   writes a library: a package with no `func main`, whose `init` initializes
   the globals and does nothing else. A `fn main()` the program has is not
   run: the Go program that imports the package runs instead.
+* Each `export fn` gets two exported Go entry points, named by its C
+  symbol's words capitalized (`export fn parse_json` is `ParseJson`):
+  `ParseJsonWithStack(gs, ...)` runs it on the data stacks of a block the
+  caller holds, and `ParseJson(...)` on one from the runtime's pool, which
+  allocates nothing once warm. They take Go's own values, viewed in place:
+  a `[]byte` for `u8[:]`, a `string` or a `[]byte` for `const u8[:]`, a
+  `[]T` for `T[:]`, a `*T` for `T&`. DESIGN.md §3.5 has the details.
+* `--include helper.go` splices Go into the file (its package clause and
+  build constraints dropped, its imports merged), for the `extern fn`s the
+  program calls: an extern fn calls the Go function its symbol names, in
+  the file's package. A function appending to a `u8[>..]&` builder is
+  handed the data stack block first, and appends with `GsBldAppend`. A
+  `.h` is refused: `--include` is Go here.
 * `--debug` (or `-DGS_DEBUG=1`) turns on the overflow and `as` range checks,
   and `--stack-reserve`, `-DGS_STACK_RESERVE` and `-DGS_STACK_GAP` size the
   data stacks, as they do for C. The other `-D` macros are C's, and do not
@@ -550,9 +563,13 @@ user format overloads), `assert`, `abort` and `exit`; the values on data
 stacks: resizable arrays `T[>..]` and `T[>..<]` with their builtins, frame
 objects, variable-size values (`T[]`, `T[..]`, structs holding them,
 variable-mode ADTs with `match` and case functions), `reusable` pools and
-`to_bytes`, `bytes_of` and `from_bytes`; and the extern fns of std the C
-runtime implements (`popcount`, `clz`, `ctz`, `find_any`, `find_pair`,
-`frexp`, `ldexp`). Every fixed-size value keeps its exact C layout: a
+`to_bytes`, `bytes_of` and `from_bytes`; `export fn`s; and `extern fn`s:
+the ones std, math and os bind, which the Go runtime and Go's `math`
+stand in for (math's transcendental functions are Go's, which can differ
+from a C library's in the last place), the C library's functions of
+floats that Go's `math` has, by their C names, and Go functions of the
+package (`--include`). So the standard library compiles: the
+`test/stdlib/` fixtures run as they do in C. Every fixed-size value keeps its exact C layout: a
 struct Go aligns as C packs it, holding no reference, is a Go struct, any
 other the bytes of its layout, read and written at each field's offset, a
 reference or a slice in them byte for byte; a local whose address is taken
@@ -560,7 +577,8 @@ lives on the fixed-frame stack (`gs.Frame`, DESIGN.md §3.6), so nothing a
 value's bytes hold is Go-heap memory. A program using anything else --
 threads, fixed-size locals and temporaries of more than 4096 bytes outside
 a recursive cycle (which C holds on a data stack; such globals are
-supported), index types, other `extern fn`s and `export fn` among them --
-stops with an error at the first such construct, naming it: `... is not
-supported by --target=go yet`. `test/run_go_tests.py` checks what it
+supported), index types, the members of `extern` blocks (shared libraries,
+which a Go program built without cgo cannot load) and std's `ffi` among
+them -- stops with an error at the first such construct, naming it: `...
+is not supported by --target=go yet`. `test/run_go_tests.py` checks what it
 compiles against the C backend ([testing.md](testing.md)).

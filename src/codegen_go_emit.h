@@ -328,24 +328,37 @@ static void GoLineUses(string_view s, unordered_map<string, int> &uses) {
     auto i = s.find_first_not_of('\t');
     if (i == string_view::npos) return;
     s = s.substr(i);
-    // The identifiers a list of them at p spells, `a, b`, and where it ends.
-    auto names = [&](size_t p) {
+    // The identifiers a list of them at p spells, `a, b`, and where it ends;
+    // with bases, a target selecting a field (`h.Len`, `h.a.b`) as well,
+    // whose variable Go counts as used, into bases.
+    auto names = [&](size_t p, vector<string_view> *bases) {
         for (;;) {
             if (p >= s.size() || !(isalpha((unsigned char)s[p]) || s[p] == '_')) return p;
+            auto b = p;
             while (p < s.size() && isid(s[p])) p++;
+            auto e = p;
+            while (bases && p + 1 < s.size() && s[p] == '.' &&
+                   (isalpha((unsigned char)s[p + 1]) || s[p + 1] == '_')) {
+                for (p++; p < s.size() && isid(s[p]);) p++;
+            }
+            if (bases && p != e) bases->push_back(s.substr(b, e - b));
             if (s.compare(p, 2, ", ") != 0) return p;
             p += 2;
         }
     };
     size_t from = 0;
     if (s.compare(0, 4, "var ") == 0) {
-        from = names(4);
+        from = names(4, nullptr);
     } else if (s.compare(0, 4, "for ") == 0) {
-        auto e = names(4);
+        auto e = names(4, nullptr);
         if (s.compare(e, 4, " := ") == 0) from = e;
     } else {
-        auto e = names(0);
-        if (e > 0 && (s.compare(e, 3, " = ") == 0 || s.compare(e, 4, " := ") == 0)) from = e;
+        vector<string_view> bases;
+        auto e = names(0, &bases);
+        if (e > 0 && (s.compare(e, 3, " = ") == 0 || s.compare(e, 4, " := ") == 0)) {
+            from = e;
+            for (auto b : bases) uses[string(b)]++;
+        }
     }
     for (auto p = from; p < s.size();) {
         auto c = s[p];
