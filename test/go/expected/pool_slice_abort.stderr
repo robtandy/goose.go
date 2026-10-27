@@ -1,0 +1,1 @@
+goose runtime error: slice not from this pool (test/go/programs/pool_slice_abort.goose:14)

@@ -1,0 +1,1 @@
+goose runtime error: invalid slice length (test/go/programs/slice_len_abort.goose:5)
