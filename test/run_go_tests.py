@@ -52,11 +52,17 @@ must run alike. --fuzz-flow N generates N programs of random control flow,
 whose returns, breaks, continues and guards end it in every position Go's
 flow analysis follows (conditions, arguments, loop bounds, values), with
 code after them that is never reached: their Go must vet and build, and run
-as their C does at both levels, with the same --stacks report. --bless writes test/go/expected/ from the C backend's runs
-instead of comparing with it.
+as their C does at both levels, with the same --stacks report. --fuzz-values
+N generates N programs of fixed-size values: random structs (packed, padded,
+nested), ADTs and fixed and limited arrays, built from literals, written in
+place, compared, copied, matched, handed to functions by value and by
+reference and sliced, each printed; they run as --fuzz-flow's do, the Go
+built with -d=checkptr as well. --bless writes test/go/expected/ from the C
+backend's runs instead of comparing with it.
 
   python3 test/run_go_tests.py [--exe build/goose] [-j N] [--sweep] [--fuzz N]
-                               [--fuzz-flow N] [--bless] [-v] [name...]
+                               [--fuzz-flow N] [--fuzz-values N] [--bless] [-v]
+                               [name...]
 """
 
 import argparse
@@ -368,6 +374,245 @@ def flow_program(seed):
     return FlowProgram(seed).text(seed)
 
 
+# --- random fixed-size values (--fuzz-values) ----------------------------------
+
+
+class ValueProgram:
+    """A random program of fixed-size values: structs packed and padded,
+    nested, ADTs, fixed and limited arrays, built from literals, written
+    field by field and element by element, compared, copied, matched,
+    handed to functions by value and by reference, sliced, and printed."""
+
+    SCALARS = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "bool"]
+    RANGES = {"i8": (-128, 127), "i16": (-32768, 32767), "i32": (-2**31, 2**31 - 1),
+              "i64": (-2**63 + 1, 2**63 - 1), "u8": (0, 255), "u16": (0, 65535),
+              "u32": (0, 2**32 - 1), "u64": (0, 2**63)}
+    FLOATS = ["0.0", "-0.0", "1.5", "-2.25", "1e10", "3.0e-5", "1024.0", "0.1"]
+    STRINGS = ['""', '"a"', '"goose"', '"tab\\there"', '"q\\"d"', '"two words"']
+    # Leaves that are no scalar: a string literal's slice, and an optional
+    # reference to one of the program's scalar globals (TARGETS), which
+    # outlive anything holding a reference to them.
+    TARGETS = {"i64": ["t0", "t1"], "f64": ["t2"], "u8": ["t3"]}
+
+    def __init__(self, seed):
+        self.r = random.Random(seed)
+        self.structs = {}   # name -> [(field or None for a pad, type, pad text)]
+        self.enums = {}     # name -> [(variant, [(field, type)])]
+        self.order = []     # declarations, in order
+        self.n = 0
+
+    def fresh(self, p):
+        self.n += 1
+        return f"{p}{self.n}"
+
+    # Types: a scalar name, ("s", name), ("e", name), ("a", elem, k), ("l", elem, k).
+    def spell(self, t):
+        if isinstance(t, str):
+            return t
+        if t[0] == "str":
+            return "const u8[:]"
+        if t[0] == "opt":
+            return f"{t[1]}?"
+        if t[0] in ("s", "e"):
+            return t[1]
+        inner = self.spell(t[1])
+        if not isinstance(t[1], str) and t[1][0] in ("a", "l", "str", "opt"):
+            inner = f"({inner})"
+        return f"{inner}[{t[2]}]" if t[0] == "a" else f"{inner}[..{t[2]}]"
+
+    def rtype(self, depth, elem=False, top=False):
+        r = self.r
+        k = r.random()
+        if k < 0.06 and not top:
+            return ("str",)
+        if k < 0.1 and not top:
+            return ("opt", r.choice(list(self.TARGETS)))
+        if depth <= 0 or k < 0.45:
+            return r.choice(self.SCALARS)
+        if k < 0.62 and self.structs:
+            return ("s", r.choice(list(self.structs)))
+        if k < 0.72 and self.enums and not elem:
+            return ("e", r.choice(list(self.enums)))
+        if k < 0.86:
+            return ("a", self.rtype(depth - 1, True), r.randint(1, 4))
+        return ("l", self.rtype(depth - 1, True), r.randint(1, 5))
+
+    def declare(self):
+        r = self.r
+        for _ in range(r.randint(2, 5)):
+            if r.random() < 0.3:
+                name = self.fresh("E")
+                variants = []
+                for v in range(r.randint(1, 4)):
+                    nf = r.choice([0, 0, 1, 2, 3])
+                    variants.append((f"V{v}", [(f"p{i}", self.rtype(1)) for i in range(nf)]))
+                self.enums[name] = variants
+                self.order.append(("e", name))
+            else:
+                name = self.fresh("S")
+                fields = []
+                for i in range(r.randint(1, 5)):
+                    if r.random() < 0.15:
+                        fields.append((None, None, r.choice(["pad", "pad 1", "pad 3"])))
+                    fields.append((f"f{i}", self.rtype(2), None))
+                self.structs[name] = fields
+                self.order.append(("s", name))
+
+    def decl_text(self):
+        out = []
+        for kind, name in self.order:
+            if kind == "s":
+                parts = [p if f is None else f"{f}: {self.spell(t)}" for f, t, p in self.structs[name]]
+                out.append(f"struct {name} {{ {', '.join(parts)} }}")
+            else:
+                vs = []
+                for v, fs in self.enums[name]:
+                    vs.append(f"{v} {{ {', '.join(f'{f}: {self.spell(t)}' for f, t in fs)} }}" if fs else v)
+                out.append(f"enum {name} {{ {', '.join(vs)} }}")
+        return out
+
+    def lit(self, t):
+        r = self.r
+        if not isinstance(t, str) and t[0] == "str":
+            return r.choice(self.STRINGS)
+        if not isinstance(t, str) and t[0] == "opt":
+            return r.choice(["null"] + self.TARGETS[t[1]])
+        if isinstance(t, str):
+            if t == "bool":
+                return r.choice(["true", "false"])
+            if t in ("f32", "f64"):
+                return r.choice(self.FLOATS)
+            lo, hi = self.RANGES[t]
+            v = r.choice([lo, hi, 0, 1, r.randint(lo, hi), r.randint(max(lo, -50), 50)])
+            return f"({v + 1} - 1)" if v == lo and lo < 0 else str(v)
+        if t[0] == "s":
+            inits = [f"{f}: {self.lit(ft)}" for f, ft, _ in self.structs[t[1]] if f is not None]
+            return f"{t[1]} {{ {', '.join(inits)} }}"
+        if t[0] == "e":
+            v, fs = r.choice(self.enums[t[1]])
+            if not fs:
+                return f"{t[1]}.{v}"
+            return f"{t[1]}.{v} {{ {', '.join(f'{f}: {self.lit(ft)}' for f, ft in fs)} }}"
+        n = t[2] if t[0] == "a" else r.randint(0, t[2])
+        if t[0] == "a" and n > 2 and r.random() < 0.3:
+            return f"[{self.lit(t[1])}; {n}]"
+        return f"[{', '.join(self.lit(t[1]) for _ in range(n))}]"
+
+    def paths(self, t, base, depth=3):
+        """Assignable leaf paths into a value of type t, with their types."""
+        out = []
+        if isinstance(t, str) or t[0] in ("str", "opt"):
+            return [(base, t)]
+        if depth <= 0:
+            return out
+        if t[0] == "s":
+            for f, ft, _ in self.structs[t[1]]:
+                if f is not None:
+                    out += self.paths(ft, f"{base}.{f}", depth - 1)
+        elif t[0] == "a":
+            out += self.paths(t[1], f"{base}[{self.r.randrange(t[2])}]", depth - 1)
+        return out
+
+    def stmt(self, var, t, fns):
+        r = self.r
+        k = r.random()
+        if k < 0.25:
+            return f"print({var});"
+        if k < 0.45:
+            ps = self.paths(t, var)
+            if ps:
+                p, pt = r.choice(ps)
+                if not isinstance(pt, str):
+                    # A reference is rebound; a slice is assigned.
+                    return f"{p} {'.=' if pt[0] == 'opt' else '='} {self.lit(pt)}; print({p});"
+                if pt not in ("bool",) and r.random() < 0.5:
+                    op = r.choice(["+=", "-=", "*="]) if pt not in ("f32", "f64") else r.choice(["+=", "*="])
+                    return f"{p} {op} {self.lit(pt)};"
+                return f"{p} = {self.lit(pt)};"
+            return f"print({var});"
+        if k < 0.55:
+            w = self.fresh("w")
+            ps = self.paths(t, w)
+            change = ""
+            if ps:
+                p, pt = r.choice(ps)
+                op = ".=" if not isinstance(pt, str) and pt[0] == "opt" else "="
+                change = f" {p} {op} {self.lit(pt)};"
+            return (f"var {w} = {var}; print({w} == {var}, \" \", {w} != {var});{change} "
+                    f"print({w} == {var}, \" \", {w});")
+        if k < 0.62:
+            return f"{var} = {self.lit(t)}; print({var});"
+        if k < 0.72 and not isinstance(t, str) and t[0] == "e":
+            arms = []
+            for v, fs in self.enums[t[1]]:
+                if fs and r.random() < 0.8:
+                    b = self.fresh("b")
+                    arms.append(f"{v} {b} => print(\"{v} \", {b}, \" \", {b}.{fs[0][0]})")
+                else:
+                    arms.append(f"{v} => print(\"{v}\")")
+            if r.random() < 0.4 and len(arms) > 1:
+                arms = arms[:-1] + ["_ => print(\"other\")"]
+            return f"match {var} {{ {', '.join(arms)} }}"
+        if k < 0.82 and not isinstance(t, str) and t[0] == "l":
+            e = t[1]
+            return (f"if {var}.len < {var}.cap {{ {var}.push({self.lit(e)}); }} "
+                    f"if {var}.len > 0 {{ print({var}.pop(), \" \", {var}.len); }} "
+                    f"print({var}, \" \", {var}.len);")
+        if k < 0.88 and not isinstance(t, str) and t[0] in ("a", "l"):
+            return (f"if {var}.len > 1 {{ print(first({var}[1..]), \" \", {var}[..1], \" \", "
+                    f"{var}[1..] == {var}[1..]); }}")
+        if k < 0.94:
+            show, mut = fns[self.spell(t)]
+            return f"{show}({var}); {mut}({var}); print({var});"
+        # A literal compared needs a type of its own where it is an array's.
+        c = self.fresh("c")
+        return f"let {c}: {self.spell(t)} = {self.lit(t)}; print({var} == {c}, \" \", {c} != {var});"
+
+    def text(self, seed):
+        r = self.r
+        self.declare()
+        lines = [f"// Generated by run_go_tests.py --fuzz-values, seed {seed}."]
+        lines += self.decl_text()
+        lines.append("fn first<T>(s: const T[:]) -> T { s[0] }")
+        for tt, names in self.TARGETS.items():
+            for i, n in enumerate(names):
+                lines.append(f"var {n}: {tt} = {self.lit(tt) if tt != 'f64' else '0.5'};")
+        vars_ = [(f"v{i}", self.rtype(3, top=True)) for i in range(r.randint(3, 6))]
+        globs = [(f"g{i}", self.rtype(2, top=True)) for i in range(r.randint(0, 2))]
+        fns = {}
+        for _, t in vars_ + globs:
+            sp = self.spell(t)
+            if sp in fns:
+                continue
+            show, mut = self.fresh("show"), self.fresh("mut")
+            fns[sp] = (show, mut)
+            lines.append(f"fn {show}(x: {sp}) {{ print(\"show \", x); }}")
+            ps = self.paths(t, "x")
+            body = ""
+            if ps:
+                p, pt = r.choice(ps)
+                op = ".=" if not isinstance(pt, str) and pt[0] == "opt" else "="
+                body = f"{p} {op} {self.lit(pt)};"
+            lines.append(f"fn {mut}(x: {sp}&) {{ {body} }}")
+        for g, t in globs:
+            lines.append(f"var {g}: {self.spell(t)} = {self.lit(t)};")
+        lines.append("fn main() {")
+        for v, t in vars_:
+            lines.append(f"    var {v}: {self.spell(t)} = {self.lit(t)};")
+        every = vars_ + globs
+        for _ in range(r.randint(10, 25)):
+            v, t = r.choice(every)
+            lines.append("    " + self.stmt(v, t, fns))
+        for v, _ in every:
+            lines.append(f"    print({v});")
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+
+def value_program(seed):
+    return ValueProgram(seed).text(seed)
+
+
 # --- data stack overflow -----------------------------------------------------
 
 # A line print renders that runs past its stack's region, with 64 KB
@@ -657,6 +902,44 @@ class Runner:
         self.stacks(src, name, [], out)
         return out
 
+    def fuzz_values(self, seed):
+        """A random program of fixed-size values (ValueProgram), which both
+        backends must run alike at both levels, the Go built with its
+        unsafe.Pointer checks as well, with the same stacks."""
+        out = []
+        name = f"values-{seed}"
+        src = self.work / f"{name}.goose"
+        tc.write_text(src, value_program(seed))
+        code, o, e = self.goose("--check", src)
+        if code != 0:
+            out.append(("fail", f"fuzz-values seed {seed}: the program does not check ({src})",
+                        o + e))
+            return out
+        # A random type can come out larger than this version holds in a
+        # local (4096 bytes, which C keeps on a data stack): counted, as
+        # --sweep counts what is not supported yet.
+        code, o, e = self.goose("--target=go", "-o", self.work / f"{name}-probe.go", src)
+        if code != 0 and UNSUPPORTED in e:
+            out.append(("skip", f"fuzz-values seed {seed}", None))
+            return out
+        for level in ("2", "0"):
+            ref = self.c_run(src, f"{name}-O{level}", [f"-O{level}"], out, timeout=FLOW_TIMEOUT)
+            if ref is None:
+                continue
+            exes = self.go_program(src, f"{name}-O{level}", [f"-O{level}"], out, checkptr=True)
+            if exes is None:
+                continue
+            for exe, kind in zip(exes, ("", " -d=checkptr")):
+                got = run_capture([exe], timeout=FLOW_TIMEOUT)
+                if got != ref:
+                    out.append(("fail", f"fuzz-values seed {seed} -O{level}{kind} ({src})",
+                                f"--- go (exit {got[0]}):\n{got[1][-2000:]}{got[2]}\n"
+                                f"--- c (exit {ref[0]}):\n{ref[1][-2000:]}{ref[2]}"))
+                else:
+                    out.append(("ok", f"fuzz-values seed {seed} -O{level}{kind}", None))
+        self.stacks(src, name, [], out)
+        return out
+
     def overflow(self, name):
         """A print whose line may run past its stack's region (OVERFLOW_CASES):
         the C runtime's guard gap finds it, and the Go must report it alike,
@@ -853,8 +1136,10 @@ def main():
                     help="also run N random programs through both backends")
     ap.add_argument("--fuzz-flow", type=int, default=0, metavar="N",
                     help="also run N random programs of control flow through both backends")
+    ap.add_argument("--fuzz-values", type=int, default=0, metavar="N",
+                    help="also run N random programs of fixed-size values through both backends")
     ap.add_argument("--fuzz-seed", type=int, default=0,
-                    help="the first --fuzz and --fuzz-flow program's seed")
+                    help="the first --fuzz, --fuzz-flow and --fuzz-values program's seed")
     ap.add_argument("--bless", action="store_true",
                     help="write test/go/expected/ from the C backend's runs")
     ap.add_argument("--jit-reference", action="store_true",
@@ -898,6 +1183,8 @@ def main():
                     for seed in range(args.fuzz_seed, args.fuzz_seed + args.fuzz)]
         futures += [pool.submit(r.fuzz_flow, seed)
                     for seed in range(args.fuzz_seed, args.fuzz_seed + args.fuzz_flow)]
+        futures += [pool.submit(r.fuzz_values, seed)
+                    for seed in range(args.fuzz_seed, args.fuzz_seed + args.fuzz_values)]
         for f in futures:
             r.report(f.result())
     # The command line.
