@@ -109,8 +109,17 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
         fvptr.insert(fv);
     }
     string rets;
-    for (size_t i = 0; i < sp->rets.size(); i++)
-        Append(rets, i ? ", " : "", ParamT(sp->rets[i], sp->sf->line));
+    for (size_t i = 0; i < sp->rets.size(); i++) {
+        // A result holding relative references is built where it is
+        // received, so that a link from it to the receiver's storage is
+        // measured from there (C's result location, NeedsResultLocation):
+        // a Go result is a copy.
+        auto rt = sp->rets[i];
+        if (rt->kind != TY_REF && IsFix(rt) && HasRelRef(rt))
+            Unsupported(sp->sf->line, cat("a function result holding relative references (",
+                                          TypeText(rt), ")"));
+        Append(rets, i ? ", " : "", ParamT(rt, sp->sf->line));
+    }
     if (sp->rets.size() > 1) rets = cat("(", rets, ")");
     return cat("func ", si.name, "(", params, ")", rets.empty() ? "" : " ", rets);
 }
