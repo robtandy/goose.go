@@ -190,6 +190,7 @@ inline void CodeGenGo::GenStmt(Node *n) {
 
 inline void CodeGenGo::GenStmt2(Node *n) {
     if (Unreached()) return GenUnreached([&] { GenStmt2(n); });
+    if (n->line.line > 0) curline = n->line;
     switch (n->nkind) {
         case NK_VarDecl: GenVarDecl((VarDecl *)n); return;
         case NK_Assign: GenAssign((Assign *)n); return;

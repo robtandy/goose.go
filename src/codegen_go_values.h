@@ -480,6 +480,7 @@ inline string CodeGenGo::GenX(Node *n) {
     }
     if (auto it = fillvalues.find(n); it != fillvalues.end())
         return LoadLoc(it->second, n->exprtype, n->line);
+    if (n->line.line > 0) curline = n->line;
     switch (n->nkind) {
         case NK_IntLit: {
             auto i = (IntLit *)n;

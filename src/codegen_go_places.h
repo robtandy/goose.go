@@ -188,7 +188,9 @@ inline string CodeGenGo::IndexValue(Node *idx) {
     if (it && it->kind == TY_INT && it->ix) it = ast.inttypes[it->intstorage];
     int64_t v;
     bool uns;
-    if (GoConstInt(x, v, uns)) return cat(it && it->intstorage == IS_U64 && uns ? v : v);
+    // A u64 constant above i64.max is its bits, a negative int64, which the
+    // check reports as GS_IDX's (int64_t) cast does.
+    if (GoConstInt(x, v, uns)) return cat(v);
     auto i64 = ast.inttypes[IS_I64];
     return Snapshot(i64, Coerce(x, it, i64, idx->line));
 }

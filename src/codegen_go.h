@@ -95,7 +95,11 @@ struct CodeGenGo {
     string eqcode;      // Equality functions.
     string code;        // Functions, gsInitGlobals and main.
 
+    // The line of the node being generated, which a message about code with
+    // no line of its own (a temporary's type) names.
+    Line curline;
     [[noreturn]] void Fail(Line l, const string &msg) {
+        if (l.line <= 0) l = curline;
         auto s = cat("codegen: ", msg);
         if (l.fileidx >= 0 && l.fileidx < (int)ast.sources.size() && l.line > 0)
             s = cat(ast.sources[l.fileidx].first, ":", l.line, ": ", s);
