@@ -438,6 +438,11 @@ static string FirstResult(const string &t, size_t n) {
 // payload as its own type; every case's results land in the same
 // temporaries, which are returned. A fixed-mode ADT, also behind a
 // reference, dispatches only to cases taking the payload by value (§3.5).
+// A variable-mode one is its image: a case taking its payload by reference
+// gets the payload's address in it; one taking it by value a copy, taken
+// before the later arguments run -- of the whole image, on a stack of its
+// own, where a by-value case takes a variable-size payload, else of each
+// fixed-size payload a by-value case takes (CodeGen::EmitDispatch).
 inline vector<string> CodeGenGo::GenDispatch(Call *c) {
     auto ln = c->line;
     auto sp0 = c->dispatch[0];
@@ -447,13 +452,55 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
     auto enumtype = sn->exprtype;
     auto isref = enumtype->kind == TY_REF;
     if (isref) enumtype = enumtype->ref->sub;
-    if (enumtype->kind != TY_ENUM || enumtype->enu->varmode)
+    if (enumtype->kind != TY_ENUM)
         Unsupported(ln, cat("a case-function dispatch over ", TypeText(enumtype)));
+    auto varmode = enumtype->enu->varmode;
     auto ei = EIOf(enumtype);
     auto &ti = TI(enumtype, ln);
+    auto nv = ei->en->variants.size();
+    auto ts = TagSize(ei->en);
     GoLoc e;
+    string p, copied, tagx;
+    vector<string> snap(nv);
     vector<string> args(an.size());
     for (size_t i = 0; i < an.size(); i++) {
+        if ((int)i == pos && varmode) {
+            p = T();
+            if (isref) {
+                Decl(p, "unsafe.Pointer", GenX(sn));
+            } else {
+                auto l = GenLoc(sn);
+                while (l.t->kind == TY_REF) DerefLoc(l);
+                Decl(p, "unsafe.Pointer", l.addr);
+            }
+            tagx = cat("*(*", IntGoT(TagStore(ei->en)), ")(", p, ")");
+            auto wholecopy = false;
+            for (size_t vi = 0; vi < nv; vi++)
+                wholecopy = wholecopy || (c->dispatch[vi]->argtypes[pos]->kind != TY_REF &&
+                                          IsBytesT(VariantType(enumtype, (int)vi)));
+            if (wholecopy) {
+                string stk;
+                copied = BytesTemp(stk);
+                auto sz = T();
+                Decl(sz, "int64", SizeX(enumtype, p));
+                L("copy(unsafe.Slice((*byte)(", Top(stk), "), ", sz, "), unsafe.Slice((*byte)(", p, "), ", sz, "))");
+                Bump(stk, sz);
+                continue;
+            }
+            for (size_t vi = 0; vi < nv; vi++) {
+                if (c->dispatch[vi]->argtypes[pos]->kind == TY_REF || EmptyLayout(ei->en->variants[vi].fields))
+                    continue;
+                auto vt = VariantType(enumtype, (int)vi);
+                snap[vi] = T();
+                Decl(snap[vi], LocalT(vt, ln));
+                L("if ", tagx, " == ", vi, " {");
+                ind++;
+                L(snap[vi], " = *(*", GoT(vt, ln), ")(unsafe.Add(", p, ", ", ts, "))");
+                ind--;
+                LS("}");
+            }
+            continue;
+        }
         if ((int)i == pos) {
             // A copy of the value, through a reference too, taken before the
             // later arguments run: they may change it, and the dispatch is on
@@ -480,8 +527,8 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
     }
     auto chain = [&] {
         auto tag = T();
-        Decl(tag, ti.rep == GR_TAG ? ti.name : IntGoT(TagStore(ei->en)), TagOf(e, ln));
-        auto nv = ei->en->variants.size();
+        if (varmode) Decl(tag, IntGoT(TagStore(ei->en)), tagx);
+        else Decl(tag, ti.rep == GR_TAG ? ti.name : IntGoT(TagStore(ei->en)), TagOf(e, ln));
         for (size_t vi = 0; vi < nv; vi++) {
             auto sp = c->dispatch[vi];
             auto &ki = sinfo[sp];
@@ -494,11 +541,22 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c) {
             PushSc(SC_PLAIN);
             auto vt = VariantType(enumtype, (int)vi);
             auto pt = sp->argtypes[pos];
-            if (pt->kind == TY_REF) Fail(ln, "internal: a fixed-mode payload dispatched by reference");
-            auto varg = ti.voffs.empty() || ti.voffs[vi] < 0 ? ZeroOf(vt, ln) : PayloadLoc(e, (int)vi, ln).lv;
+            string varg;
+            if (varmode) {
+                auto payload = cat("unsafe.Add(", pt->kind == TY_REF ? p : copied, ", ", ts, ")");
+                if (pt->kind == TY_REF) varg = IsBytesT(vt) ? payload : RefFromAddr(pt, payload);
+                else if (IsBytesT(vt)) varg = payload;   // The copy's: the case's own value.
+                else if (EmptyLayout(ei->en->variants[vi].fields)) varg = ZeroOf(vt, ln);
+                else if (!snap[vi].empty()) varg = snap[vi];
+                else varg = cat("*(*", GoT(vt, ln), ")(", payload, ")");
+            } else {
+                if (pt->kind == TY_REF) Fail(ln, "internal: a fixed-mode payload dispatched by reference");
+                varg = ti.voffs.empty() || ti.voffs[vi] < 0 ? ZeroOf(vt, ln) : PayloadLoc(e, (int)vi, ln).lv;
+            }
+            auto pv = pt->kind == TY_REF || IsBytesT(pt) ? varg : Coerce(varg, vt, pt, ln);
             auto list = StackArgs(sp, ln);
             for (size_t i = 0; i < an.size(); i++)
-                Append(list, list.empty() ? "" : ", ", (int)i == pos ? Coerce(varg, vt, pt, ln) : args[i]);
+                Append(list, list.empty() ? "" : ", ", (int)i == pos ? pv : args[i]);
             for (auto fv : ki.freevars) Append(list, list.empty() ? "" : ", ", FreeVarArg(c->FreeVarArg(fv)));
             auto call = cat(ki.name, "(", list, ")");
             if (res.empty()) {

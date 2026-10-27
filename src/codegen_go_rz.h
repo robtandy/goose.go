@@ -1103,9 +1103,10 @@ inline bool CodeGenGo::SimpleText(Call *c, TypeExpr *t) {
 }
 
 // Appends the text of `a` to the growable u8 array at l (CodeGen::
-// EmitFormatInto): rendered straight at a resizable's top, or into a
-// builder of its own first for a limited array, so that its capacity check
-// comes before anything lands in it.
+// EmitFormatInto): rendered straight at a resizable's top. Into a limited
+// array, under its capacity check before anything lands in it: an array's
+// or a slice's bytes copied, a scalar's text from a buffer of its own, and
+// anything else rendered into a builder of its own first.
 inline void CodeGenGo::EmitFormatInto(GoLoc l, Node *a, Line ln, Call *c) {
     if (l.t->arr->akind != A_LIMITED) {
         RenderToBuilder(l, a, c);
