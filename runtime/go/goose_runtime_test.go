@@ -300,6 +300,16 @@ func hasFlag(m procMapping, flag string) bool {
 	return false
 }
 
+// regionMapped says whether ms holds the region from base still: its usable
+// part read/write from base, and its guard gap PROT_NONE right after, which
+// no mapping made since at the same address would have.
+func regionMapped(ms []procMapping, base, usable uintptr) bool {
+	start, ok := mappingAt(ms, base)
+	guard, gok := mappingAt(ms, base+usable)
+	return ok && gok && start.lo == base && start.perms == "rw-p" &&
+		guard.lo == base+usable && guard.perms == "---p"
+}
+
 // A region is a private read/write mapping kept out of transparent huge
 // pages, followed by its PROT_NONE gap; Close unmaps both.
 func TestRegionMappings(t *testing.T) {
@@ -311,8 +321,14 @@ func TestRegionMappings(t *testing.T) {
 	if !ok || start.lo != base || start.perms != "rw-p" {
 		t.Fatalf("the region's start is mapped as %+v, want rw-p from %#x", start, base)
 	}
-	if !hasFlag(start, "nh") {
-		t.Errorf("the region's first 2 MB are not MADV_NOHUGEPAGE: VmFlags %v", start.flags)
+	// Only a kernel with transparent huge pages takes MADV_NOHUGEPAGE (any
+	// other refuses it, which gsMapRegion lets be) and shows it as "nh".
+	if _, err := os.Stat("/sys/kernel/mm/transparent_hugepage"); err == nil && start.flags != nil {
+		if !hasFlag(start, "nh") {
+			t.Errorf("the region's first 2 MB are not MADV_NOHUGEPAGE: VmFlags %v", start.flags)
+		}
+	} else {
+		t.Log("no transparent huge pages here to keep the region out of")
 	}
 	if rest, ok := mappingAt(ms, base+reserve-1); !ok || rest.perms != "rw-p" {
 		t.Errorf("the region's end is mapped as %+v, want rw-p", rest)
@@ -324,12 +340,8 @@ func TestRegionMappings(t *testing.T) {
 	if err := gs.Close(); err != nil {
 		t.Fatal(err)
 	}
-	ms = procMaps(t)
-	if m, ok := mappingAt(ms, base); ok && m.lo == start.lo && m.perms == "rw-p" {
-		t.Errorf("the region is still mapped after Close: %+v", m)
-	}
-	if m, ok := mappingAt(ms, base+reserve); ok && m.lo == guard.lo && m.perms == "---p" {
-		t.Errorf("the guard gap is still mapped after Close: %+v", m)
+	if regionMapped(procMaps(t), base, reserve) {
+		t.Error("the region and its guard gap are still mapped after Close")
 	}
 }
 
@@ -344,14 +356,13 @@ func droppedBlockBase() uintptr {
 // pool drops blocks at collections.
 func TestUnreachableBlockIsClosed(t *testing.T) {
 	base := droppedBlockBase()
-	if _, ok := mappingAt(procMaps(t), base); !ok {
+	if !regionMapped(procMaps(t), base, 1<<20) {
 		t.Fatal("the region is not mapped")
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		runtime.GC()
-		m, ok := mappingAt(procMaps(t), base)
-		if !ok || m.lo != base || m.perms != "rw-p" {
+		if !regionMapped(procMaps(t), base, 1<<20) {
 			return
 		}
 		if time.Now().After(deadline) {

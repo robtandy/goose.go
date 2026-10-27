@@ -660,6 +660,22 @@ func TestSlicePoolScenarios(t *testing.T) {
 		checkSpans(t, p)
 	})
 
+	// A slice grows in place into a free span that ends the array, though
+	// the span holds less than the growth and an earlier one holds the
+	// whole grown run (gs_spans_regrow's "or reaches the end").
+	t.Run("growth to the end", func(t *testing.T) {
+		p := newPool()
+		a, b, c := p.alloc(10), p.alloc(2), p.alloc(3)
+		fill(p, b, 2, 7)
+		p.free(a, 10) // (0, 10), which would hold 8
+		p.free(c, 3)  // (12, 3) reaches the end
+		b = p.realloc(b, 2, 8)
+		expect(t, "b", append([]int64{b, p.elems.Len}, p.i64s(b, 8)...), []int64{10, 18, 7, 8, 0, 0, 0, 0, 0, 0})
+		if idx, cnt := checkSpans(t, p); !i64sEqual(idx, 0) || !i64sEqual(cnt, 10) {
+			t.Errorf("spans %v %v, want (0, 10) alone", idx, cnt)
+		}
+	})
+
 	t.Run("moves", func(t *testing.T) {
 		p := newPool()
 		a, _, c, _, e, _ := p.alloc(3), p.alloc(1), p.alloc(8), p.alloc(1), p.alloc(2), p.alloc(1)
