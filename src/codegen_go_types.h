@@ -429,7 +429,10 @@ inline void CodeGenGo::CheckRepresentable(TypeExpr *t, Line ln) {
         case TY_REF: {
             auto &r = *t->ref;
             if (r.lenstorage == IS_VARINT) Unsupported(ln, "a varint relative reference");
-            if (r.pool) Unsupported(ln, cat("an `in pool` relative reference (", TypeText(t), ")"));
+            // An `in pool` one measures from its pool's base, which is a
+            // resizable global's (§3.9).
+            if (r.pool && (!r.pool->isglobal || !IsResz(r.pool->type)))
+                Unsupported(ln, cat("an `in pool` relative reference (", TypeText(t), ")"));
             // A fat reference to a resizable value (GsRref).
             if (r.lenstorage < 0 && IsResz(r.sub)) {
                 CheckRepresentable(r.sub, ln);
@@ -489,13 +492,15 @@ inline string CodeGenGo::GoT(TypeExpr *t, Line ln) {
 }
 
 // The integer a relative reference is stored as (§3.9): signed, measured
-// both ways from its own slot.
+// both ways from its own slot, or for the `in pool` form unsigned, measured
+// up from its pool's base.
 inline const char *CodeGenGo::RelGoT(TypeExpr *rt) {
+    auto pool = rt->ref->pool != nullptr;
     switch (IntSize((IntStorage)rt->ref->lenstorage)) {
-        case 1: return "int8";
-        case 2: return "int16";
-        case 4: return "int32";
-        default: return "int64";
+        case 1: return pool ? "uint8" : "int8";
+        case 2: return pool ? "uint16" : "int16";
+        case 4: return pool ? "uint32" : "int32";
+        default: return pool ? "uint64" : "int64";
     }
 }
 

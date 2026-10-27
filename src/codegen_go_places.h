@@ -309,6 +309,12 @@ inline void CodeGenGo::DerefLoc(GoLoc &l) {
 // offset it holds, null where an optional one holds 0 (§3.9).
 inline string CodeGenGo::RelLoad(const GoLoc &slot) {
     auto off = cat("int64(", slot.lv, ")");
+    if (auto pool = slot.t->ref->pool) {
+        // From the pool's base, biased by one so that 0 stays null.
+        auto base = cat(gnames.at(pool), ".Base");
+        if (!slot.t->ref->optional) return cat("unsafe.Add(", base, ", ", off, "-1)");
+        return cat("GsPoolLoad(", base, ", ", off, ")");
+    }
     if (!slot.t->ref->optional) return cat("unsafe.Add(", AddrOf(slot), ", ", off, ")");
     return cat("GsRelLoad(", AddrOf(slot), ", ", off, ")");
 }
@@ -491,6 +497,27 @@ inline void CodeGenGo::EmitRelRangeCheck(TypeExpr *rt, const string &off, Line l
 inline void CodeGenGo::EmitRelStore(const GoLoc &slot, const string &rv, bool nonnull, bool apart,
                                     Line ln) {
     auto rt = slot.t;
+    if (auto pool = rt->ref->pool) {
+        // The `in pool` form: the target's distance from the pool's base,
+        // plus one; null is 0. The width spans 2^N - 1 bytes of a pool, and
+        // a data stack's reservation bounds the distance (EmitRelRangeCheck).
+        auto base = cat(gnames.at(pool), ".Base");
+        auto p = T();
+        Decl(p, "unsafe.Pointer", cat("unsafe.Pointer(", rv, ")"));
+        auto off = T();
+        if (rt->ref->optional && !nonnull) Decl(off, "uint64", cat("GsPoolOff(", p, ", ", base, ")"));
+        else Decl(off, "uint64", cat("uint64(uintptr(", p, ") - uintptr(", base, ")) + 1"));
+        auto bits = IntSize((IntStorage)rt->ref->lenstorage) * 8;
+        if (bits < 64 && opts.stacks.reserve >= (1ull << bits)) {
+            L("if ", off, " > ", (1ull << bits) - 1, " {");
+            ind++;
+            L("GsAbort(GsEReloff, ", LocArgs(ln), ")");
+            ind--;
+            LS("}");
+        }
+        L(slot.lv, " = ", RelGoT(rt), "(", off, ")");
+        return;
+    }
     auto fa = T();
     Decl(fa, "unsafe.Pointer", AddrOf(slot));
     auto p = T();
@@ -514,6 +541,15 @@ inline void CodeGenGo::EmitRelStore(const GoLoc &slot, const string &rv, bool no
 // minus that offset, wherever the value lies.
 inline void CodeGenGo::EmitRelSelf(const GoLoc &slot, int64_t fieldoff, Line ln) {
     auto rt = slot.t;
+    if (auto pool = rt->ref->pool) {
+        // The value's own position in its pool (§3.9), which it is built in.
+        auto base = cat(gnames.at(pool), ".Base");
+        auto p = T();
+        Decl(p, "unsafe.Pointer", cat("unsafe.Add(", AddrOf(slot), ", ", -fieldoff, ")"));
+        EmitRelStore(slot, p, true, true, ln);
+        (void)base;
+        return;
+    }
     auto bits = IntSize((IntStorage)rt->ref->lenstorage) * 8;
     if (bits < 64 && fieldoff > ((int64_t)1 << (bits - 1)))
         Fail(ln, cat("self at byte offset ", fieldoff, " does not fit a ",

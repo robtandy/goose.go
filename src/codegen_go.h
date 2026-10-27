@@ -440,6 +440,15 @@ struct CodeGenGo {
     GoLoc RzRecvLoc(Node *n);
     GoLoc PinRz(GoLoc l);
     string GenRzArrayBuiltin(Call *c);
+    bool HasFieldDefaults(TypeExpr *t);
+    vector<string> EmitAlloc(Call *c, vector<Node *> &an, Line ln);
+    void EmitFree(vector<Node *> &an, Line ln);
+    string SpanArgs(const GoLoc &l);
+    string PlaceRun(const GoLoc &l, const string &n);
+    string SliceLen(Node *n, int64_t esz, Line ln);
+    void EmitSliceExtend(const GoLoc &l, const string &end, int64_t esz);
+    void EmitDefaultElems(const GoView &v, const string &first, const string &count, Node *init);
+    vector<string> EmitSlicePool(Call *c, vector<Node *> &an, Line ln);
 
     // ------------------------------------------------------------------
     // Per-specialization interface. A function's Go parameters are the data

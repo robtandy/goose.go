@@ -662,7 +662,8 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             return;
         }
         case B_LEN: case B_CAP: case B_INDEX_OF: case B_PUSH: case B_APPEND: case B_POP:
-        case B_POP_N: case B_CLEAR: case B_RESIZE: {
+        case B_POP_N: case B_CLEAR: case B_RESIZE: case B_ALLOC_INDEX: case B_ALLOC_REF:
+        case B_ALLOC_SLICE: case B_REALLOC_SLICE: case B_FREE_SLICE: case B_FREE: {
             auto x = GenArrayBuiltin(c);
             if (x.empty() || Unreached()) return;
             auto want = d.t ? d.t : c->exprtype;

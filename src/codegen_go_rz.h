@@ -632,6 +632,15 @@ inline string CodeGenGo::GenRzArrayBuiltin(Call *c) {
             return r.empty() ? "" : r[0];
         }
         case B_APPEND: EmitAppend(an, ln); return "";
+        case B_ALLOC_INDEX: case B_ALLOC_REF: {
+            auto r = EmitAlloc(c, an, ln);
+            return r.empty() ? "" : r[0];
+        }
+        case B_ALLOC_SLICE: case B_REALLOC_SLICE: case B_FREE_SLICE: {
+            auto r = EmitSlicePool(c, an, ln);
+            return r.empty() ? "" : r[0];
+        }
+        case B_FREE: EmitFree(an, ln); return "";
         case B_INDEX_OF: {
             // The checker proved the reference is an element of this very
             // array (§3.3): the distance is a whole number of elements.
@@ -1102,6 +1111,251 @@ inline void CodeGenGo::LandValue(const string &stk, const string &top0, const st
     }
     ind--;
     LS("}");
+}
+
+
+// ------------------------------------------------------------------
+// reusable pools (§5.4): a grow-only array whose freelist is a second stack
+// of its own -- free slot indices for a slot pool, a slice pool's tree of
+// free spans (gsSpans, the runtime's) -- as the C backend keeps them
+// (CodeGen::EmitAlloc, EmitSlicePool).
+
+// Whether a field declares a default of its own anywhere in t, so that its
+// default value is not all zero bytes (CodeGen::HasFieldDefaults).
+inline bool CodeGenGo::HasFieldDefaults(TypeExpr *t) {
+    switch (t->kind) {
+        case TY_STRUCT: case TY_ENUM: case TY_VARIANT: {
+            if (t->kind == TY_ENUM && t->enu->varmode) return false;
+            auto runs = FieldRuns(t);
+            if (t->kind == TY_ENUM) runs = runs.first(1);   // Variant 0 is the default.
+            for (auto &run : runs)
+                for (size_t i = 0; i < run.fields->size(); i++) {
+                    auto &f = (*run.fields)[i];
+                    if (!f.ispad && (f.defaultval || HasFieldDefaults((*run.ftypes)[i]))) return true;
+                }
+            return false;
+        }
+        case TY_ARRAY:
+            return t->arr->akind == A_FIXED && ArrSize(t->arr) > 0 && HasFieldDefaults(t->arr->sub);
+        default: return false;
+    }
+}
+
+// alloc_index / alloc_ref: a slot off the freelist, else a fresh one at the
+// top, which joins the array only once the element is written there. The
+// element is evaluated ahead of the bookkeeping, or built in the slot.
+inline vector<string> CodeGenGo::EmitAlloc(Call *c, vector<Node *> &an, Line ln) {
+    auto l = RzRecvLoc(an[0]);
+    if (l.fl.empty() || l.stk.empty()) Fail(ln, "internal: a pool without its freelist");
+    auto v = ArrayView(l, ln);
+    auto elem = v.elem;
+    auto ev = ElemValue(an[1], elem);
+    auto iv = T();
+    Decl(iv, "int64");
+    L("if ", l.fl, ".Len > 0 {");
+    ind++;
+    L(l.fl, ".Len--");
+    Bump(l.flstk, "-8");
+    L(iv, " = *(*int64)(", Top(l.flstk), ")");
+    ind--;
+    LS("} else {");
+    ind++;
+    L(iv, " = ", l.lenlv);
+    ind--;
+    LS("}");
+    auto e = T();
+    Decl(e, "unsafe.Pointer", ElemAddr(v, iv));
+    auto slot = AtAddr(e, elem);
+    StoreElem(an[1], slot, ev);
+    L("if ", iv, " == ", l.lenlv, " {");
+    ind++;
+    L(l.lenlv, "++");
+    Bump(l.stk, cat(v.esize));
+    ind--;
+    LS("}");
+    if (c->builtin == B_ALLOC_INDEX) return { iv };
+    return { NewElemResult(slot, ln) };
+}
+
+// free(pool, i): only an existing slot may enter the freelist, which hands
+// it out unchecked: the ordinary bounds check first.
+inline void CodeGenGo::EmitFree(vector<Node *> &an, Line ln) {
+    auto l = RzRecvLoc(an[0]);
+    if (l.fl.empty()) Fail(ln, "internal: a pool without its freelist");
+    auto i64 = ast.inttypes[IS_I64];
+    auto x = Snapshot(i64, Coerce(GenX(an[1]), an[1]->exprtype, i64, ln));
+    auto i = T();
+    Decl(i, "int64", cat("GsIdx(", x, ", ", l.lenlv, ", ", LocArgs(ln), ")"));
+    L("*(*int64)(", Top(l.flstk), ") = ", i);
+    Bump(l.flstk, "8");
+    L(l.fl, ".Len++");
+}
+
+// The freelist as the GsSpans* functions take it: its base, its node count
+// and its stack's top, which they move.
+inline string CodeGenGo::SpanArgs(const GoLoc &l) {
+    auto addr = [](const string &x) {
+        if (x.size() > 3 && x.compare(0, 2, "(*") == 0 && x.back() == ')') return x.substr(2, x.size() - 3);
+        return cat("&", x);
+    };
+    return cat(l.fl, ".Base, ", addr(cat(l.fl, ".Len")), ", &", Top(l.flstk));
+}
+
+// Where a slice pool places a run of n elements: past the end of the array
+// while the freelist is empty, as it stays in a pool nothing is freed from,
+// and otherwise where the runtime finds room.
+inline string CodeGenGo::PlaceRun(const GoLoc &l, const string &n) {
+    auto i = T();
+    Decl(i, "int64", l.lenlv);
+    L("if ", l.fl, ".Len != 0 {");
+    ind++;
+    L(i, " = GsSpansAlloc(", SpanArgs(l), ", ", l.lenlv, ", ", n, ")");
+    ind--;
+    LS("}");
+    return i;
+}
+
+// A slice pool's length argument, evaluated once: a negative length, or one
+// no data stack could hold, aborts before anything changes.
+inline string CodeGenGo::SliceLen(Node *n, int64_t esz, Line ln) {
+    auto i64 = ast.inttypes[IS_I64];
+    auto nv = T();
+    Decl(nv, "int64", Coerce(GenX(n), n->exprtype, i64, ln));
+    L("if uint64(", nv, ") > uint64(gsStackReserve/", esz, ") {");
+    ind++;
+    L("GsAbort(GsESliceLen, ", LocArgs(ln), ")");
+    ind--;
+    LS("}");
+    return nv;
+}
+
+// Grows a slice pool's element region to `end` elements where it is shorter.
+inline void CodeGenGo::EmitSliceExtend(const GoLoc &l, const string &end, int64_t esz) {
+    auto ext = T();
+    Decl(ext, "int64", cat(end, " - ", l.lenlv));
+    L("if ", ext, " > 0 {");
+    ind++;
+    L(l.lenlv, " += ", ext);
+    Bump(l.stk, esz == 1 ? ext : cat(ext, "*", esz));
+    ind--;
+    LS("}");
+}
+
+// Default values (§4.2) for `count` elements of a view from index `first`:
+// all zero where the default is that, else each built.
+inline void CodeGenGo::EmitDefaultElems(const GoView &v, const string &first, const string &count,
+                                        Node *init) {
+    auto gt = GoT(v.elem, v.elem->line);
+    if (!HasFieldDefaults(v.elem) || !init) {
+        L("clear(unsafe.Slice((*", gt, ")(", ElemAddr(v, first), "), ", count, "))");
+        return;
+    }
+    auto k = T();
+    L("for ", k, " := int64(0); ", k, " < ", count, "; ", k, "++ {");
+    ind++;
+    auto e = T();
+    Decl(e, "unsafe.Pointer", ElemAddr(v, cat(first, " + ", k)));
+    PushSc(SC_PLAIN);
+    GenAny(init, GoDst { GD_LVALUE, AtAddr(e, v.elem).lv, v.elem });
+    PopSc();
+    ind--;
+    LS("}");
+}
+
+// alloc_slice / free_slice / realloc_slice: the receiver, then the slice,
+// then the length. A slice handed back becomes an index into the pool: an
+// empty one takes 0, a non-empty one the checker rooted at this pool exactly
+// starts a whole number of elements into its length, and any other one is
+// checked to, and to end inside the length (GS_E_POOLSLICE).
+inline vector<string> CodeGenGo::EmitSlicePool(Call *c, vector<Node *> &an, Line ln) {
+    auto l = RzRecvLoc(an[0]);
+    if (l.fl.empty() || l.stk.empty()) Fail(ln, "internal: a pool without its freelist");
+    auto v = ArrayView(l, ln);
+    auto elem = v.elem;
+    auto esz = v.esize;
+    auto st = ast.SliceOf(elem, ln);
+    auto indexof = [&](const string &sv) {
+        auto i = T();
+        if (!c->poolcheck) {
+            Decl(i, "int64", "0");
+            L("if ", sv, ".Len != 0 {");
+            ind++;
+            L(i, " = int64(uintptr(", sv, ".Data)-uintptr(", v.data, ")) / ", esz);
+            ind--;
+            LS("}");
+            return i;
+        }
+        Decl(i, "int64", "0");
+        L("if ", sv, ".Len != 0 {");
+        ind++;
+        auto off = T();
+        Decl(off, "uint64", cat("uint64(uintptr(", sv, ".Data) - uintptr(", v.data, "))"));
+        L("if ", off, "%", esz, " != 0 || ", off, "/", esz, " >= uint64(", l.lenlv, ") || uint64(", sv,
+          ".Len) > uint64(", l.lenlv, ")-", off, "/", esz, " {");
+        ind++;
+        L("GsAbort(GsEPoolSlice, ", LocArgs(ln), ")");
+        ind--;
+        LS("}");
+        L(i, " = int64(", off, " / ", esz, ")");
+        ind--;
+        LS("}");
+        return i;
+    };
+    if (c->builtin == B_FREE_SLICE) {
+        auto sv = Snapshot(st, CoerceVal(GenX(an[1]), an[1]->exprtype, st, ln));
+        auto i = indexof(sv);
+        L("GsSpansFree(", SpanArgs(l), ", ", i, ", ", sv, ".Len)");
+        return {};
+    }
+    string i, n;
+    if (c->builtin == B_ALLOC_SLICE) {
+        n = SliceLen(an[1], esz, ln);
+        i = PlaceRun(l, n);
+        EmitSliceExtend(l, cat(i, " + ", n), esz);
+        EmitDefaultElems(v, i, n, c->defaultinit);
+    } else {
+        auto sv = Snapshot(st, CoerceVal(GenX(an[1]), an[1]->exprtype, st, ln));
+        n = SliceLen(an[2], esz, ln);
+        i = indexof(sv);
+        auto ol = T();
+        Decl(ol, "int64", cat(sv, ".Len"));
+        L("if ", n, " <= ", ol, " {");
+        ind++;
+        L("GsSpansFree(", SpanArgs(l), ", ", i, " + ", n, ", ", ol, " - ", n, ")");
+        ind--;
+        LS("} else {");
+        ind++;
+        // Growth stays in place where the slice ends the array or free
+        // elements follow it; otherwise the slice moves where alloc_slice
+        // would put the grown run, its own place freed first, so that the
+        // copy can overlap its source.
+        L("if ", ol, " == 0 {");
+        ind++;
+        auto pi = PlaceRun(l, n);
+        L(i, " = ", pi);
+        ind--;
+        LS("} else if ", i, " + ", ol, " != ", l.lenlv, " {");
+        ind++;
+        auto ni = T();
+        Decl(ni, "int64", cat("GsSpansRegrow(", SpanArgs(l), ", ", l.lenlv, ", ", i, ", ", ol, ", ", n, ")"));
+        auto gt = GoT(elem, ln);
+        L("if ", ni, " != ", i, " {");
+        ind++;
+        L("copy(unsafe.Slice((*", gt, ")(", ElemAddr(v, ni), "), ", ol, "), unsafe.Slice((*", gt, ")(",
+          ElemAddr(v, i), "), ", ol, "))");
+        ind--;
+        LS("}");
+        L(i, " = ", ni);
+        ind--;
+        LS("}");
+        EmitSliceExtend(l, cat(i, " + ", n), esz);
+        EmitDefaultElems(v, cat(i, " + ", ol), cat(n, " - ", ol), c->defaultinit);
+        ind--;
+        LS("}");
+    }
+    auto r = T();
+    Decl(r, "GsSlice", cat("GsSlice{", ElemAddr(v, i), ", ", n, "}"));
+    return { r };
 }
 
 }  // namespace goose
