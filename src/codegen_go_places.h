@@ -80,18 +80,31 @@ inline CodeGenGo::GoLoc CodeGenGo::PinLoc(const GoLoc &l) {
 
 inline CodeGenGo::GoLoc CodeGenGo::FieldLocAt(const GoLoc &base, int fi, Line ln) {
     const vector<Field> *fields;
+    const vector<TypeExpr *> *ftypes;
     TypeExpr *ft;
     if (base.t->kind == TY_STRUCT) {
         auto si = SI(base.t);
         fields = &si->st->fields;
+        ftypes = &si->ftypes;
         ft = si->ftypes[fi];
     } else if (base.t->kind == TY_VARIANT) {
         auto ei = EIVar(base.t);
         auto vi = ei->en->VariantIndex(base.t->var->variant);
         fields = &ei->en->variants[vi].fields;
+        ftypes = &ei->vftypes[vi];
         ft = ei->vftypes[vi][fi];
     } else {
         Fail(ln, cat("internal: a field of a value of type ", TypeText(base.t)));
+    }
+    if (IsBytesT(base.t) && !IsFrameObj(base.t)) {
+        // A field of a bytes value: at its offset in the image, past a
+        // cursor over the variable-size fields before it (FieldPtr). The
+        // resizable tail of a value that is no frame object has no header
+        // of its own: its count is the owner's (C.2).
+        auto r = BytesLoc(FieldPtr(base.addr, *fields, *ftypes, fi), ft, base);
+        if (!IsResz(ft)) r.lenlv.clear();
+        r.hdr.clear();
+        return r;
     }
     auto &ti = TI(base.t, ln);
     GoLoc r;
@@ -120,8 +133,10 @@ inline CodeGenGo::GoLoc CodeGenGo::FieldLocAt(const GoLoc &base, int fi, Line ln
 
 // An ADT's tag, as an lvalue of its representation's integer type.
 inline string CodeGenGo::TagOf(const GoLoc &e, Line ln) {
-    auto &ti = TI(e.t, ln);
     auto ei = EIOf(e.t);
+    // A variable-mode ADT's tag leads its image.
+    if (IsBytesT(e.t)) return cat("(*(*", IntGoT(TagStore(ei->en)), ")(", e.addr, "))");
+    auto &ti = TI(e.t, ln);
     if (ti.rep == GR_TAG) return e.lv;
     if (ti.rep == GR_NATIVE) return cat(e.lv, ".tag");
     if (TagStore(ei->en) == IS_U8) return cat(e.lv, "[0]");
@@ -130,9 +145,10 @@ inline string CodeGenGo::TagOf(const GoLoc &e, Line ln) {
 
 // The payload of variant vi, which the ADT at e holds.
 inline CodeGenGo::GoLoc CodeGenGo::PayloadLoc(const GoLoc &e, int vi, Line ln) {
-    auto &ti = TI(e.t, ln);
     auto ei = EIOf(e.t);
     auto vt = VariantType(e.t, vi);
+    if (IsBytesT(e.t)) return BytesLoc(AddOff(e.addr, TagSize(ei->en)), vt, e);
+    auto &ti = TI(e.t, ln);
     if (ti.voffs[vi] < 0) Fail(ln, "internal: the payload of a variant without one");
     GoLoc r;
     if (ti.rep == GR_NATIVE) r = AtVar(cat(e.lv, ".", VariantField(ei, vi)), vt);
@@ -157,7 +173,7 @@ inline CodeGenGo::GoView CodeGenGo::ArrayView(const GoLoc &l, Line ln) {
         v.data = AddrOf(l);
         v.len = cat(ArrSize(t->arr));
         v.fixed = ArrSize(t->arr);
-    } else if (t->kind == TY_ARRAY && t->arr->akind == A_LIMITED) {
+    } else if (IsStaticLimited(t)) {
         v.elem = t->arr->sub;
         auto &ti = TI(t, ln);
         if (ti.rep == GR_NATIVE) {
@@ -171,8 +187,30 @@ inline CodeGenGo::GoView CodeGenGo::ArrayView(const GoLoc &l, Line ln) {
                                   : cat("(*(*", IntGoT(ls), ")(", AddrOf(l), "))");
         }
         v.len = cat("int64(", v.lenlv, ")");
-        v.cap = ArrSize(t->arr);
+        v.cap = cat(ArrSize(t->arr));
         v.lenst = LenStore(t->arr);
+    } else if (t->kind == TY_ARRAY && t->arr->akind == A_VAR) {
+        // A variable array's image (§3.3): its length prefix, then its
+        // elements, which a varint prefix puts behind a size of its own.
+        v.elem = t->arr->sub;
+        auto ls = LenStore(t->arr);
+        if (ls == IS_VARINT) {
+            auto p = T();
+            Decl(p, "unsafe.Pointer", cat("unsafe.Add(", l.addr, ", GsUlebSize(", l.addr, "))"));
+            v.data = p;
+            v.len = cat("GsUlebRead(", l.addr, ")");
+        } else {
+            v.data = AddOff(l.addr, IntSize(ls));
+            v.len = cat("int64(*(*", IntGoT(ls), ")(", l.addr, "))");
+        }
+    } else if (t->kind == TY_ARRAY && t->arr->akind == A_LIMITED) {
+        // A runtime capacity: [cap u32][len u32][cap slots].
+        v.elem = t->arr->sub;
+        v.data = AddOff(l.addr, 8);
+        v.lenlv = cat("(*(*uint32)(", AddOff(l.addr, 4), "))");
+        v.len = cat("int64(", v.lenlv, ")");
+        v.cap = cat("int64(*(*uint32)(", l.addr, "))");
+        v.lenst = IS_U32;
     } else if (t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK)) {
         // A resizable's elements from its header's base; its count is the
         // header's (C.2).
@@ -185,7 +223,8 @@ inline CodeGenGo::GoView CodeGenGo::ArrayView(const GoLoc &l, Line ln) {
     } else {
         Fail(ln, cat("internal: the elements of a value of type ", TypeText(t)));
     }
-    v.esize = TI(v.elem, ln).size;
+    // Variable-size elements are walked, never indexed.
+    v.esize = IsFix(v.elem) ? TI(v.elem, ln).size : -1;
     return v;
 }
 
@@ -312,7 +351,7 @@ inline void CodeGenGo::DerefLoc(GoLoc &l) {
     if (IsRelRef(l.t)) {
         auto p = T();
         Decl(p, "unsafe.Pointer", RelLoad(l));
-        l = AtAddr(p, sub);
+        l = IsBytesT(sub) ? BytesLoc(p, sub, GoLoc {}) : AtAddr(p, sub);
     } else {
         l = AtTyped(l.lv, sub);
     }
@@ -323,6 +362,9 @@ inline void CodeGenGo::DerefLoc(GoLoc &l) {
 // offset it holds, null where an optional one holds 0 (§3.9).
 inline string CodeGenGo::RelLoad(const GoLoc &slot) {
     auto off = cat("int64(", slot.lv, ")");
+    // A varint width's offset is decoded from the slot's own bytes (§3.6).
+    if (slot.t->ref->lenstorage == IS_VARINT)
+        off = cat(slot.t->ref->pool ? "GsUlebRead(" : "GsZigRead(", slot.addr, ")");
     if (auto pool = slot.t->ref->pool) {
         // From the pool's base, biased by one so that 0 stays null.
         auto base = cat(gnames.at(pool), ".Base");
@@ -357,6 +399,14 @@ inline CodeGenGo::GoLoc CodeGenGo::GenLoc(Node *n) {
     // where it is no fixed-size value (GenRzTmp, GenPtr).
     auto t = n->exprtype;
     if (IsResz(t)) return GenRzTmp(n);
+    if (auto s = Is<StrLit>(n); s && t->kind == TY_ARRAY && t->arr->akind == A_VAR) {
+        // A `u8[]` literal is an image in static data: its length prefix,
+        // then its bytes (CodeGen::GenStrBytes).
+        GoLoc l;
+        l.t = t;
+        l.addr = StrImage(s->val, LenStore(t->arr));
+        return l;
+    }
     if (IsBytesT(t)) {
         GoLoc l;
         l.t = t;
@@ -391,6 +441,7 @@ inline string CodeGenGo::LoadLoc(GoLoc l, TypeExpr *et, Line ln) {
     }
     if (IsRelRef(l.t)) {
         auto sub = l.t->ref->sub;
+        if (IsBytesT(sub)) return RelLoad(l);
         return cat("(*", GoT(sub, ln), ")(", RelLoad(l), ")");
     }
     if (et->kind == TY_SLICE && l.t->kind == TY_ARRAY) {
@@ -401,9 +452,52 @@ inline string CodeGenGo::LoadLoc(GoLoc l, TypeExpr *et, Line ln) {
     if (IsStaticLimited(et) &&
         (l.t->kind == TY_SLICE || (l.t->kind == TY_ARRAY && !TEq(l.t, et))))
         return AdaptToLimited(l, et, ln);
+    // A varint reads as the i64 it decodes to; a bytes value is its
+    // address, or a fixed-mode value read out of it.
+    if (IsVarintT(l.t)) {
+        auto x = cat("GsZigRead(", l.addr, ")");
+        return IsScalarT(et) ? Coerce(x, ast.inttypes[IS_I64], et, ln) : x;
+    }
+    if (IsBytesT(l.t) && !IsResz(l.t)) {
+        if (IsFix(et) && et->kind == TY_ENUM) return AdaptBytesToEnum(l, et, ln);
+        if (IsFix(et) && !TEq(l.t, et))
+            Unsupported(ln, cat("reading a ", TypeText(l.t), " as a ", TypeText(et)));
+        return l.addr;
+    }
     if (et->kind == TY_ENUM && l.t->kind == TY_VARIANT) return AdaptToEnum(l, et, ln);
     if (IsScalarT(l.t) && IsScalarT(et)) return Coerce(l.lv, l.t, et, ln);
     return l.lv;
+}
+
+// A variant or a variable-mode ADT, as a bytes value, read as the fixed-mode
+// ADT et (CodeGen::AdaptToFixed): the tag, and the payload of the variant
+// it holds.
+inline string CodeGenGo::AdaptBytesToEnum(const GoLoc &l, TypeExpr *et, Line ln) {
+    auto ei = EIOf(et);
+    auto tv = T();
+    Decl(tv, LocalT(et, ln));
+    auto e = AtVar(tv, et);
+    auto &ti = TI(et, ln);
+    if (l.t->kind == TY_VARIANT) {
+        auto vi = ei->en->VariantIndex(l.t->var->variant);
+        L(TagOf(e, ln), " = ", vi);
+        if (ti.voffs[vi] >= 0)
+            L(PayloadLoc(e, vi, ln).lv, " = *(*", GoT(VariantType(et, vi), ln), ")(", l.addr, ")");
+        return tv;
+    }
+    auto tag = T();
+    Decl(tag, IntGoT(TagStore(ei->en)), cat("*(*", IntGoT(TagStore(ei->en)), ")(", l.addr, ")"));
+    L(TagOf(e, ln), " = ", ti.rep == GR_TAG ? cat(ti.name, "(", tag, ")") : tag);
+    for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+        if (ti.voffs.empty() || ti.voffs[vi] < 0) continue;
+        L("if ", tag, " == ", vi, " {");
+        ind++;
+        L(PayloadLoc(e, (int)vi, ln).lv, " = *(*", GoT(VariantType(et, (int)vi), ln), ")(",
+          AddOff(l.addr, TagSize(ei->en)), ")");
+        ind--;
+        LS("}");
+    }
+    return tv;
 }
 
 // A variant as its ADT (§3.5): the variant's tag, its value the payload.
@@ -466,7 +560,14 @@ inline string CodeGenGo::CoerceVal(const string &x, TypeExpr *from, TypeExpr *to
     if (IsScalarT(from) && IsScalarT(to)) return Coerce(x, from, to, ln);
     if (IsRelRef(to)) to = ast.RefTo(to->ref->sub, ln, to->ref->optional);
     if (from->kind == TY_REF && to->kind == TY_REF) return x;
-    if (from->kind == TY_REF) return LoadLoc(AtTyped(x, from->ref->sub), to, ln);
+    if (from->kind == TY_REF) {
+        // The pointee where the reference points: a resizable's through its
+        // header, a bytes value at its address.
+        auto sub = from->ref->sub;
+        if (IsResz(sub)) return LoadLoc(FatRefLoc(x, sub), to, ln);
+        if (IsBytesT(sub)) return LoadLoc(BytesLoc(x, sub, GoLoc {}), to, ln);
+        return LoadLoc(AtTyped(x, sub), to, ln);
+    }
     if (TEq(from, to)) return x;
     auto needsplace = (to->kind == TY_SLICE && from->kind == TY_ARRAY) ||
                       (to->kind == TY_ENUM && from->kind == TY_VARIANT) ||

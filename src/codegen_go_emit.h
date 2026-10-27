@@ -231,6 +231,11 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
         if (IsBytesT(rt)) {
             GoT(rt, sp->sf->line);
             add(cat("gs_dst", i, " int64"));
+            // The element-run twin returns its run's count.
+            if (emiter && i == 0) {
+                Append(rets, nrets++ ? ", " : "", "int64");
+                continue;
+            }
             if (!IsResz(rt)) continue;
             Append(rets, nrets++ ? ", " : "", IsFrameObj(rt) ? RzGoT(rt, sp->sf->line) : "int64");
             continue;
@@ -245,7 +250,20 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
         Append(rets, nrets++ ? ", " : "", ParamT(rt, sp->sf->line));
     }
     if (nrets > 1) rets = cat("(", rets, ")");
-    return cat("func ", si.name, "(", params, ")", rets.empty() ? "" : " ", rets);
+    return cat("func ", emiter ? ernames[sp] : si.name, "(", params, ")", rets.empty() ? "" : " ", rets);
+}
+
+// The element-run twin of a specialization (C.3, CodeGen::EnsureEr): its name,
+// queued for emission, or "" where it can have none.
+inline string CodeGenGo::EnsureEr(FnSpec *sp) {
+    if (auto it = ernames.find(sp); it != ernames.end()) return it->second;
+    auto rt = sp->rets.size() == 1 ? sp->rets[0] : nullptr;
+    auto ok = rt && rt->kind == TY_ARRAY && rt->arr->akind == A_VAR && sp->body && sinfo.count(sp);
+    if (!ok) return ernames[sp] = "";
+    auto name = Unique(cat(sinfo[sp].name, "_er"));
+    ernames[sp] = name;
+    erqueue.push_back(sp);
+    return name;
 }
 
 inline void CodeGenGo::ResetFnState() {
@@ -380,9 +398,10 @@ inline string CodeGenGo::FinishBody(const string &b) {
     return out;
 }
 
-inline void CodeGenGo::EmitSpec(FnSpec *sp) {
+inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
     curspec = sp;
     curinfo = &sinfo[sp];
+    emiter = er;
     ResetFnState();
     spexpr = curinfo->needssp ? "gs_sp" : "0";
     PushSc(SC_FN);
@@ -391,11 +410,13 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp) {
     // the frame; the named results built at their destinations (§7.3).
     dstcounts.assign(sp->rets.size(), "");
     for (size_t i = 0; i < sp->rets.size(); i++) {
-        if (!IsResz(sp->rets[i])) continue;
+        if (!IsResz(sp->rets[i]) && !(er && i == 0)) continue;
         dstcounts[i] = Unique2(cat("gs_rl", i));
         Decl(dstcounts[i], IsFrameObj(sp->rets[i]) ? RzGoT(sp->rets[i], sp->sf->line) : "int64");
     }
-    DetectNrvo(sp);
+    // In the element-run form a named result is not built at the
+    // destination: the copy at the return is the cost of the run (§7.3).
+    if (!er) DetectNrvo(sp);
     for (auto st : sp->body->stmts) GenStmt(st);
     if (auto tail = sp->body->tail) {
         auto asvalue = !sp->rets.empty() && !IsVoidT(tail->exprtype);
@@ -418,10 +439,11 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp) {
     if (stkmax > 0 && !curinfo->needssp)
         Fail(sp->sf->line, cat("internal: ", curinfo->name, " uses data stacks without gs_sp"));
     stackown[sp] = std::max(stackown[sp], stkmax);
-    Append(code, "// ", sp->sf->qname, ", line ", sp->sf->line.line, "\n", sig, " {\n",
-           FinishBody(body), "}\n\n");
+    Append(code, "// ", sp->sf->qname, ", line ", sp->sf->line.line, er ? ", its element-run twin" : "", "\n",
+           sig, " {\n", FinishBody(body), "}\n\n");
     curspec = nullptr;
     curinfo = nullptr;
+    emiter = false;
 }
 
 // ------------------------------------------------------------------
@@ -657,11 +679,16 @@ inline void CodeGenGo::EmitProgram() {
             Append(gdecls, "\t", gstkorder[i], " = ", mainstacks + (int64_t)i, "\n");
         Append(gdecls, ")\n");
     }
+    // Under GS_STACK_STATS the program reports, as it ends, the stacks it
+    // took, as C's gs_stack_stats does.
+    string stats;
+    if (opts.stackstats && !opts.library)
+        stats = cat("\tgsStackStats(gs, ", mainstacks, ", ", opts.stacks.budget, ")\n");
     Append(code, opts.library ? "func init() {\n" : "func main() {\n",
            "\tdefer GsExitOnAbort()\n"
            "\tdebug.SetPanicOnFault(true)\n"
            "\tgs := NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n"
-           "\tgsInitGlobals(gs)\n", call, "}\n");
+           "\tgsInitGlobals(gs)\n", call, stats, "}\n");
 }
 
 // The whole file: a header Go tools know generated code by, the package,
@@ -679,7 +706,7 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "// ns_x_g followed by the namespace's length.\n\n"
                    "package ", opts.package, "\n\n"
                    "import (\n\t\"math\"\n\t\"os\"\n",
-                   code.find("runtime.KeepAlive(") != string::npos ? "\t\"runtime\"\n" : "",
+                   (code + bcode).find("runtime.KeepAlive(") != string::npos ? "\t\"runtime\"\n" : "",
                    "\t\"runtime/debug\"\n\t\"strconv\"\n\t\"syscall\"\n\t\"unsafe\"\n)\n\n"
                    "// The runtime configuration the program was compiled with (--stack-reserve,\n"
                    "// -D GS_STACK_RESERVE, -D GS_STACK_GAP).\n"
@@ -687,7 +714,7 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "\n\tgsStackGap     = ", opts.stacks.gap, "\n)\n\n");
     for (auto part : go_runtime_prologue) s += part;
     Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, gdecls,
-           gdecls.empty() ? "" : "\n", code, eqcode);
+           gdecls.empty() ? "" : "\n", code, eqcode, bcode);
     return s;
 }
 

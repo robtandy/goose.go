@@ -103,13 +103,28 @@ inline bool CodeGenGo::HasStmts(Node *n) {
 inline bool CodeGenGo::TryPure(const function<string()> &gen, string &x) {
     auto mark = body.size();
     auto savetmp = tmpn;
-    vector<size_t> nlocals;
-    for (auto &s : scopes) nlocals.push_back(s.locals.size());
+    // What the attempt takes in the open scopes -- the locals it declares,
+    // the stacks it claims and the tops it saves -- goes with its code.
+    auto savenext = stknext, savemax = stkmax;
+    auto saveopen = openat;
+    vector<size_t> nlocals, nsaves, ndefers;
+    for (auto &s : scopes) {
+        nlocals.push_back(s.locals.size());
+        nsaves.push_back(s.saves.size());
+        ndefers.push_back(s.defers.size());
+    }
     x = gen();
     if (body.size() == mark) return true;
     body.resize(mark);
     tmpn = savetmp;
-    for (size_t i = 0; i < nlocals.size() && i < scopes.size(); i++) scopes[i].locals.resize(nlocals[i]);
+    stknext = savenext;
+    stkmax = savemax;
+    openat = std::move(saveopen);
+    for (size_t i = 0; i < nlocals.size() && i < scopes.size(); i++) {
+        scopes[i].locals.resize(nlocals[i]);
+        scopes[i].saves.resize(nsaves[i]);
+        scopes[i].defers.resize(ndefers[i]);
+    }
     return false;
 }
 
@@ -272,6 +287,9 @@ inline string CodeGenGo::Materialize(TypeExpr *t, const string &x) {
 // x, a value of type `from`, as a value of type `to`: Go converts nothing
 // implicitly, where C converts a scalar to the type of the slot it lands in.
 inline string CodeGenGo::Coerce(const string &x, TypeExpr *from, TypeExpr *to, Line ln) {
+    // A varint as a Go value is the i64 it encodes (§3.6).
+    if (to && IsVarintT(to)) to = ast.inttypes[IS_I64];
+    if (from && IsVarintT(from)) from = ast.inttypes[IS_I64];
     if (!to || !from || SameGoT(from, to)) return x;
     if (!IsScalarT(from) || !IsScalarT(to)) return CoerceVal(x, from, to, ln);
     auto gt = GoT(to, ln);
@@ -642,8 +660,10 @@ inline string CodeGenGo::GenBinary(Binary *b) {
         ElemwiseInto(b->exprtype, op, b->line, l, ls, r, rs, AtVar(v, b->exprtype));
         return v;
     }
+    // A varint operand or result is the i64 it encodes (§3.6).
+    if (lt && IsVarintT(lt)) lt = ast.inttypes[IS_I64];
     if ((op == T_EQ || op == T_NEQ) && lt && !IsScalarT(lt)) return GenEquality(b);
-    if (!IsScalarT(lt) || (b->exprtype && !IsScalarT(b->exprtype)))
+    if (!IsScalarT(lt) || (b->exprtype && !IsScalarT(b->exprtype) && !IsVarintT(b->exprtype)))
         Unsupported(b->line, cat("the operator on ", TypeText(lt)));
     // Left to right (§2): the left operand is read into a temporary first
     // where the right one runs statements.
@@ -813,8 +833,7 @@ inline void CodeGenGo::LeafAny(Node *n, const GoDst &d) {
             L(d.s, " = ", l.lv);
             return;
         }
-        auto x = GenX(n);
-        if (d.t) x = Coerce(x, n->exprtype, d.t, n->line);
+        auto x = d.t ? GenXD(n, d.t) : GenX(n);
         // Go's vet reports an assignment of a variable to itself.
         if (x != d.s) L(d.s, " = ", x);
         return;

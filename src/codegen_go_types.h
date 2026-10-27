@@ -423,47 +423,39 @@ inline void CodeGenGo::CheckRepresentable(TypeExpr *t, Line ln) {
     switch (t->kind) {
         case TY_INT:
             if (t->ix) Unsupported(ln, cat("the index type ", TypeText(t)));
-            if (t->intstorage == IS_VARINT) Unsupported(ln, "varint");
+            // A varint is storage in a bytes value (§3.6).
             return;
         case TY_FLT: case TY_BOOL: return;
         case TY_REF: {
             auto &r = *t->ref;
-            if (r.lenstorage == IS_VARINT) Unsupported(ln, "a varint relative reference");
             // An `in pool` one measures from its pool's base, which is a
             // resizable global's (§3.9).
             if (r.pool && (!r.pool->isglobal || !IsResz(r.pool->type)))
                 Unsupported(ln, cat("an `in pool` relative reference (", TypeText(t), ")"));
-            // A fat reference to a resizable value (GsRref).
-            if (r.lenstorage < 0 && IsResz(r.sub)) {
-                CheckRepresentable(r.sub, ln);
-                return;
-            }
-            if (Cls(r.sub) != SC_FIXED) Unsupported(ln, cat("a value of type ", TypeText(t)));
+            // A fat reference to a resizable value (GsRref), a reference to
+            // a bytes value (its address); what they lead to is checked where
+            // a value of it is reached.
             return;
         }
-        case TY_SLICE:
-            if (Cls(t->sub) != SC_FIXED) Unsupported(ln, cat("a value of type ", TypeText(t)));
-            return;
-        case TY_ARRAY: case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
-            // A frame object (C.2): its fixed fields and its tail's header.
-            if (t->kind == TY_STRUCT && IsFrameObj(t)) {
-                for (auto ft : SI(t)->ftypes)
-                    if (ft) CheckRepresentable(ft, ln);
+        case TY_SLICE: return;
+        case TY_ARRAY: case TY_STRUCT: case TY_ENUM: case TY_VARIANT: {
+            if (Cls(t) == SC_FIXED && !(t->kind == TY_ENUM && t->enu->varmode)) {
+                if (t->kind == TY_ARRAY && t->arr->akind != A_FIXED && t->arr->akind != A_LIMITED)
+                    Unsupported(ln, cat("a value of type ", TypeText(t)));
                 return;
             }
-            // A resizable array of fixed-size elements: its header (GsRhdr),
-            // the elements on a data stack.
-            if (t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK)) {
-                if (!IsFix(t->arr->sub))
-                    Unsupported(ln, cat("a value of type ", TypeText(t), " (variable-size elements)"));
+            // A value that is not fixed-size: a resizable's header (a frame
+            // object's struct), or a bytes value's image on a data stack
+            // (codegen_go_rz.h, codegen_go_bytes.h), whose parts are what
+            // this version holds. Each nominal type is checked once.
+            if (t->kind != TY_ARRAY && !repchecked.insert(Mangle(t)).second) return;
+            if (t->kind == TY_ARRAY) {
                 CheckRepresentable(t->arr->sub, ln);
                 return;
             }
-            if (Cls(t) != SC_FIXED || (t->kind == TY_ENUM && t->enu->varmode))
-                Unsupported(ln, cat("a value of type ", TypeText(t)));
-            if (t->kind == TY_ARRAY && t->arr->akind != A_FIXED && t->arr->akind != A_LIMITED)
-                Unsupported(ln, cat("a value of type ", TypeText(t)));
+            EachFieldOf(FieldRuns(t), [&](TypeExpr *ft) { CheckRepresentable(ft, ln); });
             return;
+        }
         case TY_FN: Unsupported(ln, "a function value outside a call");
         default: Fail(ln, cat("internal: no Go type for ", TypeText(t)));
     }
@@ -479,8 +471,11 @@ inline string CodeGenGo::GoT(TypeExpr *t, Line ln) {
         case TY_FLT: return t->fltstorage == FS_F32 ? "float32" : "float64";
         case TY_BOOL: return "bool";
         case TY_REF:
+            if (t->ref->lenstorage == IS_VARINT) return "unsafe.Pointer";
             if (t->ref->lenstorage >= 0) return RelGoT(t);
             if (IsResz(t->ref->sub)) return "GsRref";
+            // A reference to a bytes value is its address.
+            if (IsBytesT(t->ref->sub)) return "unsafe.Pointer";
             return cat("*", GoT(t->ref->sub, ln));
         case TY_SLICE: return "GsSlice";
         case TY_ARRAY:
@@ -489,6 +484,9 @@ inline string CodeGenGo::GoT(TypeExpr *t, Line ln) {
             break;
         default: break;
     }
+    // A bytes value is the address of its image; a resizable that is no
+    // frame object, its header (C.2).
+    if (IsBytesT(t) && !IsFrameObj(t)) return IsResz(t) ? "GsRhdr" : "unsafe.Pointer";
     auto m = Mangle(t);
     if (auto it = gonames.find(m); it != gonames.end()) return it->second;
     auto name = Unique(m);
@@ -521,6 +519,16 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
     }
     GoTypeInfo ti;
     ti.name = gt;
+    // A bytes value as a Go value is its address (a varint, its decoded
+    // i64), a resizable that is no frame object its header.
+    if (IsBytesT(t) && !IsFrameObj(t)) {
+        ti.size = gt == "GsRhdr" ? 16 : 8;
+        ti.align = 8;
+        ti.ptrs = gt != "int64";
+        ti.exact = false;
+        ti.goeq = false;
+        return typeinfo[m] = ti;
+    }
     switch (t->kind) {
         case TY_INT:
             ti.size = ti.align = IntSize(t->intstorage);
@@ -835,6 +843,7 @@ inline void CodeGenGo::EmitTypeDecls() {
 // (GenSliceEq).
 
 inline string CodeGenGo::EqX(TypeExpr *t, const GoLoc &a, const GoLoc &b, Line ln) {
+    if (IsBytesT(t) && !IsResz(t)) return cat(EqFnBytes(t, ln), "(", a.addr, ", ", b.addr, ")");
     auto &ti = TI(t, ln);
     if (ti.goeq) return cat("(", a.lv, " == ", b.lv, ")");
     return cat(EqFn(t, ln), "(", PtrOf(a), ", ", PtrOf(b), ")");

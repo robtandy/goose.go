@@ -141,7 +141,7 @@ inline void CodeGenGo::ArrayLitInto(ArrayLit *al, const GoLoc &dst, bool fresh) 
 // whose offset every slot encodes from where it is.
 inline void CodeGenGo::FreezeFill(Node *n, TypeExpr *t, vector<Node *> &added) {
     if (!n || Is<SelfRef>(n) || fillvalues.count(n)) return;
-    if (HasRelRef(t)) {
+    if (HasRelRefAny(t)) {
         if (auto sl = Is<StructLit>(n)) {
             const vector<TypeExpr *> *ftypes;
             if (t->kind == TY_STRUCT) ftypes = &SI(t)->ftypes;
@@ -160,8 +160,28 @@ inline void CodeGenGo::FreezeFill(Node *n, TypeExpr *t, vector<Node *> &added) {
             return;
         }
     }
+    if (IsVarintT(t)) t = ast.inttypes[IS_I64];
     if (IsRelRef(t)) t = ast.RefTo(t->ref->sub, n->line, t->ref->optional);
     if (Is<NullLit>(n)) return;
+    // A value that is not fixed-size is held on a temporary stack of its own
+    // (CodeGen::FreezeFill).
+    if (IsResz(t)) {
+        string stk;
+        auto h = RzTemp(t, stk);
+        GenAny(n, GoDst { GD_STACK, stk, t, RzLenLv(t, h) });
+        fillvalues.emplace(n, RzTempLoc(t, h, stk));
+        added.push_back(n);
+        return;
+    }
+    if (IsBytesT(t)) {
+        GoLoc l;
+        l.t = t;
+        l.addr = BytesTemp(l.stk);
+        GenConstruct(n, l.stk, t);
+        fillvalues.emplace(n, l);
+        added.push_back(n);
+        return;
+    }
     auto x = CoerceVal(GenX(n), n->exprtype, t, n->line);
     auto v = T();
     Decl(v, LocalT(t, n->line), x);
@@ -265,8 +285,11 @@ inline string CodeGenGo::GenDot(Dot *d) {
         auto l = GenLoc(d->obj);
         while (l.t->kind == TY_REF) DerefLoc(l);
         auto i64 = ast.inttypes[IS_I64];
-        if (l.t->kind == TY_ARRAY && d->member == B_CAP)
+        if (l.t->kind == TY_ARRAY && d->member == B_CAP) {
+            // A runtime capacity is read where the array stores it.
+            if (ArrSize(l.t->arr) < 0) return Coerce(ArrayView(l, d->line).cap, i64, d->exprtype, d->line);
             return Coerce(GoIntLit(ArrSize(l.t->arr), false, i64, d->line), i64, d->exprtype, d->line);
+        }
         auto v = ArrayView(l, d->line);
         auto len = v.fixed >= 0 ? GoIntLit(v.fixed, false, i64, d->line) : v.len;
         return Coerce(len, i64, d->exprtype, d->line);
@@ -282,6 +305,18 @@ inline string CodeGenGo::GenDot(Dot *d) {
 inline string CodeGenGo::GenEquality(Binary *b) {
     auto lt = b->left->exprtype;
     if (lt && IsPlainRef(lt)) lt = lt->ref->sub;
+    if (lt && IsBytesT(lt) && !IsResz(lt)) {
+        // Bytes values compare through their images (EqFnBytes), the left
+        // one's address taken before the right operand runs.
+        auto la = GenLoc(b->left);
+        while (la.t->kind == TY_REF) DerefLoc(la);
+        auto lp = T();
+        Decl(lp, "unsafe.Pointer", la.addr);
+        auto ra = GenLoc(b->right);
+        while (ra.t->kind == TY_REF) DerefLoc(ra);
+        auto eq = cat(EqFnBytes(lt, b->line), "(", lp, ", ", ra.addr, ")");
+        return b->op == T_EQ ? eq : cat("(!", eq, ")");
+    }
     if (lt && IsResz(lt)) {
         // Resizable arrays compare as element ranges through their views,
         // the left one read before the right operand runs.
@@ -323,7 +358,19 @@ inline string CodeGenGo::RangeEq(TypeExpr *elem, const string &ad, const string 
     Decl(t, "bool", cat(an, " == ", bn));
     L("if ", t, " {");
     ind++;
-    if ((IsScalarT(elem) && elem->kind != TY_FLT) || (ti.exact && BitwiseEq(elem) && !ti.ptrs)) {
+    if (!IsFix(elem)) {
+        // Variable-size elements are walked, a cursor on each side.
+        auto pa = T(), pb = T(), i = T();
+        Decl(pa, "unsafe.Pointer", ad);
+        Decl(pb, "unsafe.Pointer", bd);
+        L("for ", i, " := int64(0); ", t, " && ", i, " < ", an, "; ", i, "++ {");
+        ind++;
+        L(t, " = ", EqFnBytes(elem, ln), "(", pa, ", ", pb, ")");
+        L(pa, " = unsafe.Add(", pa, ", ", SizeFn(elem), "(", pa, "))");
+        L(pb, " = unsafe.Add(", pb, ", ", SizeFn(elem), "(", pb, "))");
+        ind--;
+        LS("}");
+    } else if ((IsScalarT(elem) && elem->kind != TY_FLT) || (ti.exact && BitwiseEq(elem) && !ti.ptrs)) {
         L(t, " = GsMemEq(", ad, ", ", bd, ", ", an, "*", ti.size, ")");
     } else {
         auto i = T();
@@ -458,16 +505,71 @@ inline void CodeGenGo::GenForArray(ForLoop *f) {
     GoT(et, f->line);
     auto held = v.elem->kind == TY_REF;
     auto typedix = f->idxdef && !SameGoT(f->idxdef->type, ast.inttypes[IS_I64]);
+    // A body that re-points a slice on the path, or rebinds a reference on
+    // it, moves the walk to the elements the path leads to now, at the next
+    // index, as the length read again does (ForLoop::CgStmt).
+    auto moves = !f->fixedlen && (l.t->kind == TY_SLICE || l.viaref);
+    // Variable-size elements are walked, a cursor advancing past each one in
+    // the loop's post statement, so that a continue moves it on too; such an
+    // element binds by reference only.
+    string cur, at;
+    if (!IsFix(v.elem)) {
+        cur = T();
+        Decl(cur, "unsafe.Pointer", v.data);
+        if (moves) {
+            at = T();
+            Decl(at, "unsafe.Pointer", cur);
+        }
+    }
     OpenLabeled(SC_LOOP);
     auto gi = f->idxdef && !typedix ? LocalName(f->idxdef) : T();
     LabelHere();
-    L("for ", gi, " := int64(0); ", gi, " < ", len, "; ", gi, "++ {");
+    if (!cur.empty())
+        L("for ", gi, " := int64(0); ", gi, " < ", len, "; ", gi, ", ", cur, " = ", gi, "+1, unsafe.Add(", cur,
+          ", ", SizeFn(v.elem), "(", cur, ")) {");
+    else
+        L("for ", gi, " := int64(0); ", gi, " < ", len, "; ", gi, "++ {");
     ind++;
     if (typedix) {
         auto it = f->idxdef->type;
         Decl(LocalName(f->idxdef), LocalT(it, f->line), Coerce(gi, ast.inttypes[IS_I64], it, f->line));
     }
-    auto e = ElemAt(v, gi, f->line);
+    if (!cur.empty()) {
+        if (moves) {
+            // Where the elements moved, the cursor walks from their start
+            // again.
+            auto e = T();
+            Decl(e, "unsafe.Pointer", ArrayView(l, f->line).data);
+            L("if ", e, " != ", at, " {");
+            ind++;
+            L(at, " = ", e);
+            L(cur, " = ", e);
+            auto k = T();
+            L("for ", k, " := int64(0); ", k, " < ", gi, "; ", k, "++ {");
+            ind++;
+            L(cur, " = unsafe.Add(", cur, ", ", SizeFn(v.elem), "(", cur, "))");
+            ind--;
+            LS("}");
+            ind--;
+            LS("}");
+        }
+        auto e = BytesLoc(cur, v.elem, GoLoc {});
+        e.viaref = l.viaref || held;
+        auto iv = LocalName(f->vdef);
+        if (held) Decl(iv, LocalT(et, f->line), LoadLoc(e, et, f->line));
+        else if (!f->vdef->copybind) Decl(iv, "unsafe.Pointer", cur);
+        else Fail(f->line, "internal: a variable-size element bound by value");
+        GenLoopBody(f->body);
+        ind--;
+        LS("}");
+        auto s = PopLabeled();
+        PlaceLabel(s);
+        dead = false;
+        return;
+    }
+    // The start of the elements behind a varint length prefix is a
+    // statement's, which runs again where they can move.
+    auto e = ElemAt(moves ? ArrayView(l, f->line) : v, gi, f->line);
     e.viaref = l.viaref || held;
     auto iv = LocalName(f->vdef);
     if (!f->vdef->copybind && !held) Decl(iv, LocalT(et, f->line), PtrOf(e));
@@ -491,8 +593,17 @@ inline void CodeGenGo::GenEnumMatch(MatchExpr *m, TypeExpr *enumtype, bool isref
     auto ln = m->line;
     auto ei = EIOf(enumtype);
     auto &ti = TI(enumtype, ln);
+    auto varmode = IsBytesT(enumtype);
     GoLoc e;
-    if (isref) {
+    if (varmode) {
+        // A variable-mode ADT is its image: its tag, then the payload,
+        // which a binder takes by reference or copies (§8.1).
+        auto l = GenLoc(m->scrutinee);
+        while (l.t->kind == TY_REF) DerefLoc(l);
+        auto p = T();
+        Decl(p, "unsafe.Pointer", l.addr);
+        e = BytesLoc(p, enumtype, GoLoc {});
+    } else if (isref) {
         e = AtTyped(GenPure(m->scrutinee), enumtype);
     } else {
         auto sv = CoerceVal(GenX(m->scrutinee), m->scrutinee->exprtype, enumtype, ln);
@@ -524,7 +635,32 @@ inline void CodeGenGo::GenEnumMatch(MatchExpr *m, TypeExpr *enumtype, bool isref
         first = false;
         ind++;
         PushSc(SC_PLAIN);
-        if (arm.binder) {
+        if (arm.binder && varmode) {
+            auto vi = ei->en->VariantIndex(arm.variants[0]);
+            auto vt = VariantType(enumtype, vi);
+            auto pl = PayloadLoc(e, vi, ln);
+            if (arm.pat.byref) {
+                auto bn = LocalName(arm.binder);
+                if (IsBytesT(vt)) Decl(bn, "unsafe.Pointer", pl.addr);
+                else Decl(bn, cat("*", GoT(vt, ln)), cat("(*", GoT(vt, ln), ")(", AddrOf(pl), ")"));
+            } else if (IsBytesT(vt)) {
+                // A copy of a variable payload, on a stack of its own.
+                auto bn = LocalName(arm.binder);
+                auto stk = AllocStk(true);
+                Decl(bn, "unsafe.Pointer", Top(stk));
+                SaveBase(true, stk, bn);
+                vstk[arm.binder] = stk;
+                auto sz = T();
+                Decl(sz, "int64", SizeX(vt, pl.addr));
+                L("copy(unsafe.Slice((*byte)(", Top(stk), "), ", sz, "), unsafe.Slice((*byte)(", pl.addr, "), ",
+                  sz, "))");
+                Bump(stk, sz);
+            } else if (EmptyLayout(arm.variants[0]->fields)) {
+                Decl(LocalName(arm.binder), LocalT(vt, ln));
+            } else {
+                Decl(LocalName(arm.binder), LocalT(vt, ln), pl.lv);
+            }
+        } else if (arm.binder) {
             auto vi = ei->en->VariantIndex(arm.variants[0]);
             auto vt = VariantType(enumtype, vi);
             auto bn = LocalName(arm.binder);
@@ -564,7 +700,8 @@ inline CodeGenGo::GoLoc CodeGenGo::RecvLoc(Node *n) {
 }
 
 inline void CodeGenGo::CheckLimited(const GoLoc &l, Line ln) {
-    if (!IsStaticLimited(l.t)) Unsupported(ln, cat("this operation on ", TypeText(l.t)));
+    if (l.t->kind != TY_ARRAY || l.t->arr->akind != A_LIMITED)
+        Unsupported(ln, cat("this operation on ", TypeText(l.t)));
 }
 
 // A pushed element's value, evaluated before its slot is claimed (§2): a
@@ -576,7 +713,9 @@ inline string CodeGenGo::ElemValue(Node *n, TypeExpr *elem) {
         auto pt = ast.RefTo(elem->ref->sub, n->line, elem->ref->optional);
         return Snapshot(pt, CoerceVal(GenX(n), n->exprtype, pt, n->line));
     }
-    if (HasRelRef(elem)) return "";
+    // A variable-size element is built in its slot, as one holding relative
+    // references is.
+    if (!IsFix(elem) || HasRelRef(elem)) return "";
     return Snapshot(elem, CoerceVal(GenX(n), n->exprtype, elem, n->line));
 }
 
@@ -596,6 +735,7 @@ inline void CodeGenGo::StoreElem(Node *n, const GoLoc &slot, const string &ev) {
 // reference an element that is one holds (there are no references to
 // references, §3.8).
 inline string CodeGenGo::NewElemResult(const GoLoc &slot, Line ln) {
+    if (IsBytesT(slot.t) && slot.t->kind != TY_REF) return slot.addr;
     if (slot.t->kind != TY_REF) return PtrOf(slot);
     return Snapshot(ast.RefTo(slot.t->ref->sub, ln, slot.t->ref->optional),
                     LoadLoc(slot, slot.t, ln));
@@ -616,6 +756,7 @@ inline string CodeGenGo::GenArrayBuiltin(Call *c) {
             while (l.t->kind == TY_REF) DerefLoc(l);
             if (c->builtin == B_CAP) {
                 CheckLimited(l, ln);
+                if (ArrSize(l.t->arr) < 0) return ArrayView(l, ln).cap;
                 return GoIntLit(ArrSize(l.t->arr), false, i64, ln);
             }
             auto v = ArrayView(l, ln);
@@ -814,7 +955,8 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
     if (nominal) {
         for (auto r : rendering)
             if (TEq(r, t)) {
-                L(cur, " = ", RenderFn(t, ln), "(", cur, ", ", end, ", ", PtrOf(l), ")");
+                L(cur, " = ", RenderFn(t, ln), "(", cur, ", ", end, ", ", IsBytesT(t) ? l.addr : PtrOf(l),
+                  ")");
                 return;
             }
         rendering.push_back(t);
@@ -825,20 +967,28 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
             break;
         case TY_REF: {
             auto x = LoadLoc(l, l.t, ln);
+            auto sub = t->ref->sub;
+            // The pointee where the reference points: a resizable's through
+            // its header, a bytes value at its address.
+            auto at = [&](const string &p) {
+                if (IsResz(sub)) return FatRefLoc(p, sub);
+                if (IsBytesT(sub)) return BytesLoc(p, sub, GoLoc {});
+                return AtTyped(p, sub);
+            };
             if (t->ref->optional) {
-                auto p = Snapshot(ast.RefTo(t->ref->sub, ln, true), x);
-                L("if ", p, " == nil {");
+                auto p = Snapshot(ast.RefTo(sub, ln, true), x);
+                L("if ", p, IsResz(sub) ? ".Hdr" : "", " == nil {");
                 ind++;
                 lit("null");
                 ind--;
                 LS("} else {");
                 ind++;
-                RenderLoc(cur, end, AtTyped(p, t->ref->sub), t->ref->sub, nested, ln);
+                RenderLoc(cur, end, at(p), sub, nested, ln);
                 ind--;
                 LS("}");
                 break;
             }
-            RenderLoc(cur, end, AtTyped(Snapshot(t, x), t->ref->sub), t->ref->sub, nested, ln);
+            RenderLoc(cur, end, at(Snapshot(ast.RefTo(sub, ln, false), x)), sub, nested, ln);
             break;
         }
         case TY_ARRAY: case TY_SLICE: {
@@ -854,6 +1004,12 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
             }
             lit("[");
             auto i = T();
+            // Variable-size elements are walked with a cursor of their own.
+            string p;
+            if (!IsFix(elem)) {
+                p = T();
+                Decl(p, "unsafe.Pointer", d);
+            }
             L("for ", i, " := int64(0); ", i, " < ", n, "; ", i, "++ {");
             ind++;
             PushSc(SC_PLAIN);
@@ -862,13 +1018,19 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
             lit(", ");
             ind--;
             LS("}");
-            GoView ev;
-            ev.data = d;
-            ev.elem = elem;
-            ev.esize = v.esize;
-            auto el = ElemAt(ev, i, ln);
+            GoLoc el;
+            if (!p.empty()) {
+                el = BytesLoc(p, elem, GoLoc {});
+            } else {
+                GoView ev;
+                ev.data = d;
+                ev.elem = elem;
+                ev.esize = v.esize;
+                el = ElemAt(ev, i, ln);
+            }
             el.viaref = elem->kind == TY_REF;
             RenderLoc(cur, end, el, elem, true, ln);
+            if (!p.empty()) L(p, " = unsafe.Add(", p, ", ", SizeX(elem, p), ")");
             PopSc();
             ind--;
             LS("}");
@@ -894,6 +1056,7 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
         case TY_ENUM: {
             auto ei = EIOf(t);
             auto &ti = TI(t, ln);
+            auto bytes = IsBytesT(t);
             auto tag = T();
             Decl(tag, ti.rep == GR_TAG ? ti.name : IntGoT(TagStore(ei->en)), TagOf(l, ln));
             for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
@@ -903,7 +1066,8 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
                 PushSc(SC_PLAIN);
                 auto vt = VariantType(t, (int)vi);
                 GoLoc pl;
-                if (ti.voffs.empty() || ti.voffs[vi] < 0) pl = AtVar(ZeroOf(vt, ln), vt);
+                if (bytes) pl = PayloadLoc(l, (int)vi, ln);
+                else if (ti.voffs.empty() || ti.voffs[vi] < 0) pl = AtVar(ZeroOf(vt, ln), vt);
                 else pl = PayloadLoc(l, (int)vi, ln);
                 RenderVariant(cur, end, pl, vt, ln);
                 PopSc();
@@ -975,13 +1139,14 @@ inline void CodeGenGo::EmitRenderFns() {
         curinfo = nullptr;
         spexpr = "0";
         PushSc(SC_FN);
-        RenderLoc("cur", "end", AtTyped("v", r.t), r.t, true, r.ln);
+        auto bytes = IsBytesT(r.t);
+        RenderLoc("cur", "end", bytes ? BytesLoc("v", r.t, GoLoc {}) : AtTyped("v", r.t), r.t, true, r.ln);
         PopSc();
         auto b = FinishBody(body);
         RestoreFnState(save);
         Append(code, "// The text of a ", TypeText(r.t), " below the first level (§3.7).\n", "func ",
-               r.name, "(cur, end unsafe.Pointer, v *", GoT(r.t, r.ln), ") unsafe.Pointer {\n", b,
-               "\treturn cur\n}\n\n");
+               r.name, "(cur, end unsafe.Pointer, v ", bytes ? "unsafe.Pointer" : cat("*", GoT(r.t, r.ln)),
+               ") unsafe.Pointer {\n", b, "\treturn cur\n}\n\n");
     }
 }
 

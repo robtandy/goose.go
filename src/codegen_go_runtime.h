@@ -139,6 +139,21 @@ func gsSize(n int64) string {
 	return strconv.FormatInt(n, 10) + units[u]
 }
 
+// gsStackStats is the report a program compiled with GS_STACK_STATS gives on
+// stderr as it ends (gs_stack_stats): its indexed data stacks, the regions
+// of its block, what each reserves, and the budget.
+func gsStackStats(gs *GsStackBlock, stacks, budget int64) {
+	per := gsRegionUsable + gs.gap
+	n := int64(0)
+	if per > 0 {
+		n = budget / per
+	}
+	os.Stderr.WriteString("goose stack stats: main: " + strconv.FormatInt(stacks, 10) + " data stacks, " +
+		strconv.Itoa(len(gs.regions)) + " regions (reserving " + gsSize(gsRegionUsable) + " each); budget " +
+		gsSize(budget) + " for " + strconv.FormatInt(n, 10) + ", main program " +
+		strconv.Itoa(len(gs.regions)) + ", no workers\n")
+}
+
 // gsReserveRegion maps one region: address space only, committed by the OS
 // page by page as the stack grows into it, with the guard gap at its end.
 func gsReserveRegion(reserve, gap int64) ([]byte, int64) {
@@ -1612,6 +1627,114 @@ func GsSpansRegrow(base unsafe.Pointer, n *int64, top *unsafe.Pointer, length, i
 	}
 	f.release(&p, &q, &s, idx, ol)
 	return GsSpansAlloc(base, n, top, length, cnt)
+}
+)GSGO",
+R"GSGO(// ---------------------------------------------------------------------------
+// Variable-size values (§3.6, docs/implementation.md §6.1): a length prefix
+// or a varint is ULEB128, a signed varint value zigzag-encoded on top, as
+// runtime/go/goose_bytes.go has them (keep the two the same).
+
+// GsUlebRead is the ULEB128 at p (GS_ULEB_READ).
+func GsUlebRead(p unsafe.Pointer) int64 {
+	var v uint64
+	for shift := uint(0); ; shift += 7 {
+		b := *(*byte)(p)
+		v |= uint64(b&0x7f) << shift
+		if b < 0x80 {
+			return int64(v)
+		}
+		p = unsafe.Add(p, 1)
+	}
+}
+
+// GsUlebSize is the size in bytes of the ULEB128 at p (GS_ULEB_SIZE).
+func GsUlebSize(p unsafe.Pointer) int64 {
+	n := int64(1)
+	for *(*byte)(unsafe.Add(p, n-1)) >= 0x80 {
+		n++
+	}
+	return n
+}
+
+// GsUlebWrite writes v as a ULEB128 at p, returning its size in bytes,
+// at most 10.
+func GsUlebWrite(p unsafe.Pointer, v uint64) int64 {
+	n := int64(0)
+	for v >= 0x80 {
+		*(*byte)(unsafe.Add(p, n)) = byte(v) | 0x80
+		v >>= 7
+		n++
+	}
+	*(*byte)(unsafe.Add(p, n)) = byte(v)
+	return n + 1
+}
+
+// GsZigRead is the zigzag-encoded varint at p (gs_zig_read).
+func GsZigRead(p unsafe.Pointer) int64 {
+	u := uint64(GsUlebRead(p))
+	return int64(u>>1) ^ -int64(u&1)
+}
+
+// GsZigWrite writes v as a zigzag-encoded varint at p, returning its size
+// in bytes (gs_zig_write).
+func GsZigWrite(p unsafe.Pointer, v int64) int64 {
+	return GsUlebWrite(p, uint64(v)<<1^uint64(v>>63))
+}
+
+// GsLenCheck is the check of a count that goes into a length field: it
+// must fit the field's storage (EmitLenCheck).
+func GsLenCheck(n int64, max uint64) {
+	if uint64(n) > max {
+		GsPanic("array length exceeds storage range")
+	}
+}
+
+// gsUlebCheck reads the ULEB128 at byte q of the n bytes at p, for the
+// verifier (gs_uleb_check): the value and its size in bytes, which is 0
+// where the varint runs past n or past ten bytes, carries payload bits
+// above the 64th, or is not in its shortest form. Nothing past the n bytes
+// is formed into an address.
+func gsUlebCheck(p unsafe.Pointer, q, n int64) (v uint64, k int64) {
+	for shift := uint(0); ; shift += 7 {
+		if q+k >= n {
+			return 0, 0
+		}
+		b := *(*byte)(unsafe.Add(p, q+k))
+		k++
+		if shift > 63 || (shift == 63 && b&0x7e != 0) {
+			return 0, 0
+		}
+		v |= uint64(b&0x7f) << shift
+		if b < 0x80 {
+			if shift != 0 && b == 0 { // A redundant high zero group.
+				return 0, 0
+			}
+			return v, k
+		}
+	}
+}
+
+// gsZigCheck is gsUlebCheck for a zigzag-encoded varint (gs_zig_check).
+func gsZigCheck(p unsafe.Pointer, q, n int64) (int64, int64) {
+	u, k := gsUlebCheck(p, q, n)
+	return int64(u>>1) ^ -int64(u&1), k
+}
+
+// The verifier's element starts, one bit per image byte (GS_BM_SET,
+// GS_BM_GET), in scratch on a data stack.
+func gsBmSet(bm unsafe.Pointer, i int64) {
+	*(*byte)(unsafe.Add(bm, i>>3)) |= 1 << (i & 7)
+}
+
+func gsBmGet(bm unsafe.Pointer, i int64) bool {
+	return *(*byte)(unsafe.Add(bm, i>>3))>>(i&7)&1 != 0
+}
+
+// gsIsLE says whether the host is little-endian, which serialization needs
+// (gs_is_le).
+func gsIsLE() bool {
+	x := uint16(1)
+	return *(*byte)(unsafe.Pointer(&x)) == 1
 }
 )GSGO",
 };

@@ -85,6 +85,7 @@ struct GoOptions {
     string package = "main";   // --go-package.
     bool library = false;      // A package without func main (--library).
     bool debug = false;        // --debug, or -DGS_DEBUG=1.
+    bool stackstats = false;   // -DGS_STACK_STATS=1: report the stacks taken as main ends.
     CodeGen::StackConfig stacks { 0, 0, 0, 0 };   // As main.cpp's StackConfigOf reads them.
 };
 
@@ -99,6 +100,7 @@ struct CodeGenGo {
     string tdecls;      // The named types of fixed-size values.
     string gdecls;      // Package-level globals.
     string eqcode;      // Equality functions.
+    string bcode;       // Size walkers and verifiers of bytes values.
     string code;        // Functions, gsInitGlobals and main.
 
     // The line of the node being generated, which a message about code with
@@ -188,6 +190,7 @@ struct CodeGenGo {
     bool SameMangle(TypeExpr *a, TypeExpr *b);
     string RawMangle(TypeExpr *t);
     static bool NamedGoT(TypeExpr *t);
+    set<string> repchecked;   // The nominal types CheckRepresentable has seen.
     void CheckRepresentable(TypeExpr *t, Line ln);
     string GoT(TypeExpr *t, Line ln);
     static const char *RelGoT(TypeExpr *rt);
@@ -254,7 +257,7 @@ struct CodeGenGo {
         TypeExpr *elem = nullptr;
         int64_t esize = 0;      // One's size in Go's memory.
         int64_t fixed = -1;     // A fixed array's length.
-        int64_t cap = -1;       // A limited array's capacity.
+        string cap;             // A limited array's capacity, an int64.
     };
     string EqX(TypeExpr *t, const GoLoc &a, const GoLoc &b, Line ln);
     string EqFn(TypeExpr *t, Line ln);
@@ -280,6 +283,7 @@ struct CodeGenGo {
     GoLoc GenLoc(Node *n);
     string LoadLoc(GoLoc l, TypeExpr *et, Line ln);
     string AdaptToEnum(const GoLoc &l, TypeExpr *et, Line ln);
+    string AdaptBytesToEnum(const GoLoc &l, TypeExpr *et, Line ln);
     string AdaptToLimited(const GoLoc &l, TypeExpr *et, Line ln);
     void CopyIntoLimited(const GoLoc &l, TypeExpr *et, Line ln, const GoLoc &dst);
     string GenRefVal(Node *child, Line ln);
@@ -374,10 +378,12 @@ struct CodeGenGo {
     // NrvoDest: the local's elements are written where the value ends up.
     struct NrvoDest {
         string stk;               // Destination stack expression.
-        string lenlv;             // Receiving count.
+        string lenlv;             // Receiving count; empty for a bytes value.
+        IntStorage ls = IS_U32;   // The prefix's length storage.
+        bool prefix = false;      // Reserve prefix bytes and patch the count.
         bool inlined = false;     // Bound by an InlineBlock, not by DetectNrvo.
         bool fo = false;          // A frame object: lenlv receives the whole object.
-        string hdr;               // The local's header name (DeclStackLocal).
+        string pref, hdr;         // Reserved prefix address, header name (DeclStackLocal).
     };
     unordered_map<const VarDef *, NrvoDest> nrvo;
     // Constructions under way per stack, while their parts are emitted
@@ -402,6 +408,7 @@ struct CodeGenGo {
     GoLoc RzVarLoc(const VarDef *vd, const string &name);
     string RefOfRz(const GoLoc &l, Line ln);
     string GenPrefVal(Node *n);
+    string GenXD(Node *n, TypeExpr *want);
     void EmitValStore(const string &stk, TypeExpr *t, const string &x);
     void EmitCopyElems(const string &stk, TypeExpr *elem, const string &src, const string &n);
     struct SrcElems {
@@ -451,6 +458,58 @@ struct CodeGenGo {
     void EmitSliceExtend(const GoLoc &l, const string &end, int64_t esz);
     void EmitDefaultElems(const GoView &v, const string &first, const string &count, Node *init);
     vector<string> EmitSlicePool(Call *c, vector<Node *> &an, Line ln);
+
+    // ------------------------------------------------------------------
+    // Variable-size values (codegen_go_bytes.h): bytes images on data
+    // stacks, their sizes and fields, their construction, their equality,
+    // and serialization.
+
+    unordered_map<string, string> sizefns, verifyfns;
+    int64_t ImgSize(TypeExpr *t);
+    string SizeX(TypeExpr *t, const string &p);
+    string SizeFn(TypeExpr *t);
+    void EmitSizeWalk(string &b, TypeExpr *t, const string &p, const string &q, int &tmp, int in);
+    int64_t PrefixBytes(IntStorage ls);
+    string StrImage(const string &v, IntStorage ls);
+    int64_t MinBytes(TypeExpr *t, bool zero = false);
+    string FieldPtr(const string &base, const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
+                    int fieldidx);
+    GoLoc BytesLoc(const string &p, TypeExpr *t, const GoLoc &from);
+    void EmitLenCheck(IntStorage ls, const string &n);
+    void EmitLenStore(const string &stk, IntStorage ls, const string &n);
+    void EmitVarintStore(const string &stk, const string &x);
+    void EmitPrefixPatch(const string &pref, IntStorage ls, const string &stk, const string &count,
+                         const string &elems);
+    void EmitRelStoreStk(const string &stk, TypeExpr *rt, const string &rv, bool nonnull, Line ln);
+    void GenStructLitStk(StructLit *sl, const string &stk, const string &lenlv);
+    void EmitValStoreTag(const string &stk, IntStorage ts, const string &x);
+    void GenFieldInits(StructLit *sl, const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
+                       const string &stk, const string &lenlv, const string &selfbase);
+    void GenVarEnumFromLoc(GoLoc l, TypeExpr *et, const string &stk);
+    void EmitBytesCount(const string &stk, TypeExpr *at, const string &lenlv, const string &n, bool check);
+    string EqFnBytes(TypeExpr *t, Line ln);
+    void EmitEqWalk(string &b, TypeExpr *t, int &tmp, int in, Line ln);
+    bool HasRelRefAny(TypeExpr *t);
+    bool NeedsVerifyWalk(TypeExpr *t);
+    string VerifyFn(TypeExpr *elem);
+    void EmitVerifyLink(string &b, TypeExpr *rt, TypeExpr *elem, const string &q, const string &off,
+                        int &tmp, int in);
+    void EmitVerifyFields(string &b, const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
+                          const Layout *lo, int64_t total, TypeExpr *elem, const string &q, bool links,
+                          int &tmp, int in);
+    void EmitVerifyWalk(string &b, TypeExpr *t, TypeExpr *elem, const string &q, bool links, int &tmp,
+                        int in);
+    void PayloadOf(Node *n, string &src, string &sz);
+    struct RzDest {
+        string stk, lenlv, hdr, pref, elems;
+        IntStorage ls = IS_U32;
+    };
+    RzDest OpenRzDest(TypeExpr *t, const GoDst &d0, Line ln, const char *what);
+    void CloseRzDest(RzDest &rd, const string &count);
+    void EmitLeCheck(Line ln);
+    vector<string> EmitBytesOf(Call *c, vector<Node *> &an, Line ln);
+    vector<string> EmitToBytes(vector<Node *> &an, const GoDst &d0, Line ln);
+    vector<string> EmitFromBytes(Call *c, vector<Node *> &an, const GoDst &d0, Line ln);
 
     // ------------------------------------------------------------------
     // Per-specialization interface. A function's Go parameters are the data
@@ -509,7 +568,35 @@ struct CodeGenGo {
     FnSpec *curspec = nullptr;
     SpecInfo *curinfo = nullptr;
     string body;
-    int ind = 1;
+    // The indentation of the lines being emitted, one tab per Go block: a
+    // block closing (the indentation dropping) takes the locals declared in
+    // it out of the scopes that noted them (NoteLocal), so that no exit
+    // outside it names them.
+    struct Indent {
+        CodeGenGo *cg = nullptr;
+        int v = 1;
+        operator int() const { return v; }
+        Indent &operator=(int x) {
+            v = x;
+            return *this;
+        }
+        Indent &operator++() {
+            v++;
+            return *this;
+        }
+        int operator++(int) { return v++; }
+        Indent &operator--() {
+            v--;
+            cg->DropLocals(v);
+            return *this;
+        }
+        int operator--(int) {
+            auto o = v--;
+            cg->DropLocals(v);
+            return o;
+        }
+    };
+    Indent ind;
     int tmpn = 0;
     int stknext = 0, stkmax = 0;
     string spexpr;                      // "gs_sp" in a function, "0" in gsInitGlobals.
@@ -551,9 +638,10 @@ struct CodeGenGo {
         // an exit runs them among the restores, latest first (EmitRestores).
         vector<pair<string, string>> saves;
         vector<pair<size_t, Defer *>> defers;
-        // The Go locals declared in this scope's Go block: every exit keeps
-        // those whose address the function takes alive up to it (KEEPMARK).
-        vector<string> locals;
+        // The Go locals declared in this scope, each with the indentation of
+        // its Go block: every exit keeps those whose address the function
+        // takes alive up to it (KEEPMARK).
+        vector<pair<string, int>> locals;
         SFunction *ibsf = nullptr;      // SC_IB: which returns exit here.
         // SC_LOOP, SC_BLOCK, SC_IB: the Go label a break, continue or
         // return names, written in front of the statement once one does
@@ -629,9 +717,13 @@ struct CodeGenGo {
         for (auto i = (int)scopes.size() - 1; i >= 0; i--) {
             if (scopes[i].kind == SC_STMT) continue;
             auto &ls = scopes[i].locals;
-            if (ls.empty() || ls.back() != name) ls.push_back(name);
+            if (ls.empty() || ls.back().first != name) ls.push_back({ name, (int)ind });
             return;
         }
+    }
+    void DropLocals(int depth) {
+        for (auto &s : scopes)
+            while (!s.locals.empty() && s.locals.back().second > depth) s.locals.pop_back();
     }
     // Declares a local of Go type gt, with an initial value where init is
     // not empty.
@@ -740,6 +832,17 @@ struct CodeGenGo {
     string StackArgs(FnSpec *sp, Line ln);
     string SpecCallX(Call *c, FnSpec *sp);
     vector<string> EmitSpecCall(Call *c, FnSpec *sp, const GoDst &d0, vector<GoDst> *alldst);
+    bool NeedsReprefix(const GoDst &d, TypeExpr *rt);
+    void EmitSlidePrefix(const string &base, IntStorage ls, const string &stk, const string &lenlv);
+    void EmitReprefix(FnSpec *sp, const GoDst &dd, const string &base, const string &cnt);
+    // The element-run twins of the specializations (C.3, CodeGen::EnsureEr):
+    // the same body, emitting a variable-array result's raw elements at the
+    // destination and its count, which the twin returns. "" where a
+    // specialization has none.
+    bool emiter = false;
+    unordered_map<FnSpec *, string> ernames;
+    vector<FnSpec *> erqueue;
+    string EnsureEr(FnSpec *sp);
     vector<string> GenCallVals(Call *c, const GoDst &d0, vector<GoDst> *alldst = nullptr);
     string CallVal0(Call *c, const string &r0, TypeExpr *want);
     GoLoc CallResLoc(Call *c, const string &r0);
@@ -747,7 +850,7 @@ struct CodeGenGo {
     string GenCall(Call *c);
     void GenCallAny(Call *c, const GoDst &d);
     void GenCallInto(Call *c, const vector<VarDef *> &defs);
-    void GenFvCall(Call *c, const GoDst &d);
+    string GenFvCall(Call *c, const GoDst &d0);
     void GenBuiltin(Call *c, const GoDst &d);
     void EmitPrint(Call *c);
     void RenderInto(const string &cur, const string &end, Node *a, Call *c);
@@ -760,7 +863,7 @@ struct CodeGenGo {
     string Signature(FnSpec *sp);
     void ResetFnState();
     string FinishBody(const string &b);
-    void EmitSpec(FnSpec *sp);
+    void EmitSpec(FnSpec *sp, bool er = false);
     // Globals initialized at their declaration, which gsInitGlobals skips,
     // and those the program can tell are there (FindUsedGlobals).
     set<const VarDef *> gstatic;
@@ -779,6 +882,7 @@ struct CodeGenGo {
     string Source(const string &srcname);
 
     CodeGenGo(Ast &_ast, const GoOptions &o) : ast(_ast), opts(o) {
+        ind.cg = this;
         debug = opts.debug;
         maxstacks = opts.stacks.maxstacks;
         CollectSpecs();
@@ -786,6 +890,9 @@ struct CodeGenGo {
         EmitGlobalDecls();
         for (auto sp : livespecs) EmitSpec(sp);
         EmitGlobalInit();
+        // The element-run twins last: the globals' initializers can ask for
+        // one too, and a twin for another.
+        for (size_t i = 0; i < erqueue.size(); i++) EmitSpec(erqueue[i], true);
         EmitProgram();
         EmitRenderFns();
         EmitTypeDecls();

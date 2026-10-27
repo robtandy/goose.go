@@ -47,6 +47,7 @@
 #include "codegen_go_stmts.h"
 #include "codegen_go_calls.h"
 #include "codegen_go_rz.h"
+#include "codegen_go_bytes.h"
 #include "codegen_go_emit.h"
 #include "runtime_inline.h"
 #include "process.h"
@@ -1778,10 +1779,11 @@ int Main(int argc, char **argv) {
             go.debug = debug;
             for (auto &d : cdefines) {
                 auto eq = d.find('=');
-                if (d.substr(0, eq) != "GS_DEBUG") continue;
+                auto name = d.substr(0, eq);
+                if (name != "GS_DEBUG" && name != "GS_STACK_STATS") continue;
                 uint64_t v = 1;
                 if (eq != string::npos) ParseConfigValue(d.substr(eq + 1), v);
-                go.debug = v != 0;
+                (name == "GS_DEBUG" ? go.debug : go.stackstats) = v != 0;
             }
             go.stacks = stackcfg;
             CodeGenGo cg(ast, go);

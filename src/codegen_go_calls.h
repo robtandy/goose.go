@@ -132,9 +132,47 @@ inline vector<string> CodeGenGo::EmitSpecCall(Call *c, FnSpec *sp, const GoDst &
     // Where each result the Go call returns goes: a resizable result's count
     // to its receiver (counts[i]), a fixed one to a temporary.
     vector<string> counts(sp->rets.size());
+    // A variable-array result taken as an element run, through the callee's
+    // element-run twin (ername), or in its own layout with its prefix slid
+    // out afterwards (slide); or landing in a slot of another length storage,
+    // its prefix replaced after the call (reprefix).
+    string ername, slidebase, reprefixbase, reprefixcnt;
+    GoDst slide, reprefix;
     for (size_t i = 0; i < sp->rets.size(); i++) {
         auto rt = sp->rets[i];
         GoDst dd = alldst && i < alldst->size() ? (*alldst)[i] : (i == 0 ? d0 : GoDst {});
+        if (i == 0 && dd.k == GD_STACK && !dd.lenlv.empty() && rt->kind == TY_ARRAY &&
+            rt->arr->akind == A_VAR) {
+            auto er = EnsureEr(sp);
+            if (!er.empty()) {
+                ername = er;
+                counts[i] = dd.lenlv;
+            } else {
+                slide = dd;
+                slidebase = T();
+                Decl(slidebase, "unsafe.Pointer", Top(dd.s));
+            }
+            args.push_back(dd.s);
+            continue;
+        }
+        if (i == 0 && NeedsReprefix(dd, rt)) {
+            reprefix = dd;
+            reprefixbase = T();
+            Decl(reprefixbase, "unsafe.Pointer", Top(dd.s));
+            auto er = EnsureEr(sp);
+            if (!er.empty()) {
+                // The run lands behind the destination's prefix: its bytes
+                // claimed now, the count patched in afterwards.
+                ername = er;
+                reprefixcnt = T();
+                Decl(reprefixcnt, "int64", "0");
+                counts[i] = reprefixcnt;
+                Bump(dd.s, cat(PrefixBytes(LenStore(dd.t->arr))));
+            }
+            args.push_back(dd.s);
+            retex[i] = reprefixbase;
+            continue;
+        }
         if (IsResz(rt)) {
             string stk;
             if (dd.k == GD_STACK && !dd.lenlv.empty()) {
@@ -160,22 +198,95 @@ inline vector<string> CodeGenGo::EmitSpecCall(Call *c, FnSpec *sp, const GoDst &
     }
     auto list = StackArgs(sp, c->line);
     for (auto &a : args) Append(list, list.empty() ? "" : ", ", a);
-    auto call = cat(ki.name, "(", list, ")");
+    auto call = cat(ername.empty() ? ki.name : ername, "(", list, ")");
     string names, marks;
     vector<pair<string, string>> assigns;
     for (size_t i = 0; i < sp->rets.size(); i++) {
         auto rt = sp->rets[i];
-        if (IsBytesT(rt) && !IsResz(rt)) continue;
+        // The twin returns its run's count.
+        auto run = i == 0 && !ername.empty();
+        if (IsBytesT(rt) && !IsResz(rt) && !run) continue;
         auto t = T();
         Append(names, names.empty() ? "" : ", ", t);
         Append(marks, marks.empty() ? "" : ",", t);
-        if (IsResz(rt)) assigns.push_back({ counts[i], t });
+        if (IsResz(rt) || run) assigns.push_back({ counts[i], t });
         else retex[i] = t;
     }
     if (names.empty()) L(call);
     else L(names, " := ", call, DECLMARK, marks);
     for (auto &[lv, t] : assigns) L(lv, " = ", t);
+    if (!reprefixbase.empty()) EmitReprefix(sp, reprefix, reprefixbase, reprefixcnt);
+    // The value form arrived as [len][elems]: its prefix slid out, the count
+    // reported.
+    if (!slidebase.empty()) EmitSlidePrefix(slidebase, LenStore(sp->rets[0]->arr), slide.s, slide.lenlv);
     return retex;
+}
+
+// Whether a variable-array result of type rt reaches d as a value slot of a
+// T[] of another length storage, whose layout the callee cannot write
+// (CodeGen::NeedsReprefix).
+inline bool CodeGenGo::NeedsReprefix(const GoDst &d, TypeExpr *rt) {
+    return d.k == GD_STACK && d.lenlv.empty() && d.t && d.t->kind == TY_ARRAY && d.t->arr->akind == A_VAR &&
+           rt->kind == TY_ARRAY && rt->arr->akind == A_VAR && LenStore(d.t->arr) != LenStore(rt->arr);
+}
+
+// A variable array that arrived at `base` in value form ([len][elems]) where
+// the receiver wanted an element run: the count to lenlv, the elements slid
+// down over the prefix, whose bytes the stack's top gives back
+// (CodeGen::EmitSlidePrefix).
+inline void CodeGenGo::EmitSlidePrefix(const string &base, IntStorage ls, const string &stk,
+                                       const string &lenlv) {
+    auto ms = T();
+    if (ls == IS_VARINT) {
+        Decl(ms, "int64", cat("GsUlebSize(", base, ")"));
+        L(lenlv, " = GsUlebRead(", base, ")");
+    } else {
+        Decl(ms, "int64", cat(IntSize(ls)));
+        L(lenlv, " = int64(*(*", IntGoT(ls), ")(", base, "))");
+    }
+    auto n = T();
+    Decl(n, "int64", cat("int64(uintptr(", Top(stk), ") - uintptr(", base, ")) - ", ms));
+    L("copy(unsafe.Slice((*byte)(", base, "), ", n, "), unsafe.Slice((*byte)(unsafe.Add(", base, ", ", ms,
+      ")), ", n, "))");
+    Bump(stk, cat("-", ms));
+}
+
+// The elements of a variable-array call result at `base` -- a run behind
+// prefix bytes reserved before the call, its count in cnt, or, where cnt is
+// empty, behind the callee's own prefix -- given the destination's prefix
+// (CodeGen::EmitReprefix).
+inline void CodeGenGo::EmitReprefix(FnSpec *sp, const GoDst &dd, const string &base, const string &cnt) {
+    auto ls = LenStore(dd.t->arr);
+    if (!cnt.empty()) {
+        EmitPrefixPatch(base, ls, dd.s, cnt, AddOff(base, PrefixBytes(ls)));
+        return;
+    }
+    auto srcls = LenStore(sp->rets[0]->arr);
+    auto count = T(), oms = T();
+    if (srcls == IS_VARINT) {
+        Decl(count, "int64", cat("GsUlebRead(", base, ")"));
+        Decl(oms, "int64", cat("GsUlebSize(", base, ")"));
+    } else {
+        Decl(count, "int64", cat("int64(*(*", IntGoT(srcls), ")(", base, "))"));
+        Decl(oms, "int64", cat(IntSize(srcls)));
+    }
+    EmitLenCheck(ls, count);
+    auto ms = T();
+    string pfx;
+    if (ls == IS_VARINT) {
+        pfx = T();
+        Decl(pfx, "[10]byte");
+        Decl(ms, "int64", cat("GsUlebWrite(unsafe.Pointer(&", pfx, "), uint64(", count, "))"));
+    } else {
+        Decl(ms, "int64", cat(IntSize(ls)));
+    }
+    auto n = T();
+    Decl(n, "int64", cat("int64(uintptr(", Top(dd.s), ") - uintptr(", base, ")) - ", oms));
+    L("copy(unsafe.Slice((*byte)(unsafe.Add(", base, ", ", ms, ")), ", n, "), unsafe.Slice((*byte)(unsafe.Add(",
+      base, ", ", oms, ")), ", n, "))");
+    if (ls == IS_VARINT) L("copy(unsafe.Slice((*byte)(", base, "), ", ms, "), ", pfx, "[:", ms, "])");
+    else L("*(*", IntGoT(ls), ")(", base, ") = ", IntGoT(ls), "(", count, ")");
+    Bump(dd.s, cat(ms, " - ", oms));
 }
 
 // A call's results as EmitSpecCall gives them, whatever is called: a
@@ -184,16 +295,9 @@ inline vector<string> CodeGenGo::EmitSpecCall(Call *c, FnSpec *sp, const GoDst &
 inline vector<string> CodeGenGo::GenCallVals(Call *c, const GoDst &d0, vector<GoDst> *alldst) {
     if (c->builtin >= 0) return GenRzBuiltin(c, d0);
     if (c->fvbody) {
-        auto et = c->fvbody->exprtype;
-        if (d0.k == GD_STACK || IsVoidT(et)) {
-            GenFvCall(c, d0);
-            return { "" };
-        }
-        if (IsResz(et)) return { GenRzTmp(c).hdr };
-        auto t = T();
-        Decl(t, LocalT(c->exprtype, c->line));
-        GenFvCall(c, GoDst { GD_LVALUE, t, c->exprtype });
-        return { t };
+        auto rv = GenFvCall(c, d0);
+        if (rv.empty()) return {};
+        return { rv };
     }
     if (!c->dispatch.empty()) {
         for (auto rt : c->dispatch[0]->rets)
@@ -231,6 +335,11 @@ inline string CodeGenGo::CallVal0(Call *c, const string &r0, TypeExpr *want) {
     if (c->builtin >= 0 || c->fvbody || !c->dispatch.empty()) rt = c->exprtype;
     auto et = want ? want : c->exprtype;
     if (!rt || !et) return r0;
+    // A result that is not fixed-size (or the one a reference result points
+    // at) read as a fixed type -- a slice of it, a static-capacity limited
+    // array -- from where the call left it.
+    auto st = IsPlainRef(rt) ? rt->ref->sub : rt;
+    if (IsBytesT(st) && IsFix(et) && et->kind != TY_REF) return LoadLoc(CallResLoc(c, r0), et, c->line);
     if (IsBytesT(rt) || (rt->kind == TY_REF && rt->ref->lenstorage < 0 && IsBytesT(rt->ref->sub)))
         return r0;
     return CoerceVal(r0, rt, et, c->line);
@@ -379,7 +488,9 @@ inline string CodeGenGo::GenCall(Call *c) {
     if (sp->rets.empty()) Fail(c->line, "internal: a call without results as a value");
     if (!PlainSig(sp)) {
         auto rets = EmitSpecCall(c, sp, GoDst {}, nullptr);
-        if (IsBytesT(sp->rets[0])) Fail(c->line, "internal: a non-fixed result as a Go value");
+        // A non-fixed result is read as the fixed type its receiver takes
+        // (a slice of it, a limited array), from where the call built it.
+        if (IsBytesT(sp->rets[0])) return LoadLoc(CallResLoc(c, rets[0]), c->exprtype, c->line);
         return CallVal0(c, rets[0], c->exprtype);
     }
     auto call = SpecCallX(c, sp);
@@ -422,7 +533,7 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
     if (sp->sf->isextern) Unsupported(c->line, "a call to an extern fn");
     if (!PlainSig(sp)) {
         auto rets = EmitSpecCall(c, sp, d, nullptr);
-        if (d.k == GD_DISCARD || rets.empty() || IsBytesT(sp->rets[0]) || Unreached()) return;
+        if (d.k == GD_DISCARD || rets.empty() || Unreached()) return;
         auto want = d.t ? d.t : c->exprtype;
         if (d.pool) {
             L(d.s, " = ", rets[0]);
@@ -473,7 +584,7 @@ inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
                  Coerce(res[i], rets[i], defs[i]->type, c->line));
         return;
     }
-    if (c->fvbody || !c->spec || (c->builtin >= 0 && c->builtin != B_FROM_BYTES))
+    if (c->fvbody || (c->builtin < 0 && !c->spec) || (c->builtin >= 0 && c->builtin != B_FROM_BYTES))
         Unsupported(c->line, "a multiple binding from this call");
     auto sp = c->spec;
     if (c->builtin >= 0 || !PlainSig(sp)) {
@@ -525,24 +636,78 @@ inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
 
 // Calling a function value: the checked body instance is spliced inline
 // (§7.6), its parameters ordinary locals of this function.
-inline void CodeGenGo::GenFvCall(Call *c, const GoDst &d) {
+// Calling a function value: the checked body instance spliced inline
+// (§7.6), its parameters ordinary locals of this function
+// (CodeGen::EmitFvCall). The call was checked against its destination and
+// the body's value without one, so the two can be different array or slice
+// types: an array where a slice is expected (§3.10), any array or slice
+// constructing an array of another kind (§4.2). The body then builds its
+// value as its own type in a temporary, which is sliced whole or copied as
+// the type the destination names, the call's where it names none: the
+// call's value is a copy (§4.1), so a slice of it never points into a
+// variable the body names. The value, or "" where it was built at a stack
+// destination (or there is none).
+inline string CodeGenGo::GenFvCall(Call *c, const GoDst &d0) {
     auto et = c->fvbody->exprtype;
-    auto wantsval = !IsVoidT(et) && d.k != GD_DISCARD;
-    if (Unreached()) return GenUnreached([&] { GenFvCall(c, d); });
+    auto wantsval = !IsVoidT(et);
+    if (Unreached()) {
+        string r;
+        GenUnreached([&] { r = GenFvCall(c, d0); });
+        return r;
+    }
+    auto want = d0.t ? d0.t : c->exprtype;
+    auto adapt = wantsval && (want->kind == TY_ARRAY || want->kind == TY_SLICE) && !TEq(want, et) &&
+                 (IsFix(want) || d0.k == GD_STACK);
+    string rv, stk;
+    GoDst d = d0;
+    if (wantsval && !IsBytesT(et) && (adapt || d0.k != GD_LVALUE)) {
+        rv = T();
+        Decl(rv, LocalT(et, c->line));
+        d = GoDst { GD_LVALUE, rv, et };
+    } else if (wantsval && IsResz(et) && (adapt || d0.k != GD_STACK)) {
+        rv = RzTemp(et, stk);
+        d = GoDst { GD_STACK, stk, et, RzLenLv(et, rv) };
+    } else if (wantsval && IsBytesT(et) && (adapt || d0.k != GD_STACK)) {
+        rv = BytesTemp(stk);
+        d = GoDst { GD_STACK, stk, et };
+    } else if (wantsval && d0.k == GD_LVALUE) {
+        rv = d0.s;
+    }
     PushSc(SC_PLAIN);
     L("{");
     ind++;
     for (size_t i = 0; i < c->fvparams.size(); i++)
         BindLocal(c->fvparams[i], i < c->args.size() ? c->args[i] : nullptr);
     for (auto st : c->fvbody->stmts) GenStmt(st);
-    if (c->fvbody->tail) {
-        if (wantsval && d.k == GD_STACK) GenConstruct(c->fvbody->tail, d.s, d.t ? d.t : c->exprtype, d.lenlv);
-        else if (wantsval) GenAny(c->fvbody->tail, GoDst { GD_LVALUE, d.s, d.t ? d.t : c->exprtype });
-        else GenAny(c->fvbody->tail, GoDst {});
+    if (auto tail = c->fvbody->tail) {
+        if (!wantsval) GenAny(tail, GoDst {});
+        else if (d.k == GD_STACK) GenConstruct(tail, d.s, d.t ? d.t : c->exprtype, d.lenlv);
+        else GenAny(tail, GoDst { GD_LVALUE, d.s, d.t ? d.t : c->exprtype });
     }
     PopSc();
     ind--;
     LS("}");
+    if (!wantsval || Unreached()) return "";
+    if (adapt) {
+        GoLoc lv;
+        if (IsResz(et)) lv = RzTempLoc(et, rv, stk);
+        else if (IsBytesT(et)) lv = BytesLoc(rv, et, GoLoc {});
+        else lv = AtVar(rv, et);
+        if (d0.k == GD_STACK) {
+            if (IsFix(want)) EmitValStore(d0.s, want, LoadLoc(lv, want, c->line));
+            else ConstructFromLoc(lv, want, d0.s, d0.lenlv, c->line);
+            return "";
+        }
+        rv = LoadLoc(lv, want, c->line);
+        if (d0.k == GD_LVALUE) {
+            L(d0.s, " = ", rv);
+            rv = d0.s;
+        }
+    }
+    // A value built on the stack destination is complete there, as the
+    // type the destination names: nothing is left for the construction
+    // around the call to store (ConstructCall).
+    return rv;
 }
 
 // ------------------------------------------------------------------
@@ -627,6 +792,25 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
                 return;
             }
             auto rt = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
+            if (IsBytesT(rt)) {
+                // A value held where it lies, read as the fixed slot's type
+                // (the C backend's LoadLoc at the call's type); a slice
+                // destination views a copy built on a temporary, not the
+                // source.
+                GoLoc l;
+                if (want && want->kind == TY_SLICE) {
+                    auto save = c->exprtype;
+                    c->exprtype = rt;
+                    l = GenLoc(c);
+                    c->exprtype = save;
+                } else {
+                    l = GenLoc(an[0]);
+                }
+                auto x = LoadLoc(l, want, ln);
+                if (d.k == GD_DISCARD || Unreached()) return;
+                if (x != d.s) L(d.s, " = ", x);
+                return;
+            }
             auto x = LoadLoc(GenLoc(an[0]), rt, ln);
             if (want && want->kind == TY_SLICE && rt->kind != TY_SLICE) {
                 // A slice destination views the copy, not its source.
@@ -649,6 +833,24 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             if (d.k == GD_DISCARD || res.empty() || Unreached()) return;
             auto want = d.t ? d.t : c->exprtype;
             auto x = LoadLoc(RzTempLoc(GrowU8(), res[0], ""), want, ln);
+            if (x != d.s) L(d.s, " = ", x);
+            return;
+        }
+        case B_TO_BYTES: {
+            // Appending to a builder, or a fresh image read as the slot's
+            // type (a slice, say): built on a temporary of its own.
+            auto res = EmitToBytes(an, GoDst {}, ln);
+            if (d.k == GD_DISCARD || res.empty() || Unreached()) return;
+            auto want = d.t ? d.t : c->exprtype;
+            auto x = LoadLoc(RzTempLoc(GrowU8(), res[0], ""), want, ln);
+            if (x != d.s) L(d.s, " = ", x);
+            return;
+        }
+        case B_BYTES_OF: {
+            auto res = EmitBytesOf(c, an, ln);
+            if (d.k == GD_DISCARD || Unreached()) return;
+            auto want = d.t ? d.t : c->exprtype;
+            auto x = CoerceVal(res[0], c->rettypes[0], want, ln);
             if (x != d.s) L(d.s, " = ", x);
             return;
         }

@@ -75,7 +75,17 @@ inline GoDst CodeGenGo::DeclStackLocal(VarDef *d, bool forlocal) {
     if (nit != nrvo.end()) {
         auto &nd = nit->second;
         stk = nd.stk;
-        if (resz) nd.hdr = name;
+        if (resz) {
+            // The receiving prefix goes in front of the elements, its bytes
+            // claimed before the first one lands; a varint's one byte is
+            // widened at the return where the count needs more.
+            if (nd.prefix) {
+                nd.pref = T();
+                Decl(nd.pref, "unsafe.Pointer", Top(stk));
+                Bump(stk, cat(PrefixBytes(nd.ls)));
+            }
+            nd.hdr = name;
+        }
         // A return of another value finds it in front (ExitStart).
         if (!nd.inlined) openat[stk]++;
     } else {
@@ -263,6 +273,24 @@ inline string CodeGenGo::GenPrefVal(Node *n) {
     Fail(n->line, "cannot form a reusable pool reference from this expression");
 }
 
+// n's value as the fixed-size type `want` (CodeGen::GenXD): one held where
+// it lies -- a resizable or bytes value, an array or slice of another
+// representation than a static-capacity limited destination's -- read from
+// there as `want`, any other converted from its Go value.
+inline string CodeGenGo::GenXD(Node *n, TypeExpr *want) {
+    auto nt = n->exprtype;
+    auto st = nt && nt->kind == TY_REF ? nt->ref->sub : nt;
+    auto where = st && want && IsBytesT(st) && !(nt->kind == TY_REF && want->kind == TY_REF);
+    auto adapt = st && want && IsStaticLimited(want) && (st->kind == TY_ARRAY || st->kind == TY_SLICE) &&
+                 !TEq(st, want) && !fillvalues.count(n);
+    if (where || adapt) {
+        auto l = GenLoc(n);
+        while (l.t->kind == TY_REF && want->kind != TY_REF) DerefLoc(l);
+        return LoadLoc(l, want, n->line);
+    }
+    return CoerceVal(GenX(n), nt, want, n->line);
+}
+
 // ------------------------------------------------------------------
 // Construction (§4.2, §4.3): a value written front to back at a stack's
 // top, which it bumps.
@@ -282,7 +310,21 @@ inline void CodeGenGo::EmitValStore(const string &stk, TypeExpr *t, const string
 // element where they hold pointers, which the collector must see written.
 inline void CodeGenGo::EmitCopyElems(const string &stk, TypeExpr *elem, const string &src,
                                      const string &n) {
-    if (!IsFix(elem)) Unsupported(elem->line, cat("an array of variable-size elements (", TypeText(elem), ")"));
+    if (!IsFix(elem)) {
+        // One element after another, each its own size.
+        auto p = T(), iv = T();
+        Decl(p, "unsafe.Pointer", src);
+        L("for ", iv, " := int64(0); ", iv, " < ", n, "; ", iv, "++ {");
+        ind++;
+        auto sz = T();
+        Decl(sz, "int64", SizeX(elem, p));
+        L("copy(unsafe.Slice((*byte)(", Top(stk), "), ", sz, "), unsafe.Slice((*byte)(", p, "), ", sz, "))");
+        Bump(stk, sz);
+        L(p, " = unsafe.Add(", p, ", ", sz, ")");
+        ind--;
+        LS("}");
+        return;
+    }
     auto &ti = TI(elem, elem->line);
     auto nn = IsGoName(n) || IsGoConst(n) ? n : cat("(", n, ")");
     L("copy(unsafe.Slice((*", ti.name, ")(", Top(stk), "), ", nn, "), unsafe.Slice((*", ti.name,
@@ -300,7 +342,7 @@ inline void CodeGenGo::EmitArrayCount(const string &stk, TypeExpr *at, const str
         L(lenlv, " = ", n);
         return;
     }
-    Unsupported(at->line, cat("a value of type ", TypeText(at)));
+    EmitBytesCount(stk, at, lenlv, n, !IsGoConst(n));
 }
 
 // Element count and elements of an array- or slice-valued source node, for
@@ -348,7 +390,10 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
     if (Unreached()) return GenUnreached([&] { GenConstruct(n, stk, want, lenlv); });
     if (auto it = fillvalues.find(n); it != fillvalues.end()) {
         auto target = want ? want : it->second.t;
-        if (IsBytesT(target)) ConstructFromLoc(it->second, target, stk, lenlv, n->line);
+        if (IsRelRef(target)) EmitRelStoreStk(stk, target, LoadLoc(it->second, it->second.t, n->line),
+                                              NonNullRef(n), n->line);
+        else if (IsVarintT(target)) EmitVarintStore(stk, LoadLoc(it->second, ast.inttypes[IS_I64], n->line));
+        else if (IsBytesT(target)) ConstructFromLoc(it->second, target, stk, lenlv, n->line);
         else EmitValStore(stk, target, LoadLoc(it->second, target, n->line));
         return;
     }
@@ -360,6 +405,15 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
         return;
     }
     auto et = n->exprtype;
+    // A varint slot's value is an i64, like every varint read, whatever
+    // produces it, encoded once it is computed.
+    if (IsVarintT(want ? want : et)) {
+        auto i64 = ast.inttypes[IS_I64];
+        auto x = IsVarintT(et) ? GenX(n) : CoerceVal(GenX(n), et, i64, n->line);
+        if (Unreached()) return;
+        EmitVarintStore(stk, x);
+        return;
+    }
     // An array that is not fixed-size landing in a slot of another such array
     // type takes the slot's layout (§4.2).
     if (want && et && want->kind == TY_ARRAY && IsBytesT(want) && et->kind == TY_ARRAY &&
@@ -372,7 +426,7 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
         // A spliced reference in a decayed slot: the pointee, constructed as
         // the slot's type from where it lies.
         if (IsBytesT(want)) ConstructFromLoc(GenLoc(n), want, stk, lenlv, n->line);
-        else EmitValStore(stk, want, CoerceVal(GenX(n), et, want, n->line));
+        else EmitValStore(stk, want, GenXD(n, want));
         return;
     }
     if (IsCtl(n)) {
@@ -395,7 +449,7 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
     // capacity as the callee's return would, then constructed as the slot's.
     if (want && et && IsFix(et) && (et->kind == TY_ARRAY || et->kind == TY_SLICE) &&
         want->kind == TY_ARRAY && IsBytesT(want)) {
-        auto v = Snapshot(et, CoerceVal(GenX(n), n->exprtype, et, n->line));
+        auto v = Snapshot(et, GenXD(n, et));
         ConstructFromLoc(AtVar(v, et), want, stk, lenlv, n->line);
         return;
     }
@@ -403,8 +457,15 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
         ConstructCall(c, et, stk, want, lenlv);
         return;
     }
-    if (want && IsRelRef(want) && et->kind == TY_REF)
-        Unsupported(n->line, "a relative reference built on a data stack");
+    // A reference landing in a relative-reference slot stores the offset
+    // from that slot (§3.9).
+    if (want && IsRelRef(want) && et->kind == TY_REF) {
+        auto pt = ast.RefTo(want->ref->sub, n->line, want->ref->optional);
+        auto rv = Is<NullLit>(n) ? string("nil") : Snapshot(pt, CoerceVal(GenX(n), et, pt, n->line));
+        if (Unreached()) return;
+        EmitRelStoreStk(stk, want, rv, NonNullRef(n), n->line);
+        return;
+    }
     if (!IsBytesT(et)) {
         if ((Is<StructLit>(n) || Is<ArrayLit>(n)) && HasRelRef(et)) {
             // Built where it stays, so that its offsets are measured from
@@ -416,7 +477,19 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
             LitInto(n, AtAddr(p, et), false);
             return;
         }
-        EmitValStore(stk, et, CoerceVal(GenX(n), n->exprtype, et, n->line));
+        EmitValStore(stk, et, GenXD(n, et));
+        return;
+    }
+    if (Is<NullLit>(n)) {
+        // The zero value of an optional field.
+        if (et->kind == TY_REF && et->ref->lenstorage == IS_VARINT) {
+            L("*(*byte)(", Top(stk), ") = 0");
+            Bump(stk, "1");
+            return;
+        }
+        auto w = FixedSize(et);
+        L("clear(unsafe.Slice((*byte)(", Top(stk), "), ", w, "))");
+        Bump(stk, cat(w));
         return;
     }
     if (auto s = Is<StrLit>(n)) {
@@ -435,11 +508,16 @@ inline void CodeGenGo::GenConstruct(Node *n, const string &stk, TypeExpr *want,
         }
     }
     if (auto sl = Is<StructLit>(n)) {
-        if (et->kind == TY_STRUCT && IsFrameObj(et)) {
-            GenFrameObjLit(sl, stk, lenlv);
-            return;
-        }
-        Unsupported(n->line, cat("a literal of type ", TypeText(et)));
+        GenStructLitStk(sl, stk, lenlv);
+        return;
+    }
+    if (auto d = Is<Dot>(n); d && d->variantconst) {
+        // A payload-less variant constant in variable mode: its tag alone.
+        if (et->kind != TY_ENUM || !et->enu->varmode) Fail(n->line, "internal: a variant constant on a stack");
+        auto ei = EIOf(et);
+        EmitValStoreTag(stk, TagStore(ei->en), cat(ei->en->VariantIndex(d->variantconst)));
+        if (!lenlv.empty()) L(lenlv, " = 0");
+        return;
     }
     if (auto se = Is<SliceExpr>(n); se && et->kind == TY_ARRAY) {
         // A slice expression constructing an array copies the range.
@@ -471,9 +549,38 @@ inline void CodeGenGo::ConstructFromLoc(GoLoc l, TypeExpr *et, const string &stk
             else GenArrayFromLoc(l, et, stk, ln, lenlv);
             return;
         }
+        // A variant without a resizable tail: the ADT's tail stays empty.
+        if (et->kind == TY_ENUM && !IsResz(l.t)) {
+            GenVarEnumFromLoc(l, et, stk);
+            if (!lenlv.empty()) L(lenlv, " = 0");
+            return;
+        }
         Unsupported(ln, cat("constructing a ", TypeText(et), " from a ", TypeText(l.t)));
     }
-    Unsupported(ln, cat("a value of type ", TypeText(et)));
+    if (!lenlv.empty() && et->kind == TY_ARRAY) {
+        // An element-run destination: the elements alone, their count into
+        // lenlv.
+        GenArrayFromLoc(l, et, stk, ln, lenlv);
+        return;
+    }
+    if (TEq(l.t, et)) {
+        // The same layout: the image's bytes.
+        if (l.addr.empty()) Fail(ln, cat("internal: a ", TypeText(et), " with no image"));
+        auto sz = T();
+        Decl(sz, "int64", SizeX(et, l.addr));
+        L("copy(unsafe.Slice((*byte)(", Top(stk), "), ", sz, "), unsafe.Slice((*byte)(", l.addr, "), ", sz, "))");
+        Bump(stk, sz);
+        return;
+    }
+    if (et->kind == TY_ARRAY) {
+        GenArrayFromLoc(l, et, stk, ln, lenlv);
+        return;
+    }
+    if (et->kind == TY_ENUM && et->enu->varmode) {
+        GenVarEnumFromLoc(l, et, stk);
+        return;
+    }
+    Unsupported(ln, cat("constructing a ", TypeText(et), " from a ", TypeText(l.t)));
 }
 
 // A call's first result constructed as et at stk's top (CodeGen::ConstructCall).
@@ -513,6 +620,12 @@ inline void CodeGenGo::ConstructCall(Call *c, TypeExpr *et, const string &stk, T
 inline void CodeGenGo::GenArrayFromLoc(GoLoc l, TypeExpr *et, const string &stk, Line ln,
                                        const string &lenlv) {
     while (l.t->kind == TY_REF) DerefLoc(l);
+    if (IsStaticLimited(et)) {
+        // A static-capacity limited array is a Go value (§4.2): its length
+        // and slots land together.
+        EmitValStore(stk, et, AdaptToLimited(l, et, ln));
+        return;
+    }
     auto v = ArrayView(l, ln);
     auto nn = T();
     Decl(nn, "int64", v.fixed >= 0 ? cat(v.fixed) : v.len);
@@ -583,7 +696,22 @@ inline void CodeGenGo::GenArrayLitAt(ArrayLit *al, const string &stk, const stri
     auto et = as ? as : al->exprtype;
     if (et->kind != TY_ARRAY) Fail(al->line, "internal: an array literal of no array type");
     auto elem = et->arr->sub;
-    if (al->capexpr) Unsupported(al->line, cat("a `[..cap]` literal of type ", TypeText(et)));
+    if (al->capexpr) {
+        // [..cap]: the capacity and a zero length, its slots unwritten.
+        if (et->arr->akind != A_LIMITED) Fail(al->line, "internal: a `[..cap]` literal of another kind");
+        auto i64 = ast.inttypes[IS_I64];
+        auto t = T();
+        Decl(t, "int64", CoerceVal(GenX(al->capexpr), al->capexpr->exprtype, i64, al->line));
+        L("if ", t, " < 0 || ", t, " > math.MaxUint32 {");
+        ind++;
+        L("GsAbort(GsECapRange, ", LocArgs(al->line), ")");
+        ind--;
+        LS("}");
+        L("*(*uint32)(", Top(stk), ") = uint32(", t, ")");
+        L("*(*uint32)(unsafe.Add(", Top(stk), ", 4)) = 0");
+        Bump(stk, cat("8 + ", t, "*", ImgSize(elem)));
+        return;
+    }
     auto count = GoLitCount(al);
     EmitArrayCount(stk, et, lenlv, cat(count));
     if (al->fillval) {
@@ -815,16 +943,14 @@ inline vector<string> CodeGenGo::EmitPush(vector<Node *> &an, Line ln) {
     auto l = RzRecvLoc(an[0]);
     auto v = ArrayView(l, ln);
     auto elem = v.elem;
-    if (!IsFix(elem)) Unsupported(ln, cat("a push of a variable-size element (", TypeText(elem), ")"));
     auto ev = ElemValue(an[1], elem);
     if (Unreached()) return { "nil" };
     auto e = T();
     Decl(e, "unsafe.Pointer", Top(l.stk));
-    auto slot = AtAddr(e, elem);
+    auto slot = IsFix(elem) ? AtAddr(e, elem) : BytesLoc(e, elem, GoLoc {});
     if (IsRelRef(elem)) {
-        if (ev == "nil") L(slot.lv, " = 0");
-        else EmitRelStore(slot, ev, NonNullRef(an[1]), false, ln);
-        Bump(l.stk, cat(v.esize));
+        // The offset from its slot at the top, at its own width.
+        EmitRelStoreStk(l.stk, elem, ev, NonNullRef(an[1]), ln);
     } else if (ev.empty()) {
         GenConstruct(an[1], l.stk, elem);
     } else {
@@ -850,6 +976,22 @@ inline void CodeGenGo::EmitAppend(vector<Node *> &an, Line ln) {
         auto nn = T();
         Decl(nn, "int64", "0");
         GenAny(src, GoDst { GD_STACK, l.stk, st, nn });
+        L(v.lenlv, " += ", nn);
+        return;
+    }
+    if (fresh && st->kind == TY_ARRAY && st->arr->akind == A_LIMITED && ArrSize(st->arr) < 0) {
+        // A runtime-capacity limited result is built on the receiving stack,
+        // its capacity and length header and unused capacity then removed in
+        // place: only its live elements belong to the run.
+        auto base = T(), nn = T(), bytes = T();
+        Decl(base, "unsafe.Pointer", Top(l.stk));
+        GenAny(src, GoDst { GD_STACK, l.stk, st });
+        if (Unreached()) return;
+        Decl(nn, "int64", cat("int64(*(*uint32)(unsafe.Add(", base, ", 4)))"));
+        Decl(bytes, "int64", cat(nn, "*", v.esize));
+        L("copy(unsafe.Slice((*byte)(", base, "), ", bytes, "), unsafe.Slice((*byte)(unsafe.Add(", base, ", 8)), ",
+          bytes, "))");
+        L(Top(l.stk), " = unsafe.Add(", base, ", ", bytes, ")");
         L(v.lenlv, " += ", nn);
         return;
     }
@@ -886,6 +1028,8 @@ inline vector<string> CodeGenGo::GenRzBuiltin(Call *c, const GoDst &d0) {
     auto an = c->ArgNodes();
     switch ((BuiltinKind)c->builtin) {
         case B_STR: return EmitStr(c, an, d0, c->line);
+        case B_TO_BYTES: return EmitToBytes(an, d0, c->line);
+        case B_FROM_BYTES: return EmitFromBytes(c, an, d0, c->line);
         default: break;
     }
     auto t = c->exprtype;
@@ -977,13 +1121,24 @@ inline void CodeGenGo::EmitFormatInto(GoLoc l, Node *a, Line ln, Call *c) {
 // or a temporary on a statement stack where there is no destination of its
 // own (CodeGen::EmitStr).
 inline vector<string> CodeGenGo::EmitStr(Call *c, vector<Node *> &an, const GoDst &d0, Line ln) {
-    string stk = d0.s, lenlv = d0.lenlv, hdr;
+    string stk = d0.s, lenlv = d0.lenlv, hdr, pref;
+    IntStorage ls = IS_U32;
     if (d0.k != GD_STACK) {
         hdr = RzTemp(GrowU8(), stk);
         lenlv = cat(hdr, ".Len");
     } else if (lenlv.empty()) {
-        Unsupported(ln, "str() building a variable-size value");
+        // A value slot (a u8[] element or field): the count goes into a
+        // length prefix reserved in front of the elements, as a named result
+        // lands there (§7.3).
+        if (!d0.t || d0.t->kind != TY_ARRAY || d0.t->arr->akind != A_VAR)
+            Fail(ln, "str() needs a resizable or variable-array destination");
+        ls = LenStore(d0.t->arr);
+        pref = T();
+        Decl(pref, "unsafe.Pointer", Top(stk));
+        Bump(stk, cat(PrefixBytes(ls)));
     }
+    auto elems = T();
+    Decl(elems, "unsafe.Pointer", Top(stk));
     auto cnt = T();
     Decl(cnt, "int64", "0");
     GoLoc b;
@@ -1003,7 +1158,8 @@ inline vector<string> CodeGenGo::EmitStr(Call *c, vector<Node *> &an, const GoDs
         }
         RenderToBuilder(b, a, c);
     }
-    L(lenlv, " = ", cnt);
+    if (!pref.empty()) EmitPrefixPatch(pref, ls, stk, cnt, elems);
+    else L(lenlv, " = ", cnt);
     if (!hdr.empty()) return { hdr };
     return {};
 }
@@ -1028,11 +1184,15 @@ inline void CodeGenGo::DetectNrvo(FnSpec *sp) {
         auto ct = cand->type;
         auto rzarr = IsResz(ct) && ct->kind == TY_ARRAY && rt->kind == TY_ARRAY &&
                      rt->arr->akind == A_VAR && TEq(ct->arr->sub, rt->arr->sub);
-        if (rzarr) Unsupported(sp->sf->line, cat("a resizable local returned as a ", TypeText(rt)));
-        if (!TEq(ct, rt)) continue;
+        if (!TEq(ct, rt) && !rzarr) continue;
         NrvoDest nd;
         nd.stk = cat("gs_dst", j);
-        if (IsResz(rt)) {
+        if (rzarr) {
+            // The returned variable array's prefix is reserved ahead of the
+            // local's elements.
+            nd.prefix = true;
+            nd.ls = LenStore(rt->arr);
+        } else if (IsResz(rt)) {
             nd.lenlv = dstcounts[j];
             nd.fo = IsFrameObj(ct);
         }
@@ -1056,12 +1216,28 @@ inline const VarDef *CodeGenGo::OpenIbNrvo(InlineBlock *ib, const GoDst &d) {
         nrvo[vd] = nd;
         return vd;
     }
-    if (d.lenlv.empty() || !d.t) return nullptr;
-    auto elems = ct->kind == TY_ARRAY && d.t->kind == TY_ARRAY &&
-                 (IsResz(d.t) || d.t->arr->akind == A_VAR) && TEq(ct->arr->sub, d.t->arr->sub);
-    if (!TEq(ct, d.t) && !elems) return nullptr;
-    nd.lenlv = d.lenlv;
-    nd.fo = IsFrameObj(ct);
+    if (!d.lenlv.empty()) {
+        // An element-run or resizable receiver: raw elements plus a count.
+        if (!d.t) return nullptr;
+        auto elems = ct->kind == TY_ARRAY && d.t->kind == TY_ARRAY &&
+                     (IsResz(d.t) || d.t->arr->akind == A_VAR) && TEq(ct->arr->sub, d.t->arr->sub);
+        if (!TEq(ct, d.t) && !elems) return nullptr;
+        nd.lenlv = d.lenlv;
+        nd.fo = IsFrameObj(ct);
+    } else {
+        // A value receiver: the elements need a length prefix in front of
+        // them, in the storage the call itself would have written.
+        auto at = ib->spec->rets[0];
+        if (!at || at->kind != TY_ARRAY || at->arr->akind != A_VAR) return nullptr;
+        if (d.t) {
+            if (d.t->kind != TY_ARRAY || d.t->arr->akind != A_VAR || !TEq(d.t->arr->sub, at->arr->sub))
+                return nullptr;
+            at = d.t;
+        }
+        if (ct->kind != TY_ARRAY || !TEq(ct->arr->sub, at->arr->sub)) return nullptr;
+        nd.prefix = true;
+        nd.ls = LenStore(at->arr);
+    }
     nrvo[vd] = nd;
     return vd;
 }
@@ -1080,9 +1256,16 @@ inline const CodeGenGo::NrvoDest *CodeGenGo::NrvoBoundAt(Node *val, const string
 }
 
 inline void CodeGenGo::EmitNrvoFinish(const NrvoDest &nd) {
-    if (nd.hdr.empty() || nd.lenlv.empty()) return;   // A bytes value is complete.
-    if (nd.fo) L(nd.lenlv, " = ", nd.hdr);
-    else L(nd.lenlv, " = ", nd.hdr, ".Len");
+    if (nd.hdr.empty()) return;   // A bytes value is complete.
+    if (nd.fo) {
+        L(nd.lenlv, " = ", nd.hdr);
+        return;
+    }
+    if (!nd.prefix) {
+        L(nd.lenlv, " = ", nd.hdr, ".Len");
+        return;
+    }
+    EmitPrefixPatch(nd.pref, nd.ls, nd.stk, cat(nd.hdr, ".Len"), cat(nd.hdr, ".Base"));
 }
 
 // Scope si receives exit values at d: what is open on its stack now, and the

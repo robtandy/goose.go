@@ -45,7 +45,7 @@ inline void CodeGenGo::GenUnreached(const function<void()> &gen) {
     auto nscopes = scopes.size();
     auto text = std::move(body);
     body.clear();
-    auto saveind = ind, savenext = stknext;
+    int saveind = ind, savenext = stknext;
     dry++;
     dead = false;
     gen();
@@ -107,7 +107,7 @@ inline void CodeGenGo::EmitRestores(const GoScope &s) {
         for (; di >= 0 && (int)defers[di].first == k; di--) EmitDeferBody(defers[di].second);
         if (k > 0) L(Top(saves[k - 1].first), " = ", saves[k - 1].second);
     }
-    for (auto &n : locals) L(KEEPMARK, n);
+    for (auto &n : locals) L(KEEPMARK, n.first);
 }
 
 // What an exit runs on its way out down to (and including) scope `to`.
@@ -403,13 +403,21 @@ inline void CodeGenGo::GenInlineBlock(InlineBlock *ib, const GoDst &d) {
     // sliced whole (InlineBlock::CgAny).
     auto rt = ib->spec && ib->spec->rets.size() == 1 ? ib->spec->rets[0] : nullptr;
     auto want = d.t ? d.t : ib->exprtype;
-    if (d.k != GD_DISCARD && rt && rt->kind == TY_ARRAY && IsResz(rt) && want &&
+    if (d.k != GD_DISCARD && rt && rt->kind == TY_ARRAY && IsBytesT(rt) && want &&
         want->kind == TY_SLICE) {
         string stk;
-        auto h = RzTemp(rt, stk);
-        EmitIbBody(ib, GoDst { GD_STACK, stk, rt, RzLenLv(rt, h) });
+        GoLoc l;
+        if (IsResz(rt)) {
+            auto h = RzTemp(rt, stk);
+            EmitIbBody(ib, GoDst { GD_STACK, stk, rt, RzLenLv(rt, h) });
+            l = RzTempLoc(rt, h, stk);
+        } else {
+            auto base = BytesTemp(stk);
+            EmitIbBody(ib, GoDst { GD_STACK, stk, rt });
+            l = BytesLoc(base, rt, GoLoc {});
+        }
         if (Unreached()) return;
-        auto x = LoadLoc(RzTempLoc(rt, h, stk), want, ib->line);
+        auto x = LoadLoc(l, want, ib->line);
         if (d.k == GD_LVALUE) L(d.s, " = ", x);
         else EmitValStore(d.s, want, x);
         return;
@@ -717,17 +725,23 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
                 auto named = id && id->vdef ? nrvo.find(id->vdef) : nrvo.end();
                 auto dst = cat("gs_dst", i);
                 auto direct = named != nrvo.end() && !named->second.inlined && named->second.stk == dst;
-                auto lenlv = IsResz(rt) ? dstcounts[i] : string();
+                // A resizable's count, or the element-run twin's run's.
+                auto run = IsResz(rt) || (emiter && i == 0);
+                auto lenlv = run ? dstcounts[i] : string();
                 if (direct) {
                     if (IsResz(rt))
                         L(lenlv, " = ", IsFrameObj(rt) ? VarRef(id->vdef, vals[i]->line)
                                                        : cat(VarRef(id->vdef, vals[i]->line), ".Len"));
+                    // A resizable local's elements sit at the destination
+                    // behind the length prefix reserved for them; the count
+                    // goes in there now.
+                    else if (IsResz(id->vdef->type)) EmitNrvoFinish(named->second);
                 } else {
                     auto start = ExitStart(vals[i], dst, lenlv, 0);
                     GenConstruct(vals[i], dst, rt, lenlv);
                     if (!start.empty()) LandValue(dst, DstTop0(i), start, rt, lenlv);
                 }
-                if (IsResz(rt)) rv.push_back(lenlv);
+                if (run) rv.push_back(lenlv);
                 continue;
             }
             auto later = false;
