@@ -272,11 +272,15 @@ inline void CodeGenGo::GenIf(IfExpr *fi, const GoDst &d) {
 // scrutinee's type, whose constants carry that type's value bits.
 inline void CodeGenGo::GenMatch(MatchExpr *m, const GoDst &d) {
     auto st = m->scrutinee->exprtype;
-    if (!st || st->kind != TY_INT) {
-        if (st && (st->kind == TY_ENUM || (st->kind == TY_REF && st->ref->sub->kind == TY_ENUM)))
-            Unsupported(m->line, "a match over an enum");
-        Unsupported(m->line, cat("a match over ", TypeText(st)));
+    if (st && st->kind == TY_REF && st->ref->sub->kind == TY_ENUM) {
+        GoT(st, m->line);
+        return GenEnumMatch(m, st->ref->sub, true, d);
     }
+    if (st && st->kind == TY_ENUM) {
+        GoT(st, m->line);
+        return GenEnumMatch(m, st, false, d);
+    }
+    if (!st || st->kind != TY_INT) Unsupported(m->line, cat("a match over ", TypeText(st)));
     GoT(st, m->line);
     auto x = GenPure(m->scrutinee);
     if (Unreached()) return GenUnreached([&] { GenMatch(m, d); });
@@ -377,9 +381,8 @@ inline void CodeGenGo::GenWhile(While *w) {
     OpenLabeled(SC_LOOP);
     auto si = (int)scopes.size() - 1;
     // A condition that runs statements is tested at the top of the body.
-    auto incond = !HasStmts(w->cond);
     string c;
-    if (incond) c = GenTruth(w->cond);
+    auto incond = !HasStmts(w->cond) && TryPure([&] { return GenTruth(w->cond); }, c);
     if (Unreached()) {   // Not without statements; but nothing opens unreached.
         PopLabeled();
         return GenUnreached([&] { GenWhile(w); });
@@ -427,8 +430,7 @@ inline void CodeGenGo::GenLoop(LoopExpr *lp, const GoDst &d) {
 }
 
 inline void CodeGenGo::GenFor(ForLoop *f) {
-    if (f->iterkind != IK_RANGE && f->iterkind != IK_COUNT)
-        Unsupported(f->line, "a for loop over an array or a slice");
+    if (f->iterkind != IK_RANGE && f->iterkind != IK_COUNT) return GenForArray(f);
     // The loop variable runs at the range's own type: narrow counters stay
     // narrow (§6.5). A binder whose type ends where the range does (`for i:
     // u8 in 0..256`) is a copy of a counter of the range's own, wider type,
@@ -458,7 +460,7 @@ inline void CodeGenGo::GenFor(ForLoop *f) {
     LabelHere();
     L(head);
     ind++;
-    if (wide) Decl(LocalName(f->vdef), GoT(vt, f->line), cat(GoT(vt, f->line), "(", ctr, ")"));
+    if (wide) Decl(LocalName(f->vdef), LocalT(vt, f->line), cat(GoT(vt, f->line), "(", ctr, ")"));
     GenLoopBody(f->body);
     ind--;
     LS("}");
@@ -610,13 +612,30 @@ inline string CodeGenGo::Unique2(const string &base) {
 
 inline void CodeGenGo::BindLocal(VarDef *d, Node *init) {
     auto t = d->type;
-    auto gt = GoT(t, d->line);
+    auto gt = LocalT(t, d->line);
     if (!init) {
         Decl(LocalName(d), gt);
         return;
     }
-    // A construct or a call delivers into the variable itself.
-    if (IsCtl(init) || Is<Call>(init)) {
+    // A relative reference variable holds the offset from itself (§3.9):
+    // whatever the initializer, its value is the plain reference to encode.
+    if (IsRelRef(t)) {
+        auto name = LocalName(d);
+        Decl(name, gt);
+        GenRelStore(AtVar(name, t), init, false);
+        return;
+    }
+    // A construct or a call delivers into the variable itself, and so does
+    // a literal holding relative references, whose offsets are measured from
+    // where it stays.
+    if (IsCtl(init) || Is<Call>(init) ||
+        ((Is<StructLit>(init) || Is<ArrayLit>(init)) && HasRelRef(t))) {
+        auto name = LocalName(d);
+        Decl(name, gt);
+        GenAny(init, GoDst { GD_LVALUE, name, t });
+        return;
+    }
+    if (IsStaticLimited(t) && init->exprtype && !TEq(init->exprtype, t)) {
         auto name = LocalName(d);
         Decl(name, gt);
         GenAny(init, GoDst { GD_LVALUE, name, t });
@@ -626,39 +645,108 @@ inline void CodeGenGo::BindLocal(VarDef *d, Node *init) {
     Decl(LocalName(d), gt, x);
 }
 
-// An assignable place: a variable, as Go names it. t gets its type.
-inline string CodeGenGo::GenLvalue(Node *n, TypeExpr *&t) {
-    if (auto id = Is<Ident>(n); id && id->vdef) {
-        t = id->vdef->type;
-        GoT(t, n->line);
-        return VarRef(id->vdef, n->line);
+// Whether a destination names the same storage wherever its statement
+// evaluates it (CodeGen::StableDest): a variable, or a field or a constant
+// in-range element of a fixed-size value down from one, through no
+// relative reference. An assignment to anything else takes its address
+// first, before the right side runs (§2).
+inline bool CodeGenGo::StableDest(Node *n) {
+    auto fixed = [&](TypeExpr *t) -> TypeExpr * {
+        if (t && t->kind == TY_REF) {
+            if (t->ref->lenstorage >= 0) return nullptr;
+            t = t->ref->sub;
+        }
+        return t && IsFix(t) ? t : nullptr;
+    };
+    for (;;) {
+        if (auto d = Is<Dot>(n)) {
+            if (!d->IsField() || !fixed(d->obj->exprtype)) return false;
+            n = d->obj;
+        } else if (auto ix = Is<Index>(n)) {
+            auto at = fixed(ix->obj->exprtype);
+            if (!at || at->kind != TY_ARRAY || at->arr->akind != A_FIXED) return false;
+            auto il = Is<IntLit>(ix->idx);
+            if (!(il && il->val >= 0 && il->val < ArrSize(at->arr))) return false;
+            n = ix->obj;
+        } else {
+            return Is<Ident>(n) != nullptr;
+        }
     }
-    if (Is<Dot>(n)) Unsupported(n->line, "assignment to a field");
-    if (Is<Index>(n)) Unsupported(n->line, "assignment to an element");
-    Unsupported(n->line, "assignment to this place");
+}
+
+// An assignment's place, resolved before its right side runs (§2): a
+// reference written through, an element (whose bounds check runs first),
+// a place reached through a reference that can be rebound, are pinned to
+// the storage they name now.
+inline CodeGenGo::GoLoc CodeGenGo::AssignLoc(Node *lval, bool pointee) {
+    auto l = GenLoc(lval);
+    if (pointee) DerefLoc(l);
+    if (l.viaref || !StableDest(lval)) {
+        if (!IsGoName(l.lv)) l = PinLoc(l);
+    }
+    return l;
 }
 
 inline void CodeGenGo::GenAssign(Assign *a) {
-    if (a->pointee) Unsupported(a->line, "assignment through a reference");
-    if (a->op == T_DOTASSIGN) Unsupported(a->line, "rebinding a reference (.=)");
-    TypeExpr *t = nullptr;
-    auto lv = GenLvalue(a->lval, t);
+    auto l = AssignLoc(a->lval, a->pointee);
+    auto t = l.t;
+    if (a->op == T_DOTASSIGN) {
+        // Rebinding a reference (§3.8): the reference itself, encoded where
+        // the slot is relative.
+        if (t->kind != TY_REF) {
+            GenAny(a->rhs, GoDst { GD_LVALUE, l.lv, t });
+            return;
+        }
+        if (IsRelRef(t)) {
+            GenRelStore(l, a->rhs, RelApartOf(a->lval, t));
+            return;
+        }
+        if (Is<NullLit>(a->rhs)) {
+            L(l.lv, " = nil");
+            return;
+        }
+        GenAny(a->rhs, GoDst { GD_LVALUE, l.lv, t });
+        return;
+    }
     if (a->op == T_ASSIGN) {
-        GenAny(a->rhs, GoDst { GD_LVALUE, lv, t });
+        if (IsRelRef(t)) {
+            GenRelStore(l, a->rhs, RelApartOf(a->lval, t));
+            return;
+        }
+        GenAny(a->rhs, GoDst { GD_LVALUE, l.lv, t });
         return;
     }
     // The old value is read before the right side runs where that runs
     // statements, as for any operator (§2).
-    auto old = HasStmts(a->rhs) ? Snapshot(t, lv) : lv;
+    auto old = HasStmts(a->rhs) ? Snapshot(t, l.lv) : l.lv;
+    if (t->kind == TY_STRUCT || t->kind == TY_ARRAY) {
+        // Elementwise (§6.1), both operands read before a member is written.
+        auto rt = a->rhs->exprtype;
+        if (IsPlainRef(rt)) rt = rt->ref->sub;
+        auto r = Snapshot(rt, CoerceVal(GenX(a->rhs), a->rhs->exprtype, rt, a->line));
+        ElemwiseInto(t, a->op, a->line, old, false, r, rt->kind != t->kind, l);
+        return;
+    }
     auto r = GenX(a->rhs);
     if (a->op != T_SHLEQ && a->op != T_SHREQ) r = Coerce(r, a->rhs->exprtype, t, a->line);
-    L(lv, " = ", ArithX(a->op, t, old, r, a->line));
+    L(l.lv, " = ", ArithX(a->op, t, old, r, a->line));
+}
+
+// Whether no target can lie at the relative slot an assignment writes, a
+// field of a fixed struct (RelSlotApart).
+inline bool CodeGenGo::RelApartOf(Node *lval, TypeExpr *rt) {
+    auto d = Is<Dot>(lval);
+    if (!d || !d->IsField()) return false;
+    auto ht = d->obj->exprtype;
+    if (ht && ht->kind == TY_REF) ht = ht->ref->sub;
+    if (!ht || ht->kind != TY_STRUCT || !IsFix(ht)) return false;
+    return RelSlotApart(rt, ht, StructLayout(SI(ht)).offs[(size_t)d->fieldidx]);
 }
 
 inline void CodeGenGo::GenIncDec(IncDec *a) {
-    TypeExpr *t = nullptr;
-    auto lv = GenLvalue(a->lval, t);
-    L(lv, " = ", ArithX(a->op == T_INC ? T_PLUS : T_MINUS, t, lv, "1", a->line));
+    auto l = GenLoc(a->lval);
+    while (l.t->kind == TY_REF) DerefLoc(l);
+    L(l.lv, " = ", ArithX(a->op == T_INC ? T_PLUS : T_MINUS, l.t, l.lv, "1", a->line));
 }
 
 }  // namespace goose

@@ -73,7 +73,7 @@ inline string CodeGenGo::GenCall(Call *c) {
         GoT(sp->rets[0], c->line);
         L(FirstResult(t, sp->rets.size()), " := ", call, DECLMARK, t);
     } else {
-        Decl(t, GoT(sp->rets[0], c->line), call);
+        Decl(t, LocalT(sp->rets[0], c->line), call);
     }
     return Coerce(t, sp->rets[0], c->exprtype, c->line);
 }
@@ -92,13 +92,19 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
         return;
     }
     auto want = d.t ? d.t : c->exprtype;
+    string r = call;
     if (sp->rets.size() > 1) {
-        auto t = T();
-        L(FirstResult(t, sp->rets.size()), " := ", call, DECLMARK, t);
-        L(d.s, " = ", Coerce(t, sp->rets[0], want, c->line));
+        r = T();
+        L(FirstResult(r, sp->rets.size()), " := ", call, DECLMARK, r);
+    }
+    if (IsRelRef(want)) {
+        // A reference into a relative slot: the plain one, encoded there.
+        auto pt = ast.RefTo(want->ref->sub, c->line, want->ref->optional);
+        auto v = Snapshot(pt, Coerce(r, sp->rets[0], pt, c->line));
+        EmitRelStore(AtVar(d.s, want), v, NonNullRef(c), false, c->line);
         return;
     }
-    L(d.s, " = ", Coerce(call, sp->rets[0], want, c->line));
+    L(d.s, " = ", Coerce(r, sp->rets[0], want, c->line));
 }
 
 // A multi-name binding from one call (`let a, b = f();`): each result into
@@ -127,7 +133,7 @@ inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
     L(names, " := ", call, DECLMARK, marks);
     if (same) return;
     for (size_t i = 0; i < defs.size(); i++)
-        Decl(LocalName(defs[i]), GoT(defs[i]->type, defs[i]->line),
+        Decl(LocalName(defs[i]), LocalT(defs[i]->type, defs[i]->line),
              Coerce(temps[i], sp->rets[i], defs[i]->type, c->line));
 }
 
@@ -192,19 +198,80 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             return;
         }
         case B_DEFAULT: {
-            // All-zero bytes are every scalar's default (§4.2).
+            // All-zero bytes are every fixed type's default (§4.2), which is
+            // Go's zero value of its representation, but where a field
+            // declares a default of its own: the checker built that as a
+            // literal (Call::defaultinit).
             auto t = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
-            if (!IsScalarT(t)) Unsupported(ln, cat("default<", TypeText(t), ">()"));
-            if (d.k == GD_DISCARD) return;
-            string zero = t->kind == TY_BOOL ? "false"
-                        : t->kind == TY_FLT ? GoFltLit(0, t, ln) : GoIntLit(0, false, t, ln);
-            L(d.s, " = ", Coerce(zero, t, d.t ? d.t : c->exprtype, ln));
+            GoT(t, ln);
+            auto want = d.t ? d.t : c->exprtype;
+            if (!c->defaultinit) {
+                if (d.k == GD_DISCARD) return;
+                if (IsRelRef(want)) {
+                    L(d.s, " = 0");
+                    return;
+                }
+                L(d.s, " = ", Coerce(ZeroOf(t, ln), t, want, ln));
+                return;
+            }
+            auto v = T();
+            Decl(v, LocalT(t, ln));
+            if (t->kind == TY_ARRAY) {
+                auto av = ArrayView(AtVar(v, t), ln);
+                auto i = T();
+                L("for ", i, " := int64(0); ", i, " < ", ArrSize(t->arr), "; ", i, "++ {");
+                ind++;
+                PushSc(SC_PLAIN);
+                GenAny(c->defaultinit, GoDst { GD_LVALUE, ElemAt(av, i, ln).lv, t->arr->sub });
+                PopSc();
+                ind--;
+                LS("}");
+            } else {
+                GenAny(c->defaultinit, GoDst { GD_LVALUE, v, t });
+            }
+            if (d.k != GD_DISCARD) L(d.s, " = ", Coerce(v, t, want, ln));
             return;
         }
         case B_COPY: {
-            // A scalar's copy is its value.
-            if (!IsScalarT(an[0]->exprtype)) Unsupported(ln, cat("copy of ", TypeText(an[0]->exprtype)));
-            GenAny(an[0], GoDst { d.k, d.s, d.t ? d.t : c->exprtype });
+            // A copy is the value the place holds (§4.1).
+            auto want = d.t ? d.t : c->exprtype;
+            if (IsScalarT(an[0]->exprtype)) {
+                GenAny(an[0], GoDst { d.k, d.s, want });
+                return;
+            }
+            auto rt = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
+            auto x = LoadLoc(GenLoc(an[0]), rt, ln);
+            if (want && want->kind == TY_SLICE && rt->kind != TY_SLICE) {
+                // A slice destination views the copy, not its source.
+                auto v = Snapshot(rt, x);
+                x = LoadLoc(AtVar(v, rt), want, ln);
+            } else {
+                x = Coerce(x, rt, want, ln);
+            }
+            if (d.k == GD_DISCARD) {
+                if (!IsGoName(x)) L("_ = ", x);
+                return;
+            }
+            if (x != d.s) L(d.s, " = ", x);
+            return;
+        }
+        case B_LEN: case B_CAP: case B_INDEX_OF: case B_PUSH: case B_APPEND: case B_POP:
+        case B_POP_N: case B_CLEAR: case B_RESIZE: {
+            auto x = GenArrayBuiltin(c);
+            if (x.empty() || Unreached()) return;
+            auto want = d.t ? d.t : c->exprtype;
+            auto rt = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
+            if (d.k == GD_DISCARD) {
+                if (!IsGoName(x) && !IsGoConst(x)) L("_ = ", x);
+                return;
+            }
+            if (want && IsRelRef(want)) {
+                auto v = Snapshot(rt, x);
+                EmitRelStore(AtVar(d.s, want), v, NonNullRef(c), false, ln);
+                return;
+            }
+            x = Coerce(x, rt, want, ln);
+            if (x != d.s) L(d.s, " = ", x);
             return;
         }
         default:
@@ -248,7 +315,14 @@ inline void CodeGenGo::RenderInto(const string &cur, const string &end, Node *a,
         L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(s->val), ")");
         return;
     }
-    if (!IsScalarT(t)) Unsupported(a->line, cat("printing a value of type ", TypeText(t)));
+    if (!IsScalarT(t)) {
+        if (t->kind == TY_REF && !t->ref->optional) t = t->ref->sub;
+        GoT(t, a->line);
+        auto l = GenLoc(a);
+        if (Unreached()) return;
+        RenderLoc(cur, end, l, t, false, a->line);
+        return;
+    }
     auto x = GenX(a);
     switch (t->kind) {
         case TY_INT:
