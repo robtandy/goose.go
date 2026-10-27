@@ -399,8 +399,8 @@ inline void CodeGenGo::GenFieldInits(StructLit *sl, const vector<Field> &fields,
         }
         // The resizable tail (if any) takes the enclosing header's count;
         // every other field constructs plainly.
-        if (IsResz(ft) && IsFrameObj(ft)) Unsupported(sl->line, "a frame object as the tail of a bytes value");
-        GenConstruct(init, stk, ft, IsResz(ft) ? lenlv : "");
+        if (IsResz(ft) && IsFrameObj(ft)) GenFoAsBytes(init, stk, ft, lenlv);
+        else GenConstruct(init, stk, ft, IsResz(ft) ? lenlv : "");
     }
 }
 

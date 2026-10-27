@@ -405,17 +405,7 @@ inline string CodeGenGo::CallVal0(Call *c, const string &r0, TypeExpr *want) {
 inline CodeGenGo::GoLoc CodeGenGo::CallResLoc(Call *c, const string &r0) {
     auto rt = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
     if (c->builtin >= 0 || c->fvbody || !c->dispatch.empty()) rt = c->exprtype;
-    if (IsPlainRef(rt)) {
-        auto sub = rt->ref->sub;
-        if (IsResz(sub)) return FatRefLoc(r0, sub);
-        if (IsBytesT(sub)) {
-            GoLoc l;
-            l.t = sub;
-            l.addr = r0;
-            return l;
-        }
-        return AtTyped(r0, sub);
-    }
+    if (IsPlainRef(rt)) return AtRef(r0, rt);
     if (IsResz(rt)) return RzTempLoc(rt, r0, "");
     if (IsBytesT(rt)) {
         GoLoc l;
@@ -1121,36 +1111,55 @@ inline void CodeGenGo::EmitUserFormat(const string &cur, const GoLoc &l, FnSpec 
 // The text of argument a at the cursor `cur` (§3.7): a scalar's, or a string
 // literal's bytes as they are.
 inline void CodeGenGo::RenderInto(const string &cur, const string &end, Node *a, Call *c) {
-    auto ctx = GoFmtContext(c, a);
-    auto t = a->exprtype;
+    auto ra = PrepRender(a, c);
+    if (Unreached()) return;
+    PlaceRender(cur, end, ra, a->line);
+}
+
+inline CodeGenGo::RenderArg CodeGenGo::PrepRender(Node *a, Call *c) {
+    RenderArg ra;
+    ra.ctx = GoFmtContext(c, a);
+    ra.t = a->exprtype;
+    auto t = ra.t;
+    ra.vt = t->kind == TY_REF && !t->ref->optional ? t->ref->sub : t;
+    if (auto s = Is<StrLit>(a); s && !FmtSpecFor(ra.ctx, t)) {
+        ra.lit = s;
+        return ra;
+    }
+    if (!IsScalarT(t) || FmtSpecFor(ra.ctx, t)) {
+        GoT(ra.vt, a->line);
+        ra.l = RenderedLoc(a);
+        return ra;
+    }
+    ra.scalar = true;
+    ra.x = GenX(a);
+    return ra;
+}
+
+inline void CodeGenGo::PlaceRender(const string &cur, const string &end, const RenderArg &ra, Line ln) {
     // The overloads the argument is rendered with, at any depth of it.
     struct Ctx {
         Call *&r, *saved;
         ~Ctx() { r = saved; }
     } keep { rctx, rctx };
-    rctx = ctx;
-    auto vt = t->kind == TY_REF && !t->ref->optional ? t->ref->sub : t;
-    if (auto s = Is<StrLit>(a); s && !FmtSpecFor(ctx, t)) {
-        L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(s->val), ")");
+    rctx = ra.ctx;
+    auto t = ra.t;
+    if (ra.lit) {
+        L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(ra.lit->val), ")");
         return;
     }
-    if (!IsScalarT(t) || FmtSpecFor(ctx, t)) {
-        GoT(vt, a->line);
-        auto l = RenderedLoc(a);
-        if (Unreached()) return;
-        RenderLoc(cur, end, l, vt, false, a->line);
+    if (!ra.scalar) {
+        RenderLoc(cur, end, ra.l, ra.vt, false, ln);
         return;
     }
-    auto x = GenX(a);
+    auto &x = ra.x;
     switch (t->kind) {
         case TY_INT:
             if (t->intstorage == IS_U64) L(cur, " = gsFmtU64(", cur, ", ", end, ", ", x, ")");
-            else L(cur, " = gsFmtI64(", cur, ", ", end, ", ",
-                   Coerce(x, t, ast.inttypes[IS_I64], a->line), ")");
+            else L(cur, " = gsFmtI64(", cur, ", ", end, ", ", Coerce(x, t, ast.inttypes[IS_I64], ln), ")");
             return;
         case TY_FLT:
-            L(cur, " = gsFmt", t->fltstorage == FS_F32 ? "F32" : "F64", "(", cur, ", ", end, ", ", x,
-              ")");
+            L(cur, " = gsFmt", t->fltstorage == FS_F32 ? "F32" : "F64", "(", cur, ", ", end, ", ", x, ")");
             return;
         default:
             L(cur, " = gsFmtBool(", cur, ", ", end, ", ", x, ")");

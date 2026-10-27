@@ -48,6 +48,129 @@ inline TypeExpr *CodeGenGo::FoTailArr(TypeExpr *t) {
     return IsFrameObj(ft) ? FoTailArr(ft) : ft;
 }
 
+// The bytes before the innermost tail's elements in a frame object laid out
+// as bytes (CodeGen::FoBytesPrefix).
+inline int64_t CodeGenGo::FoBytesPrefix(TypeExpr *t) {
+    auto si = SI(t);
+    int64_t n = 0;
+    for (size_t i = 0; i < si->st->fields.size(); i++) {
+        auto &f = si->st->fields[i];
+        if (f.ispad) {
+            n += f.padsize > 0 ? f.padsize : 0;
+            continue;
+        }
+        auto ft = si->ftypes[i];
+        if (IsResz(ft)) return n + (IsFrameObj(ft) ? FoBytesPrefix(ft) : 0);
+        n += FixedSize(ft);
+    }
+    Fail(t->line, "internal: a frame object without its tail");
+}
+
+// Field fi of a frame object laid out as bytes: a fixed one at its offset,
+// the tail -- a nested frame object in the same layout, or the innermost
+// resizable, its elements there and its count the owner's.
+inline CodeGenGo::GoLoc CodeGenGo::FoFieldLoc(const GoLoc &base, int fi, Line ln) {
+    auto si = SI(base.t);
+    auto &fields = si->st->fields;
+    int64_t off = 0;
+    for (auto i = 0; i < fi; i++) {
+        if (fields[i].ispad) off += fields[i].padsize > 0 ? fields[i].padsize : 0;
+        else off += FixedSize(si->ftypes[i]);
+    }
+    auto ft = si->ftypes[fi];
+    auto p = AddOff(base.addr, off);
+    GoLoc r;
+    if (IsResz(ft)) {
+        r.t = ft;
+        r.addr = p;
+        r.lenlv = base.lenlv;
+    } else {
+        r = AtAddr(p, ft);
+    }
+    (void)ln;
+    r.stk = base.stk;
+    r.fl = base.fl;
+    r.flstk = base.flstk;
+    r.viaref = base.viaref || ft->kind == TY_REF;
+    return r;
+}
+
+// Frame object `obj`'s fixed fields, at every nesting level, against the
+// bytes layout the same type takes at p (CodeGen::FoBytes): stored there,
+// explicit pads zeroed, or (`tobytes` false) loaded back.
+inline void CodeGenGo::FoBytes(TypeExpr *t, const string &obj, const string &p, bool tobytes) {
+    auto si = SI(t);
+    auto &fields = si->st->fields;
+    int64_t off = 0;
+    for (size_t i = 0; i < fields.size(); i++) {
+        auto at = AddOff(p, off);
+        if (fields[i].ispad) {
+            if (fields[i].padsize <= 0) continue;
+            if (tobytes) L("clear(unsafe.Slice((*byte)(", at, "), ", fields[i].padsize, "))");
+            off += fields[i].padsize;
+            continue;
+        }
+        auto ft = si->ftypes[i];
+        auto flv = cat(obj, ".", Sanitize(fields[i].name));
+        if (IsResz(ft)) {
+            if (IsFrameObj(ft)) FoBytes(ft, flv, at, tobytes);
+            return;
+        }
+        auto slot = AtAddr(at, ft);
+        if (tobytes) St(slot, flv);
+        else L(flv, " = ", Ld(slot));
+        off += FixedSize(ft);
+    }
+}
+
+// A frame object laid out as bytes as the Go frame object a whole read of
+// it takes (CodeGen::FoView): its fixed fields loaded, its innermost tail's
+// header pointing at the elements where they lie.
+inline CodeGenGo::GoLoc CodeGenGo::FoView(const GoLoc &l) {
+    if (l.lenlv.empty()) Fail(l.t->line, "internal: a frame object's bytes without their count");
+    auto v = T();
+    Decl(v, RzGoT(l.t, l.t->line));
+    FoBytes(l.t, v, l.addr, false);
+    auto th = FoTailHdr(l.t, v);
+    L(th, ".Base = ", AddOff(l.addr, FoBytesPrefix(l.t)));
+    L(th, ".Len = ", l.lenlv);
+    GoLoc r;
+    r.t = l.t;
+    r.lv = v;
+    r.hdr = v;
+    r.stk = l.stk;
+    return r;
+}
+
+// n's value, of frame object type t, built at stk's top as the tail of a
+// value that is no frame object (CodeGen::GenFoAsBytes): a literal field by
+// field; anything else as the frame object it is everywhere else, its
+// elements landing behind room left for the fixed fields, which are stored
+// there after it. The innermost tail's count goes to the owner's lenlv.
+inline void CodeGenGo::GenFoAsBytes(Node *n, const string &stk, TypeExpr *t, const string &lenlv) {
+    OpenAt open(*this, stk);
+    if (auto sl = Is<StructLit>(n); sl && TEq(sl->exprtype, t) && !fillvalues.count(n)) {
+        auto si = SI(t);
+        auto base = T();
+        Decl(base, "unsafe.Pointer", Top(stk));
+        GenFieldInits(sl, si->st->fields, si->ftypes, stk, lenlv, base);
+        return;
+    }
+    auto pre = FoBytesPrefix(t);
+    string p;
+    if (pre) {
+        p = T();
+        Decl(p, "unsafe.Pointer", Top(stk));
+        Bump(stk, cat(pre));
+    }
+    auto h = T();
+    Decl(h, RzGoT(t, n->line));
+    GenConstruct(n, stk, t, h);
+    if (Unreached()) return;
+    if (pre) FoBytes(t, h, p, true);
+    L(lenlv, " = ", FoTailHdr(t, h), ".Len");
+}
+
 inline void CodeGenGo::Bump(const string &stk, const string &n) {
     L(Top(stk), " = unsafe.Add(", Top(stk), ", ", n, ")");
 }
@@ -642,6 +765,8 @@ inline void CodeGenGo::GenArrayFromLoc(GoLoc l, TypeExpr *et, const string &stk,
 inline void CodeGenGo::EmitRzCopy(GoLoc l, TypeExpr *et, const string &stk, const string &lenlv,
                                   Line ln) {
     if (lenlv.empty()) Fail(ln, "internal: a resizable copied without its header");
+    // A frame object laid out as bytes is read as one first.
+    if (IsFrameObj(et) && IsFrameObj(l.t) && IsFoBytesLoc(l)) l = FoView(l);
     if (!IsFrameObj(et) || l.lv.empty())
         Unsupported(ln, cat("copying a value of type ", TypeText(et)));
     auto src = T();
@@ -757,13 +882,18 @@ inline void CodeGenGo::GenArrayLitAt(ArrayLit *al, const string &stk, const stri
 inline CodeGenGo::GoLoc CodeGenGo::RzRecvLoc(Node *n) {
     auto l = GenLoc(n);
     auto viaref = l.viaref;
-    if (l.t->kind == TY_REF && viaref && !l.ispref) {
-        // The reference itself, read now.
-        auto r = Snapshot(l.t, Ld(l));
-        l = AtVar(r, l.t);
-        viaref = false;
+    if (l.t->kind == TY_REF) {
+        // The reference itself, read now -- but for a pool reference, whose
+        // header, stack, freelist and freelist stack are read together where
+        // they are used, after the arguments, so that they name one pool
+        // whichever the arguments leave it naming (CodeGen::RecvLoc).
+        if (viaref && !l.ispref && !IsRelRef(l.t)) {
+            auto r = Snapshot(l.t, Ld(l));
+            l = AtVar(r, l.t);
+        }
+        while (l.t->kind == TY_REF) DerefLoc(l);
+        return l;
     }
-    while (l.t->kind == TY_REF) DerefLoc(l);
     if (!viaref) return l;
     return PinRz(l);
 }
@@ -1080,6 +1210,10 @@ inline void CodeGenGo::AppendBytes(const GoLoc &l, const string &src, const stri
 // to: through a cursor, as print renders its line (RenderInto), bounded by
 // the end of the builder's region.
 inline void CodeGenGo::RenderToBuilder(const GoLoc &b, Node *a, Call *c) {
+    // The argument first: what it appends to the builder comes before its
+    // text, which starts at the top it leaves.
+    auto ra = PrepRender(a, c);
+    if (Unreached()) return;
     auto cur = T(), end = T(), start = T();
     Decl(start, "unsafe.Pointer", Top(b.stk));
     Decl(cur, "unsafe.Pointer", start);
@@ -1090,7 +1224,7 @@ inline void CodeGenGo::RenderToBuilder(const GoLoc &b, Node *a, Call *c) {
     rt.b = b;
     auto saved = rtarget;
     rtarget = &rt;
-    RenderInto(cur, end, a, c);
+    PlaceRender(cur, end, ra, a->line);
     rtarget = saved;
     if (Unreached()) return;
     L(Top(b.stk), " = ", cur);

@@ -20,7 +20,10 @@ inline string CodeGenGo::ZeroOf(TypeExpr *t, Line ln) {
         case TY_INT: return GoIntLit(0, false, t, ln);
         case TY_FLT: return GoFltLit(0, t, ln);
         case TY_BOOL: return "false";
-        case TY_REF: return t->ref->lenstorage >= 0 ? cat(RelGoT(t), "(0)") : "nil";
+        case TY_REF:
+            if (t->ref->lenstorage >= 0) return cat(RelGoT(t), "(0)");
+            // A fat reference is a struct, null with no header.
+            return GoT(t, ln) == "GsRref" ? "GsRref{}" : "nil";
         default: break;
     }
     auto &ti = TI(t, ln);
@@ -604,7 +607,7 @@ inline void CodeGenGo::GenEnumMatch(MatchExpr *m, TypeExpr *enumtype, bool isref
         Decl(p, "unsafe.Pointer", l.addr);
         e = BytesLoc(p, enumtype, GoLoc {});
     } else if (isref) {
-        e = AtTyped(GenPure(m->scrutinee), enumtype);
+        e = AtRef(GenPure(m->scrutinee), m->scrutinee->exprtype);
     } else {
         auto sv = CoerceVal(GenX(m->scrutinee), m->scrutinee->exprtype, enumtype, ln);
         if (!IsGoName(sv)) sv = Snapshot(enumtype, sv);
@@ -973,8 +976,21 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
     if (nominal) {
         for (auto r : rendering)
             if (TEq(r, t)) {
-                L(cur, " = ", RenderFn(t, ln), "(", cur, ", ", end, ", ", IsBytesT(t) ? l.addr : PtrOf(l),
-                  ")");
+                // The value as its render function takes it: a frame object
+                // by its Go struct (viewed as one where it lies as bytes), a
+                // resizable bytes value by its image and count, any other
+                // bytes value by its image.
+                string arg;
+                if (IsFrameObj(t)) {
+                    if (IsFoBytesLoc(l)) l = FoView(l);
+                    arg = PtrOf(l);
+                } else if (IsResz(t)) {
+                    if (l.lenlv.empty()) Fail(ln, "internal: a resizable value rendered without its count");
+                    arg = cat("GsRhdr{", l.addr, ", ", l.lenlv, "}");
+                } else {
+                    arg = IsBytesT(t) ? l.addr : PtrOf(l);
+                }
+                L(cur, " = ", RenderFn(t, ln), "(", cur, ", ", end, ", ", arg, ")");
                 return;
             }
         rendering.push_back(t);
@@ -1162,14 +1178,30 @@ inline void CodeGenGo::EmitRenderFns() {
         curinfo = nullptr;
         spexpr = "0";
         PushSc(SC_FN);
-        auto bytes = IsBytesT(r.t);
-        RenderLoc("cur", "end", bytes ? BytesLoc("v", r.t, GoLoc {}) : AtTyped("v", r.t), r.t, true, r.ln);
+        auto fo = IsFrameObj(r.t);
+        auto rzb = IsResz(r.t) && !fo;
+        auto bytes = IsBytesT(r.t) && !fo && !rzb;
+        GoLoc v;
+        string vt;
+        if (rzb) {
+            v.t = r.t;
+            v.addr = "v.Base";
+            v.lenlv = "v.Len";
+            vt = "GsRhdr";
+        } else if (bytes) {
+            v = BytesLoc("v", r.t, GoLoc {});
+            vt = "unsafe.Pointer";
+        } else {
+            v = AtTyped("v", r.t);
+            if (fo) v.hdr = v.lv;
+            vt = cat("*", GoT(r.t, r.ln));
+        }
+        RenderLoc("cur", "end", v, r.t, true, r.ln);
         PopSc();
         auto b = FinishBody(body);
         RestoreFnState(save);
         Append(code, "// The text of a ", TypeText(r.t), " below the first level (§3.7).\n", "func ",
-               r.name, "(cur, end unsafe.Pointer, v ", bytes ? "unsafe.Pointer" : cat("*", GoT(r.t, r.ln)),
-               ") unsafe.Pointer {\n", b, "\treturn cur\n}\n\n");
+               r.name, "(cur, end unsafe.Pointer, v ", vt, ") unsafe.Pointer {\n", b, "\treturn cur\n}\n\n");
     }
 }
 

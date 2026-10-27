@@ -1044,7 +1044,10 @@ inline void CodeGenGo::GenAssign(Assign *a) {
                 return;
             }
             L(Top(l.stk), " = ", l.addr);
-            GenConstruct(a->rhs, l.stk, l.t, l.lenlv);
+            // A frame object's type here is the tail of a value that is
+            // no frame object, laid out as bytes.
+            if (IsFrameObj(l.t)) GenFoAsBytes(a->rhs, l.stk, l.t, l.lenlv);
+            else GenConstruct(a->rhs, l.stk, l.t, l.lenlv);
             return;
         }
         if (lt && IsBytesT(lt)) Unsupported(a->line, cat("assigning a value of type ", TypeText(lt)));

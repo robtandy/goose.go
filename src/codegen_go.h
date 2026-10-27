@@ -285,6 +285,10 @@ struct CodeGenGo {
     static string AddrOf(const GoLoc &l);
     string PtrOf(const GoLoc &l);
     string RefOfLoc(const GoLoc &l);
+    // The pointee of the plain reference value x of type rt, in whatever
+    // form the reference takes: a fat reference's header, a bytes value's
+    // address, an address (RefIsAddr), a typed Go pointer.
+    GoLoc AtRef(const string &x, TypeExpr *rt);
     GoLoc PinLoc(const GoLoc &l);
     // A place's value, and a store into it: where it holds Go pointers at
     // an address (GoLoc::unal), byte for byte through gsLd_/gsSt_ helpers,
@@ -420,6 +424,17 @@ struct CodeGenGo {
     string RzGoT(TypeExpr *t, Line ln);
     string FoTailHdr(TypeExpr *t, const string &obj);
     TypeExpr *FoTailArr(TypeExpr *t);
+    // A frame object's type as the tail of a value that is no frame object
+    // (C.2): bytes of that value like its other fields, its fixed fields in
+    // declaration order (an explicit pad's bytes between), then its own
+    // tail -- the innermost one's elements, counted by the owner's header.
+    // Such a place has an address and no Go lvalue (IsFoBytes).
+    static bool IsFoBytesLoc(const GoLoc &l) { return l.lv.empty() && !l.addr.empty(); }
+    int64_t FoBytesPrefix(TypeExpr *t);
+    GoLoc FoFieldLoc(const GoLoc &base, int fi, Line ln);
+    void FoBytes(TypeExpr *t, const string &obj, const string &p, bool tobytes);
+    GoLoc FoView(const GoLoc &l);
+    void GenFoAsBytes(Node *n, const string &stk, TypeExpr *t, const string &lenlv);
     string Top(const string &stk) { return cat("gs.Stks[", stk, "]"); }
     void Bump(const string &stk, const string &n);
     TypeExpr *growu8 = nullptr;
@@ -910,6 +925,20 @@ struct CodeGenGo {
     void GenBuiltin(Call *c, const GoDst &d);
     void EmitPrint(Call *c);
     void RenderInto(const string &cur, const string &end, Node *a, Call *c);
+    // An argument read for its text before any of it is placed, which its
+    // own side effects (a call appending to the builder it goes into, say)
+    // must not overwrite: a string literal, a scalar's value, or the place
+    // anything else is rendered from.
+    struct RenderArg {
+        Call *ctx = nullptr;
+        TypeExpr *t = nullptr, *vt = nullptr;
+        StrLit *lit = nullptr;
+        bool scalar = false;
+        string x;
+        GoLoc l;
+    };
+    RenderArg PrepRender(Node *a, Call *c);
+    void PlaceRender(const string &cur, const string &end, const RenderArg &ra, Line ln);
 
     // ------------------------------------------------------------------
     // Functions, globals and the program (codegen_go_emit.h).

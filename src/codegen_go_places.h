@@ -81,6 +81,13 @@ inline string CodeGenGo::RefOfLoc(const GoLoc &l) {
     return PtrOf(l);
 }
 
+inline CodeGenGo::GoLoc CodeGenGo::AtRef(const string &x, TypeExpr *rt) {
+    auto sub = rt->ref->sub;
+    if (IsResz(sub)) return FatRefLoc(x, sub);
+    if (IsBytesT(sub)) return BytesLoc(x, sub, GoLoc {});
+    return RefIsAddr(rt) ? AtAddr(x, sub) : AtTyped(x, sub);
+}
+
 // A place resolved to the storage it names now: what code run before its
 // later uses -- the right side of an assignment, the arguments after a
 // receiver -- cannot move by rebinding a reference or changing an index.
@@ -173,6 +180,8 @@ inline CodeGenGo::GoLoc CodeGenGo::FieldLocAt(const GoLoc &base, int fi, Line ln
     } else {
         Fail(ln, cat("internal: a field of a value of type ", TypeText(base.t)));
     }
+    // A field of a frame object laid out as bytes (C.2).
+    if (IsFrameObj(base.t) && IsFoBytesLoc(base)) return FoFieldLoc(base, fi, ln);
     if (IsBytesT(base.t) && !IsFrameObj(base.t)) {
         // A field of a bytes value: at its offset in the image, past a
         // cursor over the variable-size fields before it (FieldPtr). The

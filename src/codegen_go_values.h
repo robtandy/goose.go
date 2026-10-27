@@ -596,16 +596,22 @@ inline string CodeGenGo::GenUnary(Unary *u) {
 inline string CodeGenGo::GenBinary(Binary *b) {
     auto op = b->op;
     if (op == T_DOTEQ || op == T_DOTNEQ) {
-        // Reference identity (§3.8): the addresses, null the null one. A
-        // reference variable reads as the reference it holds.
+        // Reference identity (§3.8): the addresses, null the null one; a
+        // reference to a resizable value (a fat or a pool reference) is its
+        // header's. A reference variable reads as the reference it holds.
+        auto addr = [&](const string &x, TypeExpr *t) {
+            if (t && t->kind == TY_REF && t->ref->lenstorage < 0 && IsResz(t->ref->sub))
+                return cat("unsafe.Pointer(", x, ".Hdr)");
+            return cat("unsafe.Pointer(", x, ")");
+        };
         auto side = [&](Node *n) -> string {
             if (Is<NullLit>(n)) return "nil";
             if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type->kind == TY_REF) {
                 GoT(id->vdef->type, n->line);
                 auto l = VarLoc(id->vdef, n->line);
-                return cat("unsafe.Pointer(", LoadLoc(l, l.t, n->line), ")");
+                return addr(LoadLoc(l, l.t, n->line), l.t);
             }
-            return cat("unsafe.Pointer(", GenX(n), ")");
+            return addr(GenX(n), n->exprtype);
         };
         auto l = T();
         Decl(l, "unsafe.Pointer", side(b->left));
