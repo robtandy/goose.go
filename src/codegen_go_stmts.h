@@ -287,9 +287,29 @@ inline void CodeGenGo::GenMatch(MatchExpr *m, const GoDst &d) {
             open = first ? "{" : "} else {";
             wild = true;
         } else {
+            // The arm's values as disjoint ranges in order, those that overlap
+            // or touch made one: the checker lets an arm name one value twice
+            // (`A, B` where both are 1), and the same comparison twice in one
+            // `||` is what vet reports as redundant. Values order as the
+            // checker orders them, by unsigned keys (typecheck_flow.h).
+            auto key = [&](int64_t v) {
+                return st->intstorage == IS_U64 ? (uint64_t)v : (uint64_t)v ^ (1ull << 63);
+            };
+            auto sorted = arm.ranges;
+            std::sort(sorted.begin(), sorted.end(), [&](const ArmRange &a, const ArmRange &b) {
+                return key(a.lo) < key(b.lo);
+            });
+            vector<ArmRange> ranges;
+            for (auto &r : sorted) {
+                if (ranges.empty() || (key(ranges.back().hi) != UINT64_MAX &&
+                                       key(r.lo) > key(ranges.back().hi) + 1))
+                    ranges.push_back(r);
+                else if (key(r.hi) > key(ranges.back().hi))
+                    ranges.back().hi = r.hi;
+            }
             string c;
-            auto several = arm.ranges.size() > 1;
-            for (auto &r : arm.ranges) {
+            auto several = ranges.size() > 1;
+            for (auto &r : ranges) {
                 if (!c.empty()) c += " || ";
                 auto lo = GoIntLit(r.lo, false, st, m->line);
                 if (r.hi == r.lo) Append(c, x, " == ", lo);
