@@ -793,6 +793,26 @@ class Runner:
         code, o, e = self.goose("--target=go", progs / "abort_msg.goose")
         check("goose --target=go file runs it", code == 1 and o == "3 42\n" and
               "goose runtime error: division by zero requested" in e, f"exit {code}\n{o}{e}")
+        # The Go that run and build write is main.go, whatever the program is
+        # called: the go tool takes *_test.go for a test and does not read a
+        # name that starts with . or _, and the executable run builds beside
+        # it is main, which main.go.goose's name would otherwise give the Go.
+        names = self.work / "cli-names"
+        shutil.rmtree(names, ignore_errors=True)
+        names.mkdir(parents=True)
+        for stem in ("scalar_test", "_under", ".dot", "main.go"):
+            src = names / f"{stem}.goose"
+            tc.write_text(src, 'fn main() { print("hello"); }\n')
+            code, o, e = self.goose("run", "--target=go", src)
+            check(f"goose run --target=go {stem}.goose", code == 0 and o == "hello\n",
+                  f"exit {code}\n{o}{e}")
+            exe = names / f"{stem}-built{tc.EXE_SUFFIX}"
+            code, o, e = self.goose("build", "--target=go", "-o", exe, src)
+            ok = code == 0 and exe.exists()
+            if ok:
+                rc, ro, re_ = tc.run_capture([exe])
+                ok = rc == 0 and ro == "hello\n"
+            check(f"goose build --target=go {stem}.goose", ok, o + e)
         # goose build --target=go -o exe.
         exe = self.work / f"cli-built{tc.EXE_SUFFIX}"
         exe.unlink(missing_ok=True)

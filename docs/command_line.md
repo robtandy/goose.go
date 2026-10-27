@@ -516,7 +516,9 @@ supported, 64-bit only. The design is in [DESIGN.md](../DESIGN.md).
 * `goose run --target=go`, or `goose --target=go file.goose`, writes the Go
   to the program's build directory under `GOOSE_HOME`, builds it with
   `go build`, and runs the executable with the arguments after `--`,
-  exiting with its exit code.
+  exiting with its exit code. The Go there is `main.go`, whatever the
+  program is called: the go tool takes a file named `*_test.go` for a test,
+  and does not read one whose name starts with `.` or `_`.
 * `goose build --target=go` builds the executable beside the root file, or
   where `-o` says, and `--debug` builds it without the Go compiler's
   optimizations, for a debugger. `--dry-run` and `-v` print the `go build`

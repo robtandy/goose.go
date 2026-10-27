@@ -1900,7 +1900,11 @@ int Main(int argc, char **argv) {
                 fprintf(stderr, "cannot create the build directory %s\n", builddir.c_str());
                 return 1;
             }
-            outfile = cat(builddir, "/", PathStem(file), gotarget ? ".go" : ".c");
+            // The go tool reads a file's name: one ending in _test is a test,
+            // and one starting with . or _ is not read at all. The Go is
+            // main.go, whatever the program's name, which its build directory
+            // has (ProgramBuildDir).
+            outfile = gotarget ? cat(builddir, "/main.go") : cat(builddir, "/", PathStem(file), ".c");
             // The C is written far from where the command was given, so a
             // header named relative to here is named relative to nowhere
             // else: absolute, and the C names it relative to itself.
@@ -1934,10 +1938,12 @@ int Main(int argc, char **argv) {
                     return BuildGoExecutable(filename, outfile, builddir, buildopts, msgs,
                                              astp->packages[0].output);
                 // Built beside the Go, and run as a process of its own, on
-                // this one's streams: its exit code is ours.
+                // this one's streams: its exit code is ours. Named as the Go
+                // is, so that no program's name (main.go.goose's) is the
+                // Go's.
                 BuildOptions goopts;
                 goopts.verbose = verbose;
-                auto goexe = cat(builddir, "/", PathStem(filename));
+                string goexe = cat(builddir, "/main");
                 #ifdef _WIN32
                     goexe += ".exe";
                 #endif
