@@ -562,9 +562,10 @@ no cgo this way), and that build must run as the C one does too. The
 programs cover the scalar core and the fixed-size values: structs packed and
 aligned, fixed and limited arrays, ADTs with `match` and case functions,
 slices and string literals, plain, optional and self-relative references,
-elementwise arithmetic and large globals, with one program per runtime check
-those make (`index_abort`, `slice_abort`, `capacity_abort`, `pop_abort`,
-`popn_abort`, `resize_abort`, `reloff_abort`, `relnull_abort`).
+elementwise arithmetic and large globals and locals, with one program per
+runtime check those make (`index_abort`, `slice_abort`, `capacity_abort`,
+`pop_abort`, `popn_abort`, `resize_abort`, `reloff_abort`, `relnull_abort`),
+and the workers and queues beyond what `test/threads/` has (`threads_*`).
 
 The programs in `test/go/build_only/` never end, as a program whose loop only
 stopping it leaves: each is written as Go at both levels, which must vet and
@@ -577,12 +578,20 @@ its literal or inside a value's text (an `i64`, `u64`, `f64`, `f32` or
 `bool`), and lines that just fit, must run in Go as they do in C, with the
 C runtime's message and exit status.
 
-Every fixture of `test/stdlib/` runs through both backends as well, at
-`-O2`, at `-O0` and, where its first line asks `run_tests.py` for a
-`GS_DEBUG` run (`runtime-debug`), with `--debug`, each run in a directory of
+Every fixture of `test/stdlib/` and of `test/threads/` runs through both
+backends as well, at `-O2`, at `-O0` and, where its first line asks
+`run_tests.py` for a `GS_DEBUG` run (`runtime-debug`), with `--debug`, with
+the `-D` its first line names (`runtime-define`), each run in a directory of
 its own, since the `os` fixtures write files where they run: the Go must
 vet, build (with `-d=checkptr` too, at `-O2`) and run as the C does, print
-what `test/expected/` holds at `-O2`, and report the same data stacks.
+what `test/expected/` holds at `-O2`, and report the same data stacks. One
+that differs by design (`SWEEP_KNOWN`) is counted, not run:
+`thread_stack_overflow`, a worker's native stack exhaustion. The samples
+`SAMPLES` names (`23_mandelbrot_threads`) run in `samples/` through both
+backends at both levels, which must agree on stdout and the exit code and
+print what `samples/expected/` holds; their stderr is timings. A program
+with workers needs a C compiler for its reference, since a JIT run cannot
+build one, and is counted, not run, without one.
 
 Each directory of `test/go/export/` is a library of `export fn`s,
 `<name>.goose`, and the Go tests that call its Go entry points,
@@ -591,7 +600,9 @@ levels, with every other `.go` file there spliced in by `--include` (the Go
 the library's `extern fn`s call), into a module of its own with the tests,
 which must vet and pass `go test`, also built with `-d=checkptr`. The tests
 check what the entry points give, and with `testing.AllocsPerRun` that
-calling them in a loop allocates nothing on Go's heap.
+calling them in a loop allocates nothing on Go's heap; `go/export/workers/`
+calls the exports of a program with workers from many goroutines at once,
+each of which must see only its own globals.
 
 Each program in `test/go/unsupported/` uses something this version of the
 backend does not compile, and must stop the Go compile with every message its
@@ -607,7 +618,8 @@ through the Go backend. The ones it compiles must vet, build and print what
 supported yet are counted, not failed, and so are the few that differ by
 design (`SWEEP_KNOWN`, with the reason): a recursion that exhausts the native
 stack is a Goose abort in C, and a fatal error of the Go runtime, which grows
-a goroutine's stack to 1 GB first. `--fuzz N` generates `N` programs of
+a goroutine's stack to 1 GB first. (`test/stdlib/` and `test/threads/` have
+the section above instead.) `--fuzz N` generates `N` programs of
 random arithmetic, shifts, conversions and comparisons at every scalar type
 (from `--fuzz-seed` on, every other one built with `--debug`), each of which
 both backends must run alike. `--fuzz-flow N` generates `N` programs of

@@ -35,10 +35,18 @@ type GsStackBlock struct {
 	Frame     unsafe.Pointer
 	FrameBase unsafe.Pointer
 	FrameEnd  unsafe.Pointer
-	frame     []byte
-	regions   [][]byte
-	reserve   int64
-	gap       int64
+	// The program instance the block runs (§11.2), in a program with
+	// workers: its globals, which the generated code lays out (gsGlobals).
+	// Main's is a static one; a worker's, and an export's caller's, is in
+	// memory of the block's own (inst), outside the Go heap, as the data
+	// stacks are. nil where the block has none yet.
+	Gl      unsafe.Pointer
+	inst    []byte
+	worker  int64 // The worker running on the block, its id plus one; 0 for none.
+	frame   []byte
+	regions [][]byte
+	reserve int64
+	gap     int64
 }
 
 // The fixed-frame stack's reservation: address space only, as the data
@@ -159,10 +167,14 @@ func (gs *GsStackBlock) ensureStacks(n int) {
 }
 
 // Reset rewinds every stack of the block to empty, its fixed-frame stack's
-// too.
+// too. A program instance of the block's own (Gl) goes with them: the next
+// entry point to run on the block copies the program's globals in again.
 func (gs *GsStackBlock) Reset() {
 	copy(gs.Stks, gs.Base)
 	gs.Frame = gs.FrameBase
+	if gs.inst != nil {
+		gs.Gl = nil
+	}
 }
 
 // Close releases the block's regions: nothing may use what its stacks held
@@ -187,9 +199,61 @@ func (gs *GsStackBlock) Close() error {
 			first = err
 		}
 	}
+	if gs.inst != nil {
+		if err := syscall.Munmap(gs.inst); err != nil && first == nil {
+			first = err
+		}
+		gs.Gl = nil
+	}
 	gs.regions, gs.Stks, gs.Base, gs.Cap = nil, nil, nil, nil
 	gs.frame, gs.Frame, gs.FrameBase, gs.FrameEnd = nil, nil, nil, nil
+	gs.inst = nil
 	return first
+}
+
+// gsMapPrivate maps n bytes of zeroed memory outside the Go heap, at least
+// a page of them, for a program instance's globals and a worker's spawn
+// image: what points into them never moves, and the collector frees none
+// of it.
+func gsMapPrivate(n int64) []byte {
+	page := int64(syscall.Getpagesize())
+	n = (n + page - 1) / page * page
+	if n == 0 {
+		n = page
+	}
+	m, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+	if err != nil {
+		GsPanic("out of memory copying globals")
+	}
+	return m
+}
+
+// NewInstance gives the block a program instance of its own, size zeroed
+// bytes at Gl, where it has none (an export's entry point fills it); the
+// memory is the block's until Close.
+func (gs *GsStackBlock) NewInstance(size uintptr) {
+	if gs.Gl != nil {
+		return
+	}
+	if gs.inst == nil || uintptr(len(gs.inst)) < size {
+		if gs.inst != nil {
+			_ = syscall.Munmap(gs.inst)
+		}
+		gs.inst = gsMapPrivate(int64(size))
+	} else {
+		clear(gs.inst[:size])
+	}
+	gs.Gl = unsafe.Pointer(unsafe.SliceData(gs.inst))
+}
+
+// gsWho names the thread program a block runs, as the runtime's reports
+// do: main's, or a worker's by its id.
+func (gs *GsStackBlock) gsWho() string {
+	if gs == nil || gs.worker == 0 {
+		return "main"
+	}
+	return "worker " + strconv.FormatInt(gs.worker-1, 10)
 }
 
 // End is where stack k's region ends, which a line print renders at the
@@ -198,25 +262,25 @@ func (gs *GsStackBlock) End(k int64) unsafe.Pointer { return unsafe.Add(gs.Base[
 
 // gsOverflow is the C runtime's report of a data stack that grows past its
 // region (gs_overflow_text), raised before a write would cross end, where
-// the region ends. The stacks are main's: there are no threads yet. A
+// the region ends, naming the thread program whose stacks they are. A
 // pooled block's region (AcquireStackBlock) is of the sizes regions have.
 func gsOverflow(end unsafe.Pointer) {
 	gsBlocksMu.Lock()
-	usable, reserve := gsRegionUsable, int64(gsStackReserve)
+	usable, reserve, who := gsRegionUsable, int64(gsStackReserve), "main"
 	for _, b := range gsBlocks {
 		for k := range b.Cap {
 			if b.End(int64(k)) == end {
-				usable, reserve = b.Cap[k], b.reserve
+				usable, reserve, who = b.Cap[k], b.reserve, b.gsWho()
 			}
 		}
 	}
 	gsBlocksMu.Unlock()
-	panic(&GsError{Msg: gsOverflowText(usable, reserve)})
+	panic(&GsError{Msg: gsOverflowText(usable, reserve, who)})
 }
 
-func gsOverflowText(usable, reserve int64) string {
+func gsOverflowText(usable, reserve int64, who string) string {
 	reserve -= reserve % int64(syscall.Getpagesize())
-	msg := "data stack overflow: a value on main's data stacks grew past the " + gsSize(usable) +
+	msg := "data stack overflow: a value on " + who + "'s data stacks grew past the " + gsSize(usable) +
 		" reserved for it"
 	if usable < reserve {
 		msg += " (halved from " + gsSize(reserve) + " when the platform ran out of address space)"
@@ -234,7 +298,7 @@ func gsFault(addr uintptr) string {
 		for k, r := range b.regions {
 			base := uintptr(unsafe.Pointer(unsafe.SliceData(r)))
 			if addr-base < uintptr(len(r)) {
-				return "goose runtime error: " + gsOverflowText(b.Cap[k], b.reserve)
+				return "goose runtime error: " + gsOverflowText(b.Cap[k], b.reserve, b.gsWho())
 			}
 		}
 	}
@@ -253,19 +317,63 @@ func gsSize(n int64) string {
 	return strconv.FormatInt(n, 10) + units[u]
 }
 
-// gsStackStats is the report a program compiled with GS_STACK_STATS gives on
-// stderr as it ends (gs_stack_stats): its indexed data stacks, the regions
-// of its block, what each reserves, and the budget.
-func gsStackStats(gs *GsStackBlock, stacks, budget int64) {
-	per := gsRegionUsable + gs.gap
-	n := int64(0)
-	if per > 0 {
-		n = budget / per
+// The program's address space budget for regions (GS_STACK_BUDGET), the
+// most regions its main program and any one worker hold, as the compiler
+// counted them, and the workers that leaves room for beside the main
+// program: what hardware_threads() reports at most (gs_rt_start).
+var (
+	gsStackBudget   uint64
+	gsMainRegions   int64
+	gsWorkerRegions int64
+	gsThreadCap     int64 = math.MaxInt64
+)
+
+// gsRtStart is the start of the runtime, as main's thread program begins
+// (gs_rt_start): the budget, and the cap on the workers it holds, each at
+// the most regions one can take, at least one. Workers that hold no
+// regions leave the cap off.
+func gsRtStart(budget uint64, mainregions, workerregions int64) {
+	gsStackBudget, gsMainRegions, gsWorkerRegions = budget, mainregions, workerregions
+	if workerregions <= 0 {
+		return
 	}
-	os.Stderr.WriteString("goose stack stats: main: " + strconv.FormatInt(stacks, 10) + " data stacks, " +
-		strconv.Itoa(len(gs.regions)) + " regions (reserving " + gsSize(gsRegionUsable) + " each); budget " +
-		gsSize(budget) + " for " + strconv.FormatInt(n, 10) + ", main program " +
-		strconv.Itoa(len(gs.regions)) + ", no workers\n")
+	page := int64(syscall.Getpagesize())
+	per := uint64(int64(gsStackReserve)-int64(gsStackReserve)%page) + uint64(gsStackGap)
+	total := uint64(0)
+	if per != 0 {
+		total = budget / per
+	}
+	spare := int64(math.MaxInt64)
+	if total <= math.MaxInt64 {
+		spare = int64(total)
+	}
+	spare -= mainregions
+	if spare > workerregions {
+		gsThreadCap = spare / workerregions
+	} else {
+		gsThreadCap = 1
+	}
+}
+
+// gsStackStats is the report a program compiled with GS_STACK_STATS gives on
+// stderr as each thread program ends (gs_stack_stats): its indexed data
+// stacks, the regions of its block, what each reserves, and the budget.
+func gsStackStats(gs *GsStackBlock, stacks int64) {
+	per := uint64(gsRegionUsable + gs.gap)
+	n := uint64(0)
+	if per > 0 {
+		n = gsStackBudget / per
+	}
+	workers := "no workers"
+	if gsWorkerRegions > 0 {
+		workers = "a worker " + strconv.FormatInt(gsWorkerRegions, 10) + ", thread cap " +
+			strconv.FormatInt(gsThreadCap, 10)
+	}
+	os.Stderr.WriteString("goose stack stats: " + gs.gsWho() + ": " + strconv.FormatInt(stacks, 10) +
+		" data stacks, " + strconv.Itoa(len(gs.regions)) + " regions (reserving " + gsSize(gsRegionUsable) +
+		" each); budget " + gsSize(int64(min(gsStackBudget, math.MaxInt64))) + " for " +
+		strconv.FormatUint(n, 10) + ", main program " + strconv.FormatInt(gsMainRegions, 10) + ", " +
+		workers + "\n")
 }
 
 // gsReserveRegion maps one region: address space only, committed by the OS
@@ -351,11 +459,16 @@ type GsError struct {
 	Line int
 }
 
-func (e *GsError) Error() string {
+func (e *GsError) Error() string { return "goose runtime error: " + e.Text() }
+
+// Text is what the error prints after "goose runtime error: ", its
+// location included: the message a contained worker's abort leaves for
+// thread_wait (§11.2).
+func (e *GsError) Text() string {
 	if e.File == "" {
-		return "goose runtime error: " + e.Msg
+		return e.Msg
 	}
-	return "goose runtime error: " + e.Msg + " (" + e.File + ":" + strconv.Itoa(e.Line) + ")"
+	return e.Msg + " (" + e.File + ":" + strconv.Itoa(e.Line) + ")"
 }
 
 // GsExitOnAbort, deferred by the program's main, ends the process as the C
@@ -366,18 +479,45 @@ func (e *GsError) Error() string {
 // panic goes on.
 func GsExitOnAbort() {
 	if r := recover(); r != nil {
-		if e, ok := r.(*GsError); ok {
-			os.Stderr.WriteString(e.Error() + "\n")
-			os.Exit(1)
-		}
-		if f, ok := r.(interface{ Addr() uintptr }); ok {
-			if msg := gsFault(f.Addr()); msg != "" {
-				os.Stderr.WriteString(msg + "\n")
-				os.Exit(1)
-			}
-		}
-		panic(r)
+		gsEndOnPanic(r)
 	}
+}
+
+// gsEndOnPanic ends the process for what a thread program's goroutine
+// recovered, as GsExitOnAbort has it; a panic of no runtime error goes on.
+func gsEndOnPanic(r any) {
+	if e, ok := r.(*GsError); ok {
+		gsEnd(1, e.Error()+"\n")
+	}
+	if f, ok := r.(interface{ Addr() uintptr }); ok {
+		if msg := gsFault(f.Addr()); msg != "" {
+			gsEnd(1, msg+"\n")
+		}
+	}
+	panic(r)
+}
+
+// Whether the process is ending: the first thread program to end it does
+// (gs_end), and any other that tries meanwhile waits for that to happen,
+// so that one report comes out, with its status.
+var gsEnding struct {
+	sync.Mutex
+	on bool
+}
+
+// gsEnd ends the process with code, msg on stderr first.
+func gsEnd(code int, msg string) {
+	gsEnding.Lock()
+	if gsEnding.on {
+		gsEnding.Unlock()
+		select {}
+	}
+	gsEnding.on = true
+	gsEnding.Unlock()
+	if msg != "" {
+		os.Stderr.WriteString(msg)
+	}
+	os.Exit(code)
 }
 
 // GsPanic is a failure of the runtime itself, which has no location in the
@@ -400,8 +540,9 @@ func GsAbortSlice(msg GsSlice, file string, line int) {
 	panic(&GsError{Msg: string(unsafe.Slice((*byte)(msg.Data), msg.Len)), File: file, Line: line})
 }
 
-// GsExit is exit(code): the process ends at once, with that status.
-func GsExit(code int64) { os.Exit(int(code)) }
+// GsExit is exit(code): the process ends at once, with that status, from
+// whichever thread program calls it (gs_exit).
+func GsExit(code int64) { gsEnd(int(code), "") }
 
 // GsUnreachable is what a function panics with where control cannot get to
 // the end of it, which the checker found: a compiler bug if it does.
@@ -2427,6 +2568,333 @@ func GsTrimMemory(gs *GsStackBlock) bool {
 	}
 	trim(gs.frame, gs.Frame, uintptr(len(gs.frame)))
 	return ok
+}
+)GSGO",
+};
+
+// Workers and typed queues (§11.2, runtime_threads.h), written into a file
+// whose program spawns a worker, waits for one, asks for hardware_threads()
+// or uses a queue (CodeGenGo::usesthreads), with the import they take
+// besides the runtime's own: time.
+inline const char *const go_runtime_threads[] = {
+R"GSGO(
+// ---------------------------------------------------------------------------
+// Workers and typed queues (§11.2), as runtime_threads.h has them. A worker
+// is a goroutine running its thread program on a block of its own, with a
+// program instance of its own: the globals its program uses, copied from
+// the spawning instance at the spawn with its arguments (GsThreadSpawn). A
+// queue is a FIFO of the images of the values put, under a mutex (GsQueue).
+// This is the one part of the runtime that allocates on Go's heap: what a
+// queue holds, and a worker's record.
+
+// GsHardwareThreads is hardware_threads(): the processors Go runs goroutines
+// on at once, but no more than the workers the data stack budget holds
+// beside the main program (gsRtStart), so that a pool sized by it never runs
+// the program out of address space.
+func GsHardwareThreads() int64 {
+	n := int64(runtime.GOMAXPROCS(0))
+	if n > gsThreadCap {
+		n = gsThreadCap
+	}
+	return n
+}
+
+// The workers (gs_threads): ids increase from 0 and are never reused, and
+// only a running worker has a record, the channel its end closes. Of those
+// that ended, the runtime keeps a bit for each contained worker that
+// aborted, from which thread_wait answers, and the message of each such
+// abort until a wait takes it.
+var gsThreads struct {
+	mu      sync.Mutex
+	next    int64
+	running map[int64]chan struct{}
+	aborted []uint64
+	msgs    map[int64]string
+}
+
+// GsThreadSpawn starts a worker running run on a block of its own and
+// returns its id (gs_thread_start): `stacks` data stacks, which the worker
+// reserves as it starts, a program instance of glsize zeroed bytes at its
+// Gl, and a copy of the n-byte spawn image at args, taken now, which run is
+// handed and the worker owns, outside the Go heap as the stacks are. In a contained worker an abort ends run early, its message
+// kept for thread_wait (§11.2). Whichever way it ends, the worker releases
+// all it holds before thread_wait sees it ended.
+func GsThreadSpawn(run func(gs *GsStackBlock, p unsafe.Pointer), stacks int, glsize uintptr,
+	args unsafe.Pointer, n int64, contained bool) int64 {
+	if n < 0 {
+		GsPanic("invalid thread argument size")
+	}
+	// The instance and the image, in one mapping the worker's block owns.
+	off := (int64(glsize) + 7) &^ 7
+	inst := gsMapPrivate(off + n)
+	p := unsafe.Add(unsafe.Pointer(unsafe.SliceData(inst)), off)
+	copy(unsafe.Slice((*byte)(p), n), unsafe.Slice((*byte)(args), n))
+	done := make(chan struct{})
+	gsThreads.mu.Lock()
+	if gsThreads.next == math.MaxInt64 {
+		gsThreads.mu.Unlock()
+		GsPanic("thread id space exhausted")
+	}
+	id := gsThreads.next
+	gsThreads.next++
+	if gsThreads.running == nil {
+		gsThreads.running = map[int64]chan struct{}{}
+	}
+	gsThreads.running[id] = done
+	gsThreads.mu.Unlock()
+	go gsThreadMain(inst, stacks, run, p, contained, id, done)
+	return id
+}
+
+// gsThreadMain is a worker's goroutine (gs_thread_main): its block, whose
+// stacks it reserves as it starts (gs_stack_block), its thread program,
+// then the release of everything it holds, and only then its end
+// published.
+func gsThreadMain(inst []byte, stacks int, run func(*GsStackBlock, unsafe.Pointer), p unsafe.Pointer,
+	contained bool, id int64, done chan struct{}) {
+	// A fault in a guard gap reaches the worker's recover, as main's does.
+	debug.SetPanicOnFault(true)
+	var gs *GsStackBlock
+	msg, aborted := gsRunWorker(func() {
+		gs = NewStackBlock(stacks, gsStackReserve, gsStackGap)
+		gs.inst, gs.Gl, gs.worker = inst, unsafe.Pointer(unsafe.SliceData(inst)), id+1
+		run(gs, p)
+	}, contained)
+	_ = gs.Close()
+	gsThreads.mu.Lock()
+	delete(gsThreads.running, id)
+	if aborted {
+		for int64(len(gsThreads.aborted)) <= id/64 {
+			gsThreads.aborted = append(gsThreads.aborted, 0)
+		}
+		gsThreads.aborted[id/64] |= 1 << uint(id%64)
+		if gsThreads.msgs == nil {
+			gsThreads.msgs = map[int64]string{}
+		}
+		gsThreads.msgs[id] = msg
+	}
+	close(done)
+	gsThreads.mu.Unlock()
+}
+
+// gsRunWorker runs a worker's thread program, f. An abort in a contained one
+// returns here, with its message (gs_run_contained); anything else ends the
+// process, as it does on main's (gsEndOnPanic): an abort in a worker that is
+// not contained, the runtime's own failures, which have no location in the
+// program, a fault in a guard gap.
+func gsRunWorker(f func(), contained bool) (msg string, aborted bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(*GsError); ok && contained && e.File != "" {
+				msg, aborted = e.Text(), true
+				return
+			}
+			gsEndOnPanic(r)
+		}
+	}()
+	f()
+	return "", false
+}
+
+// GsThreadWait waits until the worker id has ended and released all it held
+// (gs_thread_wait): false for a contained worker that aborted. With take,
+// the first such wait for that worker takes the abort's message, where
+// later ones, and any for a worker that returned, get "". gs is the block
+// of the thread program waiting.
+func GsThreadWait(gs *GsStackBlock, id int64, take bool, file string, line int) (bool, string) {
+	gsThreads.mu.Lock()
+	if id < 0 || id >= gsThreads.next {
+		gsThreads.mu.Unlock()
+		GsAbort(GsEThreadID, file, line)
+	}
+	if id == gs.worker-1 {
+		gsThreads.mu.Unlock()
+		GsAbort(GsEThreadSelf, file, line)
+	}
+	done := gsThreads.running[id]
+	gsThreads.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	gsThreads.mu.Lock()
+	defer gsThreads.mu.Unlock()
+	if id/64 >= int64(len(gsThreads.aborted)) || gsThreads.aborted[id/64]>>uint(id%64)&1 == 0 {
+		return true, ""
+	}
+	if !take {
+		return false, ""
+	}
+	m := gsThreads.msgs[id]
+	delete(gsThreads.msgs, id)
+	return false, m
+}
+
+// GsKeep is s, or where it views memory of gs's own -- a global of the
+// program instance a call of an export fn ran on -- a copy of it on Go's
+// heap: an export's result crosses to its caller once the call's block is
+// back in the pool, where the next call takes its memory.
+func GsKeep[T any](gs *GsStackBlock, s []T) []T {
+	if len(s) == 0 || !gs.owns(unsafe.Pointer(unsafe.SliceData(s))) {
+		return s
+	}
+	return append([]T(nil), s...)
+}
+
+// owns says whether p points into memory of the block's own: a data stack's
+// region, its fixed-frame stack, its program instance.
+func (gs *GsStackBlock) owns(p unsafe.Pointer) bool {
+	in := func(r []byte) bool {
+		return r != nil && uintptr(p)-uintptr(unsafe.Pointer(unsafe.SliceData(r))) < uintptr(len(r))
+	}
+	for _, r := range gs.regions {
+		if in(r) {
+			return true
+		}
+	}
+	return in(gs.frame) || in(gs.inst)
+}
+
+// GsQueue is the queue of one element type (§11.2): the image of each value
+// put, in order, and how many there are. The zero GsQueue is an empty one
+// with no limit, which is how the program declares each of its queues.
+type GsQueue struct {
+	mu      sync.Mutex
+	head    *gsQNode
+	tail    *gsQNode
+	count   int64
+	limit   int64           // 0 until qlimit gives one.
+	waiters []chan struct{} // The receivers waiting, the first first: a put wakes one.
+}
+
+type gsQNode struct {
+	next *gsQNode
+	b    []byte
+}
+
+// GsQPut queues a copy of the n bytes at p (gs_qput), taken before the lock
+// is: false, queueing nothing, where the queue holds its limit of messages.
+// It never waits.
+func GsQPut(q *GsQueue, p unsafe.Pointer, n int64) bool {
+	nd := &gsQNode{b: make([]byte, n)}
+	copy(nd.b, unsafe.Slice((*byte)(p), n))
+	q.mu.Lock()
+	if q.limit > 0 && q.count >= q.limit {
+		q.mu.Unlock()
+		return false
+	}
+	q.count++
+	if q.tail != nil {
+		q.tail.next = nd
+	} else {
+		q.head = nd
+	}
+	q.tail = nd
+	if len(q.waiters) > 0 {
+		close(q.waiters[0])
+		q.unwait(q.waiters[0])
+	}
+	q.mu.Unlock()
+	return true
+}
+
+// GsQPutV queues the image of v, a fixed-size value, n bytes of it.
+func GsQPutV[T any](q *GsQueue, v T, n int64) bool { return GsQPut(q, unsafe.Pointer(&v), n) }
+
+// GsQValue is the fixed-size value of type T whose image b is: all zero
+// bytes past what b holds, all of them for a value of no bytes or a miss.
+func GsQValue[T any](b []byte) (v T) {
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(&v)), unsafe.Sizeof(v)), b)
+	return
+}
+
+// take unlinks the first message, under the lock.
+func (q *GsQueue) take() []byte {
+	nd := q.head
+	q.head = nd.next
+	if q.head == nil {
+		q.tail = nil
+	}
+	q.count--
+	return nd.b
+}
+
+// unwait drops the receiver w from those waiting, where a put has not
+// already, under the lock.
+func (q *GsQueue) unwait(w chan struct{}) {
+	for i, x := range q.waiters {
+		if x == w {
+			copy(q.waiters[i:], q.waiters[i+1:])
+			q.waiters[len(q.waiters)-1] = nil
+			q.waiters = q.waiters[:len(q.waiters)-1]
+			return
+		}
+	}
+}
+
+// GsQGet takes the first message, waiting for one (gs_qget).
+func GsQGet(q *GsQueue) []byte {
+	q.mu.Lock()
+	for q.head == nil {
+		w := make(chan struct{})
+		q.waiters = append(q.waiters, w)
+		q.mu.Unlock()
+		<-w
+		q.mu.Lock()
+	}
+	b := q.take()
+	q.mu.Unlock()
+	return b
+}
+
+// GsQWait takes the first message, waiting at most ms milliseconds for one,
+// on a monotonic clock (gs_qwait): false where none came. Zero or less does
+// not wait, which is qpoll (gs_qpoll).
+func GsQWait(q *GsQueue, ms int64) ([]byte, bool) {
+	// The deadline in nanoseconds cannot overflow.
+	if ms > math.MaxInt64/2000000 {
+		ms = math.MaxInt64 / 2000000
+	}
+	var deadline time.Time
+	if ms > 0 {
+		deadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
+	}
+	q.mu.Lock()
+	for q.head == nil && ms > 0 {
+		left := time.Until(deadline)
+		if left <= 0 {
+			break
+		}
+		w := make(chan struct{})
+		q.waiters = append(q.waiters, w)
+		q.mu.Unlock()
+		t := time.NewTimer(left)
+		select {
+		case <-w:
+		case <-t.C:
+		}
+		t.Stop()
+		q.mu.Lock()
+		q.unwait(w)
+	}
+	if q.head == nil {
+		q.mu.Unlock()
+		return nil, false
+	}
+	b := q.take()
+	q.mu.Unlock()
+	return b, true
+}
+
+// GsQLimit gives the queue a limit of n messages (gs_qlimit): one below what
+// it holds keeps them, and puts fail until fewer remain. A limit of zero or
+// less aborts.
+func GsQLimit(q *GsQueue, n int64, file string, line int) {
+	if n <= 0 {
+		GsAbort(GsEQBound, file, line)
+	}
+	q.mu.Lock()
+	q.limit = n
+	q.mu.Unlock()
 }
 )GSGO",
 };

@@ -7,6 +7,7 @@ import (
 	"math/bits"
 	"os"
 	"strconv"
+	"sync"
 	"unsafe"
 )
 
@@ -69,11 +70,16 @@ type GsError struct {
 
 // Error is the error's text as the C runtime prints it, less the newline:
 // "goose runtime error: " and the message, then the check's location.
-func (e *GsError) Error() string {
+func (e *GsError) Error() string { return "goose runtime error: " + e.Text() }
+
+// Text is what Error prints after "goose runtime error: ", the location
+// included: the message a contained worker's abort leaves for thread_wait
+// (goose_spec.md §11.2).
+func (e *GsError) Text() string {
 	if e.File == "" {
-		return "goose runtime error: " + e.Msg
+		return e.Msg
 	}
-	return "goose runtime error: " + e.Msg + " (" + e.File + ":" + strconv.Itoa(e.Line) + ")"
+	return e.Msg + " (" + e.File + ":" + strconv.Itoa(e.Line) + ")"
 }
 
 // GsExitOnAbort, deferred at the top of a goroutine running Goose code,
@@ -82,12 +88,40 @@ func (e *GsError) Error() string {
 // panic goes on.
 func GsExitOnAbort() {
 	if r := recover(); r != nil {
-		if e, ok := r.(*GsError); ok {
-			os.Stderr.WriteString(e.Error() + "\n")
-			os.Exit(1)
-		}
-		panic(r)
+		gsEndOnPanic(r)
 	}
+}
+
+// gsEndOnPanic ends the process for what a thread program's goroutine
+// recovered, as GsExitOnAbort has it; a panic of no runtime error goes on.
+func gsEndOnPanic(r any) {
+	if e, ok := r.(*GsError); ok {
+		gsEnd(1, e.Error()+"\n")
+	}
+	panic(r)
+}
+
+// Whether the process is ending: the first thread program to end it does
+// (gs_end), and any other that tries meanwhile waits for that to happen,
+// so that one report comes out, with its status.
+var gsEnding struct {
+	sync.Mutex
+	on bool
+}
+
+// gsEnd ends the process with code, msg on stderr first.
+func gsEnd(code int, msg string) {
+	gsEnding.Lock()
+	if gsEnding.on {
+		gsEnding.Unlock()
+		select {}
+	}
+	gsEnding.on = true
+	gsEnding.Unlock()
+	if msg != "" {
+		os.Stderr.WriteString(msg)
+	}
+	os.Exit(code)
 }
 
 // GsPanic is a failure of the runtime itself (gs_panic), which has no
