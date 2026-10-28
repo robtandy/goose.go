@@ -80,6 +80,7 @@ add_executable(goose
     src/codegen_go_rz.h
     src/codegen_go_bytes.h
     src/codegen_go_export.h
+    src/codegen_go_threads.h
     src/codegen_go_emit.h
     src/runtime_inline.h
     src/jit.h

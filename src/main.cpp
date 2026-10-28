@@ -50,6 +50,7 @@
 #include "codegen_go_bytes.h"
 #include "codegen_go_export.h"
 #include "codegen_go_emit.h"
+#include "codegen_go_threads.h"
 #include "runtime_inline.h"
 #include "process.h"
 #include "jit.h"

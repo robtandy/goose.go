@@ -638,17 +638,31 @@ inline void CodeGenGo::EnsureFromChannels(FnSpec *t) {
     if (!fromemitted.insert(t).second) return;
     auto tid = fromids.at(t);
     auto &rets = t->rets;
-    Append(rfdecls, "// The result channels of a long-distance return to ", t->sf->qname, " (§7.9).\n");
+    // Package variables, or in a program with workers, whose thread
+    // programs each return on their own, members of the instance.
+    string decls;
+    auto var = [&](const string &name, const string &gt) {
+        if (workers) Append(decls, "\t", name, " ", gt, "\n");
+        else Append(decls, "var ", name, " ", gt, "\n");
+    };
+    Append(decls, workers ? "\t" : "", "// The result channels of a long-distance return to ", t->sf->qname, " (§7.9).\n");
     for (size_t i = 0; i < rets.size(); i++) {
         if (IsFix(rets[i])) {
-            Append(rfdecls, "var gsLret_", tid, "_", i, " ", GoT(rets[i], t->sf->line), "\n");
+            var(cat("gsLret_", tid, "_", i), GoT(rets[i], t->sf->line));
             continue;
         }
-        Append(rfdecls, "var gsFdst_", tid, "_", i, " int64\nvar gsFval_", tid, "_", i, " unsafe.Pointer\n");
+        var(cat("gsFdst_", tid, "_", i), "int64");
+        var(cat("gsFval_", tid, "_", i), "unsafe.Pointer");
         if (IsResz(rets[i]))
-            Append(rfdecls, "var gsLret_", tid, "_", i, " ",
-                   IsFrameObj(rets[i]) ? RzGoT(rets[i], t->sf->line) : string("int64"), "\n");
+            var(cat("gsLret_", tid, "_", i), IsFrameObj(rets[i]) ? RzGoT(rets[i], t->sf->line) : string("int64"));
     }
+    if (workers) {
+        if (fromemitted.size() == 1)
+            decls = cat("\t// The long-distance return in flight: its target's number, 0 for none.\n\tgsRf int32\n", decls);
+        glfields += decls;
+        return;
+    }
+    rfdecls += decls;
     if (fromemitted.size() == 1)
         rfdecls = cat("// The long-distance return in flight: its target's number, 0 for none.\nvar gsRf int32\n\n",
                       rfdecls);
@@ -665,7 +679,7 @@ inline void CodeGenGo::GenFromReturn(Return *r) {
     auto tid = fromids[t];
     EnsureFromChannels(t);
     auto &rets = t->rets;
-    auto chan = [&](const char *k, size_t i) { return cat("gs", k, "_", tid, "_", i); };
+    auto chan = [&](const char *k, size_t i) { return GlName(cat("gs", k, "_", tid, "_", i)); };
     // The values land at the channels' tops, which is not where the
     // target's caller expects them when anything was built in its
     // destination since: the catch moves them down (EmitRfCheck).
@@ -711,7 +725,7 @@ inline void CodeGenGo::GenFromReturn(Return *r) {
 // this starts the return, "" where gsRf holds it already.
 inline void CodeGenGo::PropagateReturn(const string &rfval) {
     EmitExitRestores(0);
-    if (!rfval.empty()) L("gsRf = ", rfval);
+    if (!rfval.empty()) L(GlName("gsRf"), " = ", rfval);
     string list;
     for (auto &z : curzeros) Append(list, list.empty() ? "" : ", ", z);
     L(list.empty() ? string("return") : cat("return ", list));
@@ -723,23 +737,24 @@ inline void CodeGenGo::PropagateReturn(const string &rfval) {
 // taken from the channels and returned; any other goes on out.
 inline void CodeGenGo::EmitRfCheck(FnSpec *callee) {
     if (Unreached()) return;
-    L("if gsRf != 0 {");
+    auto rf = GlName("gsRf");
+    L("if ", rf, " != 0 {");
     ind++;
     auto caught = curspec && callee->needs.count(curspec);
     if (caught) {
         auto tid = fromids.at(curspec);
         EnsureFromChannels(curspec);
-        L("if gsRf == ", tid, " {");
+        L("if ", rf, " == ", tid, " {");
         ind++;
-        L("gsRf = 0");
+        L(rf, " = 0");
         vector<string> rv;
         for (size_t i = 0; i < curspec->rets.size(); i++) {
             auto rt = curspec->rets[i];
-            auto lret = cat("gsLret_", tid, "_", i);
+            auto lret = GlName(cat("gsLret_", tid, "_", i));
             // The value is on this function's destination, behind anything
             // the calls it unwound built there: down to where the caller
             // expects it.
-            if (IsBytesT(rt)) LandValue(cat("gs_dst", i), DstTop0((int)i), cat("gsFval_", tid, "_", i), rt, lret);
+            if (IsBytesT(rt)) LandValue(cat("gs_dst", i), DstTop0((int)i), GlName(cat("gsFval_", tid, "_", i)), rt, lret);
             if (IsResz(rt)) {
                 L(dstcounts[i], " = ", lret);
                 rv.push_back(dstcounts[i]);

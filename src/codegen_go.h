@@ -63,9 +63,9 @@
 // The members are declared here in the order they are defined across
 // codegen_go_values.h, codegen_go_types.h, codegen_go_places.h,
 // codegen_go_aggr.h, codegen_go_rz.h, codegen_go_stmts.h,
-// codegen_go_calls.h, codegen_go_export.h and codegen_go_emit.h;
-// codegen_go_rz.h is included after codegen_go_calls.h, whose helpers it
-// uses.
+// codegen_go_calls.h, codegen_go_export.h, codegen_go_emit.h and
+// codegen_go_threads.h; codegen_go_rz.h is included after
+// codegen_go_calls.h, whose helpers it uses.
 #pragma once
 
 namespace goose {
@@ -601,6 +601,55 @@ struct CodeGenGo {
     vector<string> EmitFromBytes(Call *c, vector<Node *> &an, const GoDst &d0, Line ln);
 
     // ------------------------------------------------------------------
+    // Workers, queues and program instances (codegen_go_threads.h, §11.2).
+
+    // The program spawns workers: every global that is not read-only static
+    // data is a member of a program instance (gsGlobals), which a function
+    // reaches through its block's (gs_gl, from gs.Gl), main's instance being
+    // the static gsGlobalsMain and a worker's a copy taken at its spawn.
+    // Without workers the globals are package variables, as they always were.
+    bool workers = false;
+    bool usesthreads = false;   // The runtime's workers and queues are written in.
+    string glfields;            // gsGlobals's members.
+    string qdecls;              // The queues, one per element type.
+    // The specializations whose bodies name the instance, which take the
+    // block for it (ComputeGsNeeds).
+    set<FnSpec *> glusers;
+    // A global's stack index field, as the instance names it, by the
+    // expression a stack takes (gs_gl.gsGStk_<name>), in gstkorder's order.
+    vector<string> gstkfields;
+    unordered_map<string, string> queues;   // Element type mangle -> queue.
+    unordered_map<FnSpec *, string> thunks;  // A worker's entry -> its thunk.
+    unordered_map<FnSpec *, vector<VarDef *>> threadglobals;
+    void FindWorkers();
+    // `name` as a member of the instance where the program has workers, as a
+    // package variable otherwise.
+    string GlName(const string &name) { return workers ? cat("gs_gl.", name) : name; }
+    // A finished body's text, with the instance read from the block where
+    // it names it: whether it does.
+    bool UsesGl(string &fb);
+    string QueueFor(TypeExpr *t);
+    vector<VarDef *> &ThreadGlobals(FnSpec *entry);
+    string EnsureThreadThunk(FnSpec *sp);
+    void EmitThreadThunk(FnSpec *sp, int64_t stacks);
+    string EmitThreadSpawn(Call *c, vector<Node *> &an);
+    string EmitThreadWait(Call *c, vector<Node *> &an);
+    void EmitRzImage(GoLoc src, TypeExpr *t, const string &stk, Line ln);
+    void EmitGlobalImage(VarDef *d, const string &stk, Line ln);
+    void EmitRecvImage(TypeExpr *t, const string &img, const string &sz, const string &stk,
+                       const string &lenlv);
+    void EmitGlobalRecv(VarDef *d, const string &img, const string &sz, const string &stkidx);
+    string EmitQPut(Call *c, vector<Node *> &an);
+    vector<string> EmitQGet(Call *c, const GoDst &d0);
+    // The export fns' entry points' instances in a program with workers:
+    // the functions copying the globals an export's calls reach (or any
+    // export's) from the package's instance into a block's (gsEnter_<fn>,
+    // gsEnter).
+    unordered_map<FnSpec *, string> instfns;
+    string EnsureInstanceFn(FnSpec *sp);
+    vector<VarDef *> &InstanceGlobals(FnSpec *entry);
+
+    // ------------------------------------------------------------------
     // Per-specialization interface. A function's Go parameters are the data
     // stack block and index where it needs them (needssp), its declared
     // parameters, then the free variables it or its callees reach (§7.5),
@@ -656,8 +705,7 @@ struct CodeGenGo {
     int globalregions = 0;
     unordered_map<FnSpec *, int> thunkregions;
     int64_t maxstacks = 0;
-    // No thread programs yet.
-    vector<pair<string, FnSpec *>> WorkerEntries() { return {}; }
+    vector<pair<string, FnSpec *>> WorkerEntries();
     void NoteStackCall(FnSpec *callee, Line ln) {
         stackcalls[curspec].push_back({ callee, stknext, ln });
     }
@@ -1017,6 +1065,7 @@ struct CodeGenGo {
             incbodies.push_back({ inc.name, std::move(body) });
         }
         CollectSpecs();
+        FindWorkers();
         ComputeRelRootMax();
         EmitGlobalDecls();
         for (auto sp : livespecs) EmitSpec(sp);
