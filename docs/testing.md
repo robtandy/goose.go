@@ -566,8 +566,12 @@ elementwise arithmetic and large globals and locals, with one program per
 runtime check those make (`index_abort`, `slice_abort`, `capacity_abort`,
 `pop_abort`, `popn_abort`, `resize_abort`, `reloff_abort`, `relnull_abort`),
 the workers and queues beyond what `test/threads/` has (`threads_*`), and
-what the corpus's runs found at one level only (`varint_widen`,
-`relative_call_results`, `adapted_ref_results`).
+what parity runs of the corpus found: values stored into varint and
+relative slots (`varint_widen`, `relative_call_results`), the stacks of a
+condition's operands (`condition_stacks`), and results adapted between an
+ADT's modes and from a variant, from every kind of call, at a level where
+the call stays one (`adapted_results`, `adapted_ref_results`,
+`adapted_builtins`).
 
 The programs in `test/go/build_only/` never end, as a program whose loop only
 stopping it leaves: each is written as Go at both levels, which must vet and

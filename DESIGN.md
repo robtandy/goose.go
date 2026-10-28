@@ -82,6 +82,7 @@ Goose specifies exact byte layouts (`FixedSize`, `LayoutFields` in `src/codegen_
 ### 3.3 Variable-Size Byte Images (`Bytes` Class)
 - Represented as `unsafe.Pointer` pointing to the start of the self-describing byte image on a Data Stack.
 - Fields after a variable-size field are reached via generated `gs_size_<T>(p unsafe.Pointer) int64` walkers and `unsafe.Add(p, offset)`, identical to C Goose (`FieldPtr`, `SizeX`).
+- **An ADT adapted from another type.** Where the checker adapts the result of a call -- a function's, a case function's, a builtin's or a function value's -- or of an inlined body to an ADT it does not arrive as (a variant to its ADT, or an ADT to its other mode, `goose_spec.md` §3.5), the value is built as the type it arrives as and converted, as C builds it (`CodeGenGo::AdtFrom`, `GenAdtAdapted`, after `CodeGen`'s): a variant becoming the variable-mode ADT is built behind the ADT's tag; a fixed-mode ADT becoming the variable-mode one is built in a local and written out as the image of the variant it holds; a variable-mode value becoming the fixed-mode ADT, a reference's pointee included, is built on a temporary stack, taken before the call as C takes it, and read from there. A result a return forwards is adapted at the function's destination for it the same way (`GenForward`). Each call is made once, and both backends take the same stacks. A fixed-size value holding relative references adapted so is not supported yet.
 
 ### 3.4 Resizable Data-Stack Values (`Resizable` Class) & Slices
 - **Slices (`T[:]`)**:
