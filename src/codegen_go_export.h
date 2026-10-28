@@ -306,10 +306,12 @@ inline void CodeGenGo::EmitExports() {
         for (auto &n : { name, with })
             if (!names.insert(n).second)
                 Fail(ln, cat("export fn ", sf->name, ": another export fn's Go entry point is ", n, " too"));
-        // What its calls reach, its own body included.
+        // What its calls reach, its own body included. In a program with
+        // workers a call runs on an instance of its block's own, whose
+        // globals' stacks are the block's (codegen_go_threads.h).
         set<FnSpec *> seen;
         vector<FnSpec *> work = { sp };
-        while (!work.empty()) {
+        while (!work.empty() && !workers) {
             auto f = work.back();
             work.pop_back();
             if (!seen.insert(f).second) continue;
@@ -372,6 +374,14 @@ inline void CodeGenGo::EmitExports() {
         };
         auto stacks = ProgramStacksOf(*this, { sp });
         auto takesgs = si.needssp || si.needsgs || (specnum.count(sp) && gsneeds[specnum[sp]]);
+        // In a program with workers, a call that takes the block runs on its
+        // program instance (§11.2): one of the block's own, which a block a
+        // caller keeps keeps across its calls, and one copied for the call
+        // from the package's where the block comes from the pool.
+        auto inst = workers && takesgs;
+        // The functions filling the instance, emitted before the entry points.
+        auto enterall = inst ? EnsureInstanceFn(nullptr) : string();
+        auto enter = inst ? EnsureInstanceFn(sp) : string();
         string call = cat(si.name, "(", si.needssp ? "gs, 0" : takesgs ? "gs" : "");
         for (size_t i = 0; i < args.size(); i++) Append(call, i || takesgs ? ", " : "", args[i]);
         call += ")";
@@ -402,13 +412,17 @@ inline void CodeGenGo::EmitExports() {
         }
         if (!doc.empty()) doc += "//\n";
         Append(xcode, doc, "// ", with, " runs ", where, " on the data stacks of gs, which\n"
-               "// it gives back as it found them; it makes sure gs has the ", stacks, " stack(s) it takes.\n"
+               "// it gives back as it found them; it makes sure gs has the ", stacks, " stack(s) it takes.\n",
+               inst ? "// It runs on gs's program instance, whose globals stay gs's across calls: a copy of\n"
+                      "// the package's, made where gs has none (gsEnter).\n" : "",
                "func ", with, tps, "(", join(params, "gs *GsStackBlock"), ")", retsig, " {\n");
         if (stacks) Append(xcode, "\tgs.EnsureStacks(", stacks, ")\n");
         else if (!takesgs) xcode += "\t_ = gs\n";
+        if (inst) Append(xcode, "\tif gs.Gl == nil {\n\t\t", enterall, "(gs)\n\t}\n");
         Append(xcode, "\t", ret(call), "\n}\n\n");
         Append(xcode, doc, "// ", name, " runs ", where, " on a block of data stacks\n"
-               "// from the runtime's pool (AcquireStackBlock), which it gives back as it returns.\n"
+               "// from the runtime's pool (AcquireStackBlock), which it gives back as it returns.\n",
+               inst ? "// It runs on a program instance of its own, copied from the package's for the call.\n" : "",
                "func ", name, tps, "(", join(params, ""), ")", retsig, " {\n");
         if (!takesgs) {
             // Nothing of the block's is used: the function is called itself.
@@ -416,11 +430,16 @@ inline void CodeGenGo::EmitExports() {
             continue;
         }
         Append(xcode, "\tgs := AcquireStackBlock(", stacks, ")\n");
+        if (inst) Append(xcode, "\t", enter, "(gs)\n");
         auto fcall = cat(with, "(", join(fwd, "gs"), ")");
         if (rt.empty()) {
             Append(xcode, "\t", fcall, "\n\tReleaseStackBlock(gs)\n}\n\n");
         } else {
-            Append(xcode, "\tgs_r := ", fcall, "\n\tReleaseStackBlock(gs)\n\treturn gs_r\n}\n\n");
+            // A slice of the call's instance's globals is gone with it: it
+            // crosses as a copy.
+            auto keep = inst && rt[0] == '[';
+            Append(xcode, "\tgs_r := ", fcall, "\n", keep ? "\tgs_r = GsKeep(gs, gs_r)\n" : "",
+                   "\tReleaseStackBlock(gs)\n\treturn gs_r\n}\n\n");
         }
     }
 }

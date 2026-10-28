@@ -86,8 +86,13 @@ inline void CodeGenGo::CollectSpecs() {
                 if (c->builtin < 0) add(c->spec);
                 for (auto d : c->dispatch) add(d);
                 for (auto &fs : c->fmtspecs) add(fs.second);
-                // print renders its line on a data stack.
-                if (c->builtin == B_PRINT) si.needssp = true;
+                // print renders its line on a data stack, and thread_spawn
+                // assembles its packet on one; thread_wait asks the block
+                // which worker is waiting.
+                if (c->builtin == B_PRINT || c->builtin == B_THREAD_SPAWN ||
+                    c->builtin == B_THREAD_SPAWN_CONTAINED)
+                    si.needssp = true;
+                if (c->builtin == B_THREAD_WAIT) si.needsgs = true;
                 // An extern fn appending to a builder is handed the block.
                 if (c->builtin < 0 && c->spec && c->spec->sf->isextern && ExternTakesGs(c->spec))
                     si.needsgs = true;
@@ -220,6 +225,11 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
         } else if (IsBytesT(pt)) {
             GoT(pt, sp->sf->line);
             param(pn, "unsafe.Pointer");
+        } else if (sp->sf->isthread && IsLargeFixed(pt)) {
+            // A thread_fn's large value is the worker's copy in its spawn
+            // packet, at its address (EmitThreadThunk), as C passes one.
+            param(pn, cat("*", GoT(pt, sp->sf->line)));
+            fvptr.insert(vd);
         } else {
             param(pn, ParamT(pt, sp->sf->line));
         }
@@ -645,9 +655,10 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
         for (size_t i = 0; i < sp->rets.size(); i++) {
             if (!IsBytesT(sp->rets[i])) continue;
             auto sav = T();
-            Decl(sav, "int64", cat("gsFdst_", tid, "_", i));
-            L("gsFdst_", tid, "_", i, " = gs_dst", i);
-            fdstsaves.push_back(cat("gsFdst_", tid, "_", i, " = ", sav));
+            auto fdst = GlName(cat("gsFdst_", tid, "_", i));
+            Decl(sav, "int64", fdst);
+            L(fdst, " = gs_dst", i);
+            fdstsaves.push_back(cat(fdst, " = ", sav));
         }
     }
     for (auto st : sp->body->stmts) GenStmt(st);
@@ -676,6 +687,7 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
     auto framed = false;
     auto fb = FinishBody(body, true, curgorets, &framed);
     if (framed) hasframe.insert(sp);
+    if (UsesGl(fb)) glusers.insert(sp);
     if (fb.find("gsGStk_") != string::npos) gstkusers.insert(sp);
     Append(code, "// ", sp->sf->qname, ", line ", sp->sf->line.line, er ? ", its element-run twin" : "", "\n",
            sig, " {\n", fb, "}\n\n");
@@ -781,12 +793,23 @@ inline void CodeGenGo::EmitGlobalDecls() {
                 cstatic[d] = g->inits[di];
         }
     FindUsedGlobals();
+    // A global of a program with workers is a member of the program
+    // instance (gsGlobals), but for read-only static data, which every
+    // instance shares (§6.3); a dedicated stack is the instance's too, the
+    // index of the block's stack it is (codegen_go_threads.h).
+    auto var = [&](const VarDef *d, const string &name, const string &gt) {
+        if (workers && !cstatic.count(d)) {
+            Append(glfields, "\t", name, " ", gt, "\n");
+            return GlName(name);
+        }
+        Append(gdecls, "var ", name, " ", gt, "\n");
+        return name;
+    };
     for (auto g : ast.globals) {
         for (size_t di = 0; di < g->defs.size(); di++) {
             auto d = g->defs[di];
             if (!usedglobals.count(d)) continue;
             auto name = Unique(Sanitize(g->ns, d->name));
-            gnames[d] = name;
             if (IsBytesT(d->type)) {
                 // A header (or base) and a dedicated stack, which follows the
                 // main program's in its block (gsInitGlobals sets it up).
@@ -794,19 +817,17 @@ inline void CodeGenGo::EmitGlobalDecls() {
                     Unsupported(g->line, cat("a global of type ", TypeText(d->type), " without an initializer"));
                 GoT(d->type, g->line);
                 auto stk = Unique(cat("gsGStk_", name));
-                gstks[d] = stk;
-                Append(gdecls, "var ", name, " ", IsResz(d->type) ? RzGoT(d->type, g->line) : "unsafe.Pointer",
-                       "\n");
+                gnames[d] = var(d, name, IsResz(d->type) ? RzGoT(d->type, g->line) : "unsafe.Pointer");
+                gstks[d] = workers ? var(d, stk, "int64") : stk;
                 if (d->reusable) {
                     auto fln = Unique(cat(name, "_fl"));
                     auto flstk = Unique(cat("gsGStk_", fln));
-                    gpools[d] = { fln, flstk };
-                    Append(gdecls, "var ", fln, " GsRhdr\n");
+                    gpools[d] = { var(d, fln, "GsRhdr"), workers ? var(d, flstk, "int64") : flstk };
                 }
                 continue;
             }
             if (PrefVar(d)) {
-                Append(gdecls, "var ", name, " GsPref\n");
+                gnames[d] = var(d, name, "GsPref");
                 continue;
             }
             auto gt = GoT(d->type, g->line);
@@ -814,9 +835,10 @@ inline void CodeGenGo::EmitGlobalDecls() {
             if (!d->isvar && d->type->cq && g->inits.size() == g->defs.size() &&
                 StaticInit(g->inits[di], d->type, init)) {
                 Append(gdecls, "var ", name, " ", gt, " = ", init, "\n");
+                gnames[d] = name;
                 gstatic.insert(d);
             } else {
-                Append(gdecls, "var ", name, " ", gt, "\n");
+                gnames[d] = var(d, name, gt);
             }
         }
     }
@@ -865,8 +887,10 @@ inline void CodeGenGo::EmitGlobalInit() {
     PopSc();
     L(FRAMEEND);
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
+    auto fb = FinishBody(body, true);
+    UsesGl(fb);
     Append(code, "// The globals' initializers, in declaration order (§11.1).\n"
-                 "func gsInitGlobals(gs *GsStackBlock) {\n\t_ = gs\n", FinishBody(body, true), "}\n\n");
+                 "func gsInitGlobals(gs *GsStackBlock) {\n\t_ = gs\n", fb, "}\n\n");
 }
 
 // A global's dedicated stack, and its pool's freelist's, set up where its
@@ -874,8 +898,16 @@ inline void CodeGenGo::EmitGlobalInit() {
 // base.
 inline void CodeGenGo::InitGlobalStack(VarDef *d) {
     auto stk = gstks[d];
+    // Main's instance names the stacks of the main program's layout, which
+    // the constants gsGStk_<name> give (EmitProgram).
+    auto index = [&](const string &s) {
+        auto raw = workers ? s.substr(6) : s;
+        gstkorder.push_back(s);
+        gstkfields.push_back(raw);
+        if (workers) L(s, " = ", raw);
+    };
     globalregions++;
-    gstkorder.push_back(stk);
+    index(stk);
     if (IsResz(d->type) && IsFrameObj(d->type)) {
         // The tail header is set when the value is constructed.
     } else if (IsResz(d->type)) {
@@ -887,7 +919,7 @@ inline void CodeGenGo::InitGlobalStack(VarDef *d) {
     if (d->reusable) {
         auto &p = gpools[d];
         globalregions++;
-        gstkorder.push_back(p.second);
+        index(p.second);
         L(p.first, ".Base = ", Top(p.second));
         L(p.first, ".Len = 0");
     }
@@ -903,30 +935,47 @@ inline void CodeGenGo::EmitProgram() {
     auto mainstacks = ProgramStacksOf(*this, MainRootsOf(*this));
     auto mainsf = ast.MainFunction();
     CheckStackLimitOf(*this, "the main program", mainstacks, mainsf ? mainsf->line : Line {});
+    // The counts are final: the workers' thunks, each opening its program's
+    // block, and the most regions the main program and any one worker hold,
+    // which give hardware_threads() its cap (gs_rt_init).
+    int64_t workerregions = 0;
+    for (auto &[name, sp] : WorkerEntries()) {
+        auto stacks = ProgramStacksOf(*this, { sp });
+        CheckStackLimitOf(*this, cat("thread program ", name), stacks, sp->sf->line);
+        EmitThreadThunk(sp, stacks);
+        workerregions = std::max(workerregions, stacks + thunkregions[sp]);
+    }
     string call;
     if (!opts.library && mainsf && !mainsf->specs.empty() && sinfo.count(mainsf->specs[0])) {
         auto msp = mainsf->specs[0];
         auto &mi = sinfo[msp];
         call = cat("\t", mi.name, "(", mi.needssp ? "gs, 0" : mi.needsgs ? "gs" : GsArgPh(msp), ")\n");
     }
-    // The globals' dedicated stacks follow the main program's in its block.
-    if (!gstkorder.empty()) {
+    // The globals' dedicated stacks follow the main program's in its block,
+    // where main's instance has them (and an export's call's, in a program
+    // with workers).
+    if (!gstkfields.empty()) {
         Append(gdecls, "\n// The dedicated data stacks of the globals that live on one, which follow\n"
                        "// the main program's own in its block.\nconst (\n");
-        for (size_t i = 0; i < gstkorder.size(); i++)
-            Append(gdecls, "\t", gstkorder[i], " = ", mainstacks + (int64_t)i, "\n");
+        for (size_t i = 0; i < gstkfields.size(); i++)
+            Append(gdecls, "\t", gstkfields[i], " = ", mainstacks + (int64_t)i, "\n");
+        if (workers) Append(gdecls, "\tgsGStkEnd = ", mainstacks + globalregions, "\n");
         Append(gdecls, ")\n");
     }
     // Under GS_STACK_STATS the program reports, as it ends, the stacks it
     // took, as C's gs_stack_stats does.
     string stats;
-    if (opts.stackstats && !opts.library)
-        stats = cat("\tgsStackStats(gs, ", mainstacks, ", ", opts.stacks.budget, ")\n");
+    if (opts.stackstats && !opts.library) stats = cat("\tgsStackStats(gs, ", mainstacks, ")\n");
+    // In a program with workers, main's block runs main's instance, which
+    // the export fns' entry points copy their globals from.
+    string inst;
+    if (workers) inst = "\tgs.Gl = unsafe.Pointer(&gsGlobalsMain)\n\tgsMainBlock = gs\n";
     Append(code, opts.library ? "func init() {\n" : "func main() {\n",
            "\tdefer GsExitOnAbort()\n"
            "\tdebug.SetPanicOnFault(true)\n"
-           "\tgs := NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n"
-           "\tgsInitGlobals(gs)\n", call, stats, "}\n");
+           "\tgsRtStart(", opts.stacks.budget, ", ", mainstacks + globalregions, ", ", workerregions, ")\n"
+           "\tgs := NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n",
+           inst, "\tgsInitGlobals(gs)\n", call, stats, "}\n");
     // Every body is emitted, and the counts are final: the export fns' entry
     // points can say what they hand on.
     ComputeGsNeeds();
@@ -946,7 +995,7 @@ inline void CodeGenGo::ComputeGsNeeds() {
     auto &needs = gsneeds;
     needs.assign(numspec.size(), 0);
     for (size_t i = 0; i < numspec.size(); i++)
-        needs[i] = sinfo[numspec[i]].needsgs || hasframe.count(numspec[i]);
+        needs[i] = sinfo[numspec[i]].needsgs || hasframe.count(numspec[i]) || glusers.count(numspec[i]);
     for (auto changed = true; changed;) {
         changed = false;
         for (auto &[sp, callees] : phcalls) {
@@ -1017,6 +1066,7 @@ inline string CodeGenGo::Source(const string &srcname) {
     if (usesbits) add("", "math/bits");
     if (usesos)
         for (auto p : { "bytes", "io", "path/filepath", "strings", "time" }) add("", p);
+    if (usesthreads) add("", "time");
     sort(imports.begin(), imports.end(), [](auto &a, auto &b) { return a.second < b.second; });
     for (auto &[n, p] : incimports) add(n, p);
     string imps;
@@ -1038,7 +1088,19 @@ inline string CodeGenGo::Source(const string &srcname) {
                   "// source's, for goose run.\nconst gsJitResourceDir = ", GoStr(opts.resourcedir), "\n");
         for (auto part : go_runtime_os) s += part;
     }
-    Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, gdecls,
+    if (usesthreads)
+        for (auto part : go_runtime_threads) s += part;
+    // A program with workers keeps its globals in program instances.
+    string inst;
+    if (workers)
+        inst = cat("// The globals of a program instance (§11.1, §11.2), which every thread program has\n"
+                   "// of its own: main's is gsGlobalsMain, a worker's the copy its spawn took. Read-only\n"
+                   "// static data is not among them, which every instance shares as it is.\n"
+                   "type gsGlobals struct {\n", glfields, "}\n\nvar gsGlobalsMain gsGlobals\n\n"
+                   "// The block main's program runs, whose stacks hold main's instance's values.\n"
+                   "var gsMainBlock *GsStackBlock\n\n");
+    if (!qdecls.empty()) inst += cat("// The queues (§11.2), one per element type.\n", qdecls, "\n");
+    Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, inst, gdecls,
            gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code,
            xcode.empty() ? "" : "// ---- export fns' entry points ----\n\n", xcode, eqcode, bcode, ldstcode);
     // The --include files, last, so that the //line directive naming each

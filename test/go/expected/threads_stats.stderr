@@ -1,0 +1,2 @@
+goose stack stats: worker 0: 1 data stacks, 2 regions (reserving 2 GB each); budget 32 TB for 16376, main program 2, a worker 2, thread cap 8187
+goose stack stats: main: 1 data stacks, 2 regions (reserving 2 GB each); budget 32 TB for 16376, main program 2, a worker 2, thread cap 8187

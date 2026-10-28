@@ -730,7 +730,8 @@ inline void CodeGenGo::GenCallInto(Call *c, const vector<VarDef *> &defs) {
                  Coerce(res[i], rets[i], defs[i]->type, c->line));
         return;
     }
-    if (c->fvbody || (c->builtin < 0 && !c->spec && !nonfixed) || (c->builtin >= 0 && c->builtin != B_FROM_BYTES))
+    if (c->fvbody || (c->builtin < 0 && !c->spec && !nonfixed) ||
+        (c->builtin >= 0 && c->builtin != B_FROM_BYTES && c->builtin != B_QGET && c->builtin != B_QPOLL))
         Unsupported(c->line, "a multiple binding from this call");
     auto sp = c->spec;
     if (nonfixed || c->builtin >= 0 || !PlainSig(sp)) {
@@ -912,7 +913,10 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             auto t = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
             GoT(t, ln);
             auto want = d.t ? d.t : c->exprtype;
-            if (!c->defaultinit) {
+            // A large one is built in a slot on a data stack, as C's is
+            // (FixedLocal), with a default of its own or none.
+            auto large = IsLargeFixed(t) && !(curspec && curspec->incycle);
+            if (!c->defaultinit && !large) {
                 if (d.k == GD_DISCARD) return;
                 if (IsRelRef(want)) {
                     L(d.s, " = 0");
@@ -921,8 +925,11 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
                 L(d.s, " = ", Coerce(ZeroOf(t, ln), t, want, ln));
                 return;
             }
-            auto v = T();
-            Decl(v, LocalT(t, ln));
+            auto v = FixedLocal(t, T(), "", false, ln);
+            if (!c->defaultinit) {
+                if (d.k != GD_DISCARD) L(d.s, " = ", Coerce(v, t, want, ln));
+                return;
+            }
             if (t->kind == TY_ARRAY) {
                 auto av = ArrayView(AtVar(v, t), ln);
                 auto i = T();
@@ -1017,6 +1024,43 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
                 if (Unreached()) break;
                 EmitFormatInto(l, an[i], ln, c);
             }
+            return;
+        }
+        // Workers and queues (§11.2, codegen_go_threads.h): what is emitted
+        // for its effect -- a spawn, a wait, a put -- is emitted whether or
+        // not its result is used.
+        case B_HARDWARE_THREADS: {
+            usesthreads = true;
+            if (d.k == GD_DISCARD) return;
+            auto want = d.t ? d.t : c->exprtype;
+            L(d.s, " = ", Coerce("GsHardwareThreads()", ast.inttypes[IS_I64], want, ln));
+            return;
+        }
+        case B_THREAD_SPAWN: case B_THREAD_SPAWN_CONTAINED: case B_THREAD_WAIT: case B_QPUT: {
+            auto x = c->builtin == B_THREAD_WAIT ? EmitThreadWait(c, an)
+                     : c->builtin == B_QPUT     ? EmitQPut(c, an)
+                                                : EmitThreadSpawn(c, an);
+            if (d.k == GD_DISCARD || Unreached()) return;
+            auto rt = c->builtin == B_THREAD_WAIT || c->builtin == B_QPUT ? ast.booltype : ast.inttypes[IS_I64];
+            L(d.s, " = ", Coerce(x, rt, d.t ? d.t : c->exprtype, ln));
+            return;
+        }
+        case B_QLIMIT: {
+            auto n = Coerce(GenX(an[0]), an[0]->exprtype, ast.inttypes[IS_I64], ln);
+            if (Unreached()) return;
+            L("GsQLimit(&", QueueFor(c->qtype), ", ", n, ", ", LocArgs(ln), ")");
+            return;
+        }
+        case B_QGET: case B_QPOLL: {
+            auto t = c->rettypes[0];
+            auto res = EmitQGet(c, GoDst {});
+            if (d.k == GD_DISCARD || Unreached()) return;
+            auto want = d.t ? d.t : c->exprtype;
+            string x;
+            if (IsResz(t)) x = LoadLoc(RzTempLoc(t, res[0], ""), want, ln);
+            else if (IsBytesT(t)) x = LoadLoc(BytesLoc(res[0], t, GoLoc {}), want, ln);
+            else x = CoerceVal(res[0], t, want, ln);
+            if (x != d.s) L(d.s, " = ", x);
             return;
         }
         case B_LEN: case B_CAP: case B_INDEX_OF: case B_PUSH: case B_APPEND: case B_POP:

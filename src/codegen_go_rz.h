@@ -1161,6 +1161,7 @@ inline vector<string> CodeGenGo::GenRzBuiltin(Call *c, const GoDst &d0) {
         case B_STR: return EmitStr(c, an, d0, c->line);
         case B_TO_BYTES: return EmitToBytes(an, d0, c->line);
         case B_FROM_BYTES: return EmitFromBytes(c, an, d0, c->line);
+        case B_QGET: case B_QPOLL: return EmitQGet(c, d0);
         default: break;
     }
     auto t = c->exprtype;

@@ -38,6 +38,17 @@ The programs of test/go/unsupported/ use what this version of the Go backend
 does not compile yet. Each must stop the compile with every `// error:`
 message its source names, where the C backend compiles it.
 
+The C suite's fixtures of test/stdlib/ and test/threads/ run through both
+backends as the suite's programs do, at -O2 and at -O0 (and with --debug
+where their first line asks run_tests.py for a GS_DEBUG run), with the -D
+their first line names, and must print what test/expected/ holds for them,
+as run_tests.py judges a C run (Runner.fixture); one that differs by design
+(SWEEP_KNOWN) is counted, not run. The samples SAMPLES names run in
+samples/ through both backends, which must agree on stdout and the exit
+code and print what samples/expected/ holds: their stderr is timings. A
+program with workers needs a C compiler for its reference, which a JIT run
+cannot build; without one it is counted, not run.
+
 A few checks of the command line follow: the target -o out.go implies, `goose
 run --target=go` and `goose build --target=go`, --go-package and --library.
 
@@ -90,7 +101,11 @@ UNSUPPORTED = "is not supported by --target=go yet"
 SWEEP_KNOWN = {
     "runtime/native_stack_overflow.goose": "native stack exhaustion",
     "runtime/render_reference_cycle.goose": "native stack exhaustion",
+    "threads/thread_stack_overflow.goose": "native stack exhaustion, in a worker",
 }
+# The samples whose output the Go backend's must match (Runner.sample): the
+# rest are issue #6's, which puts them all through both backends.
+SAMPLES = ["23_mandelbrot_threads.goose"]
 FLOW_TIMEOUT = 60   # Seconds a --fuzz-flow program may run.
 
 
@@ -746,6 +761,10 @@ class Runner:
             # TinyCC in the compiler's process: what the compile itself
             # prints to stderr (its warnings) comes before the program's.
             code, o, e = self.goose(*flags, "--jit", src, timeout=timeout)
+            if code != 0 and "JIT mode does not support threads" in e:
+                out.append(("skip", f"{name}: a program with workers, which a JIT run cannot build",
+                            None))
+                return None
             _, _, warnings = self.goose(*flags, "--check", src)
             if warnings and e.startswith(warnings):
                 e = e[len(warnings):]
@@ -989,17 +1008,24 @@ class Runner:
             out.append(("fail", f"unsupported {src.name}: the C backend's check fails", o + e))
         return out
 
-    def stdlib(self, src):
-        """A fixture of the C suite's test/stdlib/ (issue #5): compiled by
-        both backends at -O2 and at -O0, and with --debug at -O2 where its
-        first line asks run_tests.py for a GS_DEBUG run (`runtime-debug`),
-        each run in a directory of its own, since the os fixtures write
-        files where they run. The Go must vet, build (at -O2 with
-        -d=checkptr as well) and run as the C does, its -O2 run print what
-        test/expected/ holds, as run_tests.py judges a C run, and the two
-        report the same data stacks."""
+    def fixture(self, src):
+        """A fixture of the C suite's test/stdlib/ (issue #5) or test/threads/
+        (issue #12): compiled by both backends at -O2 and at -O0, and with
+        --debug at -O2 where its first line asks run_tests.py for a GS_DEBUG
+        run (`runtime-debug`), each with the -D its first line names
+        (`runtime-define`), each run in a directory of its own, since the os
+        fixtures write files where they run. The Go must vet, build (at -O2
+        with -d=checkptr as well) and run as the C does, its -O2 run print
+        what test/expected/ holds, as run_tests.py judges a C run, and the
+        two report the same data stacks. One that differs by design
+        (SWEEP_KNOWN) is counted, not run."""
         out = []
-        name = f"stdlib-{src.stem}"
+        section = src.parent.name
+        known = SWEEP_KNOWN.get(f"{section}/{src.name}")
+        if known:
+            out.append(("known", f"{section}/{src.name} ({known})", None))
+            return out
+        name = f"{section}-{src.stem}"
         flags = runtime_defines(src)
         builds = [["-O2"], ["-O0"]]
         if "runtime-debug" in first_line(src):
@@ -1007,7 +1033,7 @@ class Runner:
         gotrun = None
         for b in builds:
             tag = "-".join(x.strip("-") for x in b)
-            label = f"stdlib/{src.name} {' '.join(b)}"
+            label = f"{section}/{src.name} {' '.join(b)}"
             rundir = self.work / f"{name}-{tag}-run"
             rundir.mkdir(parents=True, exist_ok=True)
             ref = self.c_run(src, f"{name}-{tag}", flags + b, out, cwd=rundir)
@@ -1048,11 +1074,49 @@ class Runner:
             elif o.rstrip("\n") != tc.decode(outfile.read_bytes()).rstrip("\n"):
                 bad.append("stdout")
             if bad:
-                out.append(("fail", f"expected stdlib/{src.name} (Go -O2): {', '.join(bad)}",
+                out.append(("fail", f"expected {section}/{src.name} (Go -O2): {', '.join(bad)}",
                             f"--- stdout:\n{o}\n--- stderr:\n{e}"))
             else:
-                out.append(("ok", f"expected stdlib/{src.name}", None))
+                out.append(("ok", f"expected {section}/{src.name}", None))
         self.stacks(src, name, flags, out)
+        return out
+
+    def sample(self, src):
+        """A sample of samples/ (SAMPLES) whose output the Go backend's
+        must match: compiled by both backends at -O2 and at -O0, run in
+        samples/ as run_samples.py runs one, the Go built with -d=checkptr
+        at -O2 as well. The runs must agree on stdout and the exit code, and
+        print what samples/expected/ holds; stderr is the sample's timings,
+        which no two runs share. The two report the same data stacks."""
+        out = []
+        name = f"sample-{src.stem}"
+        for level in ("2", "0"):
+            label = f"samples/{src.name} -O{level}"
+            ref = self.c_run(src, f"{name}-O{level}", [f"-O{level}"], out, cwd=src.parent)
+            exes = self.go_program(src, f"{name}-O{level}", [f"-O{level}"], out, checkptr=level == "2")
+            if exes is None or ref is None:
+                continue
+            if not isinstance(exes, tuple):
+                exes = (exes,)
+            for exe, kind in zip(exes, ("", " -d=checkptr")):
+                got = run_capture([exe], cwd=src.parent)
+                bad = [what for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]))
+                       if g != c]
+                if bad:
+                    out.append(("fail", f"parity {label}{kind}: {', '.join(bad)}",
+                                f"--- go (exit {got[0]}):\n{got[1]}{got[2]}\n--- c (exit {ref[0]}):\n"
+                                f"{ref[1]}{ref[2]}"))
+                    continue
+                out.append(("ok", f"run {label}{kind}", None))
+                if level == "2" and not kind:
+                    exp = src.parent / "expected" / f"{src.stem.split('_', 1)[1]}.out"
+                    want = tc.decode(exp.read_bytes()) if exp.exists() else None
+                    if want is None or got[1].rstrip("\n") != want.rstrip("\n"):
+                        out.append(("fail", f"expected samples/{src.name} (Go -O2)",
+                                    f"--- got:\n{got[1]}\n--- want:\n{want}"))
+                    else:
+                        out.append(("ok", f"expected samples/{src.name}", None))
+        self.stacks(src, name, [], out)
         return out
 
     def export(self, d):
@@ -1342,26 +1406,31 @@ def main():
     print(f"C reference: {r.cc.desc if r.cc else 'TinyCC (goose --jit)'}")
     programs = sorted((HERE / "go" / "programs").glob("*.goose"))
     build_only = sorted((HERE / "go" / "build_only").glob("*.goose"))
-    stdlib = sorted((HERE / "stdlib").glob("*.goose"))
+    # The C suite's fixtures of the stdlib and of the threads (issue #12),
+    # sections of their own (Runner.fixture).
+    stdlib = sorted((HERE / "stdlib").glob("*.goose")) + sorted((HERE / "threads").glob("*.goose"))
+    samples = [REPO / "samples" / n for n in SAMPLES]
     exports = sorted(p for p in (HERE / "go" / "export").iterdir() if p.is_dir())
     if args.names:
         programs = [p for p in programs if p.stem in args.names]
         build_only = [p for p in build_only if p.stem in args.names]
         stdlib = [p for p in stdlib if p.stem in args.names]
         exports = [p for p in exports if p.name in args.names]
-        if not programs and not build_only and not stdlib and not exports:
+        samples = [p for p in samples if p.stem in args.names]
+        if not programs and not build_only and not stdlib and not exports and not samples:
             ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
-                     "test/go/build_only, test/stdlib or test/go/export")
+                     "test/go/build_only, test/stdlib, test/threads, test/go/export or samples")
     if args.bless:
-        # Their expected output is the C suite's (test/expected/), and an
-        # export library's its Go tests.
-        stdlib, exports = [], []
+        # Their expected output is the C suite's (test/expected/), a
+        # sample's its own, and an export library's its Go tests.
+        stdlib, exports, samples = [], [], []
     unsupported = [] if args.names else sorted((HERE / "go" / "unsupported").glob("*.goose"))
     sweep = []
     if args.sweep:
-        # test/stdlib/ has a section of its own (Runner.stdlib).
+        # test/stdlib/ and test/threads/ have sections of their own
+        # (Runner.fixture).
         skipdirs = {"errors", "errors_tc", "goose_in_goose", "lsp", "go", "packages", "gfx",
-                    "physics", "ui", "audio", "stdlib"}
+                    "physics", "ui", "audio", "stdlib", "threads"}
         sweep = [f for f in sorted(HERE.glob("*/*.goose"))
                  if f.parent.name not in skipdirs and f.name != "lexer_tokens.goose" and
                  not error_markers(f) and "parse-only" not in first_line(f)]
@@ -1369,7 +1438,8 @@ def main():
         futures = [pool.submit(r.program, p) for p in programs]
         futures += [pool.submit(r.build_only, p) for p in build_only]
         futures += [pool.submit(r.unsupported, p) for p in unsupported]
-        futures += [pool.submit(r.stdlib, p) for p in stdlib]
+        futures += [pool.submit(r.fixture, p) for p in stdlib]
+        futures += [pool.submit(r.sample, p) for p in samples]
         futures += [pool.submit(r.export, p) for p in exports]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
         futures += [pool.submit(r.sweep, p) for p in sweep]
