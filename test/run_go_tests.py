@@ -1206,6 +1206,10 @@ class Runner:
                 exes = (exes,)
             for exe, kind in zip(exes, ("", " -d=checkptr")):
                 got = run_capture([exe] + args, cwd=rundir, timeout=SAMPLE_TIMEOUT, stdin_path=stdin)
+                if got[0] is None:
+                    out.append(("fail", f"{label}{kind}: the Go run did not end in {SAMPLE_TIMEOUT}s",
+                                None))
+                    continue
                 bad = [what for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
                                                ("stderr", masked(got[2]), masked(ref[2])))
                        if g != c]
