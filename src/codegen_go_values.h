@@ -764,6 +764,122 @@ inline string CodeGenGo::GenTruth(Node *n) {
     return GenX(n);
 }
 
+// Whether a condition, under any `!`s, is a && or || or an inlined call of a
+// bool function: one C's GenBranch takes as branches (CodeGen::BranchChain).
+inline bool CodeGenGo::BranchChain(Node *n) {
+    for (auto u = Is<Unary>(n); u && u->op == T_NOT; u = Is<Unary>(n)) n = u->child;
+    if (auto b = Is<Binary>(n); b && (b->op == T_ANDAND || b->op == T_OROR)) return true;
+    auto ib = Is<InlineBlock>(n);
+    return ib && ib->exprtype && ib->exprtype->kind == TY_BOOL;
+}
+
+// The truth of a condition C takes as branches (CodeGen::GenBranch): a && or
+// || is a chain of its operands, and each operand at a leaf is evaluated in a
+// scope of its own, whose data-stack restores run once its truth is taken,
+// ahead of the next operand, so that the operands of the chain share their
+// stacks; an inlined bool call's returns are conditions of the same kind
+// (GoDst::truth), its arguments bound in a scope of their own. A && or ||
+// as a value holds its left operand's temporaries while its right one runs
+// (GenBinary), as C's does too: both backends take the same stacks, and
+// --stacks reports the same counts for them.
+inline string CodeGenGo::GenBranchTruth(Node *n) {
+    if (auto u = Is<Unary>(n); u && u->op == T_NOT) return cat("(!", GenBranchTruth(u->child), ")");
+    if (auto b = Is<Binary>(n); b && (b->op == T_ANDAND || b->op == T_OROR)) {
+        auto l = GenBranchTruth(b->left);
+        string r;
+        if (!HasStmts(b->right) && TryPure([&] { return GenTruth(b->right); }, r)) {
+            if (VetBoolClash(l, r, b->op == T_ANDAND)) r = cat("GsBool(", r, ")");
+            return cat("(", l, b->op == T_ANDAND ? " && " : " || ", r, ")");
+        }
+        auto t = T();
+        Decl(t, "bool", l);
+        if (Unreached()) {
+            GenUnreached([&] { GenBranchTruth(b->right); });
+            return t;
+        }
+        L("if ", b->op == T_ANDAND ? t : cat("!", t), " {");
+        ind++;
+        r = GenBranchTruth(b->right);
+        L(t, " = ", r);
+        ind--;
+        LS("}");
+        dead = false;
+        return t;
+    }
+    if (auto ib = Is<InlineBlock>(n); ib && ib->exprtype && ib->exprtype->kind == TY_BOOL) {
+        auto t = T();
+        Decl(t, "bool");
+        PushSc(SC_PLAIN);
+        GoDst d { GD_LVALUE, t, ib->exprtype };
+        d.truth = true;
+        GenAny(ib, d);
+        PopSc();
+        return t;
+    }
+    PushSc(SC_PLAIN);
+    auto x = GenTruth(n);
+    // Taken before the restores, which may give back what it reads.
+    if (!scopes.back().saves.empty() && !Unreached()) {
+        auto t = T();
+        Decl(t, "bool", x);
+        x = t;
+    }
+    PopSc();
+    return x;
+}
+
+// A path to a value that no check guards: a variable, or a field of one
+// (CodeGen's CheckFreePath).
+static bool GoCheckFreePath(Node *n) {
+    if (auto id = Is<Ident>(n)) return id->vdef != nullptr;
+    if (auto d = Is<Dot>(n)) return d->IsField() && GoCheckFreePath(d->obj);
+    return false;
+}
+
+// Whether C hoists the bounds check both arms of an if start with ahead of
+// its branch (CodeGen::LeadingCheck, SameCheck): it takes the condition as
+// a value then, not as branches.
+inline bool CodeGenGo::HoistsCheck(IfExpr *fi) {
+    // Two check-free paths, or integer constants, that denote the same
+    // thing (CodeGen::SamePath).
+    function<bool(Node *, Node *)> same = [&](Node *a, Node *b) {
+        if (auto ia = Is<Ident>(a)) {
+            auto ib = Is<Ident>(b);
+            return ib && ia->vdef && ia->vdef == ib->vdef;
+        }
+        if (auto la = Is<IntLit>(a)) {
+            auto lb = Is<IntLit>(b);
+            return lb && la->val == lb->val;
+        }
+        auto da = Is<Dot>(a), db = Is<Dot>(b);
+        return da && db && da->IsField() && db->IsField() && da->fieldidx == db->fieldidx &&
+               TEq(da->obj->exprtype, db->obj->exprtype) && same(da->obj, db->obj);
+    };
+    auto leading = [&](Node *arm) -> Index * {
+        auto b = Is<Block>(arm);
+        if (!b || b->stmts.empty()) return nullptr;
+        auto a = Is<Assign>(b->stmts[0]);
+        if (!a) return nullptr;
+        auto p = a->lval;
+        while (auto d = Is<Dot>(p)) {
+            if (!d->IsField()) return nullptr;
+            p = d->obj;
+        }
+        auto ix = Is<Index>(p);
+        if (!ix || ix->nobc || fillvalues.count(ix) || !GoCheckFreePath(ix->obj)) return nullptr;
+        if (auto iv = Is<Ident>(ix->idx)) return iv->vdef ? ix : nullptr;
+        auto il = Is<IntLit>(ix->idx);
+        auto at = ix->obj->exprtype;
+        if (at && at->kind == TY_REF) at = at->ref->sub;
+        if (!il || !at || (at->kind == TY_ARRAY && at->arr->akind == A_FIXED)) return nullptr;
+        return ix;
+    };
+    auto ta = !fi->flat && fi->elseb ? leading(fi->thenb) : nullptr;
+    auto ea = ta ? leading(fi->elseb) : nullptr;
+    return ea && same(ta->obj, ea->obj) && same(ta->idx, ea->idx) &&
+           TEq(ta->obj->exprtype, ea->obj->exprtype);
+}
+
 // A control construct as a value: built into a temporary of its type. One
 // typed as a relative reference (a branch's value for such a slot) is the
 // plain reference it encodes.
@@ -812,6 +928,12 @@ inline void CodeGenGo::LeafAny(Node *n, const GoDst &d) {
         return;
     }
     if (d.k == GD_LVALUE) {
+        if (d.truth) {
+            // A condition's truth (an inlined bool call's value, in one).
+            auto x = GenBranchTruth(n);
+            if (x != d.s) L(d.s, " = ", x);
+            return;
+        }
         if (d.t && IsRelRef(d.t)) {
             GenRelStore(AtVar(d.s, d.t), n, false);
             return;

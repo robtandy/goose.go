@@ -879,7 +879,8 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
     switch ((BuiltinKind)c->builtin) {
         case B_PRINT: EmitPrint(c); return;
         case B_ASSERT: {
-            auto x = GenTruth(an[0]);
+            // A && or || as C branches on it (CodeGen::GenBranch).
+            auto x = BranchChain(an[0]) ? GenBranchTruth(an[0]) : GenTruth(an[0]);
             if (Unreached()) return GenUnreached([&] { GenBuiltin(c, d); });
             L("if !", x, " {");
             ind++;

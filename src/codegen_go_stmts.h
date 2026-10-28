@@ -258,7 +258,9 @@ inline void CodeGenGo::GenBlock(Block *b, const GoDst &d) {
 // Conditionals.
 
 inline void CodeGenGo::GenIf(IfExpr *fi, const GoDst &d) {
-    auto c = GenTruth(fi->cond);
+    // A && or || condition, or an inlined bool call, as C branches on it
+    // (IfExpr::CgAny), but where C hoists the arms' common check.
+    auto c = BranchChain(fi->cond) && !HoistsCheck(fi) ? GenBranchTruth(fi->cond) : GenTruth(fi->cond);
     if (Unreached()) return GenUnreached([&] { GenIf(fi, d); });
     if (fi->flat) {
         // The else cannot complete normally, so the then-block's contents
@@ -494,9 +496,9 @@ inline void CodeGenGo::GenWhile(While *w) {
     L(incond ? cat("for ", CondText(c), " {") : string("for {"));
     ind++;
     if (!incond) {
-        PushSc(SC_PLAIN);
-        c = GenTruth(w->cond);
-        PopSc();
+        // In a scope of its own, or its operands' each (GenBranchTruth), as
+        // C's branches on it are.
+        c = GenBranchTruth(w->cond);
         // A condition that ends the flow itself, with a break or a return
         // in it, leaves no test to make, and the body unreached.
         if (!dead) {
