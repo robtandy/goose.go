@@ -398,19 +398,10 @@ inline void CodeGenGo::GenEarlyBlock(EarlyBlock *eb, const GoDst &d) {
 // as a break leaves a block.
 inline void CodeGenGo::GenInlineBlock(InlineBlock *ib, const GoDst &d) {
     if (Unreached()) return GenUnreached([&] { GenInlineBlock(ib, d); });
-    // A body delivering a variable-mode ADT, or a reference to one, whose
-    // value the checker adapted to the fixed-mode ADT: built on a temporary
-    // stack, as C builds it (GenAdtAdapted), and read as that from there.
-    if (auto from = AdaptedIbFrom(ib);
-        from && ((d.k == GD_LVALUE && !d.pool && !d.truth) || d.k == GD_STACK) &&
-        (!d.t || TEq(d.t, ib->exprtype))) {
-        string stk;
-        auto base = BytesTemp(stk);
-        EmitIbBody(ib, GoDst { GD_STACK, stk, from });
-        if (Unreached()) return;
-        auto x = LoadLoc(BytesLoc(base, from, GoLoc {}), ib->exprtype, ib->line);
-        if (d.k == GD_LVALUE) L(d.s, " = ", x);
-        else EmitValStore(d.s, ib->exprtype, x);
+    // The body delivers the callee's own result type; one the call site
+    // adapted to an ADT converts on the way out (InlineBlock::CgAny).
+    if (auto from = AdtFrom(ib)) {
+        GenAdtAdapted(from, ib->exprtype, d, ib->line, [&](const GoDst &nd) { EmitIbBody(ib, nd); });
         return;
     }
     // A call passed where a slice is expected was checked as that slice
@@ -878,6 +869,17 @@ inline vector<string> CodeGenGo::GenForward(Call *c, const vector<TypeExpr *> &r
     return vals;
 }
 
+// Whether a call's results, forwarded by a return, include one its function
+// gives out as a value of another type that is not fixed-size (a variant's
+// ADT in variable mode, say), which GenForward builds at its destination.
+inline bool CodeGenGo::ForwardsAdapted(Call *c) {
+    auto &own = curspec->rets;
+    if (c->rettypes.size() != own.size()) return false;
+    for (size_t i = 0; i < own.size(); i++)
+        if (IsBytesT(own[i]) && !TEq(c->rettypes[i], own[i])) return true;
+    return false;
+}
+
 inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
     if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
     auto sp = curspec;
@@ -890,12 +892,14 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
         // A single call forwards all its results (§7.1).
         auto c = Is<Call>(vals[0]);
         // A builtin's (from_bytes's value and its bool), a dispatch's that
-        // are not all fixed-size, a function value's: each result into its
-        // channel, a non-fixed one built at this function's destination for
-        // it, its count into gs_rl<i>, by the call's own convention
-        // (GenCallVals), as the C backend forwards them (GenForward).
+        // are not all fixed-size, a function value's, and any call's one of
+        // whose results goes out as a value of another type that is not
+        // fixed-size (ForwardsAdapted): each result into its channel, a
+        // non-fixed one built at this function's destination for it, its
+        // count into gs_rl<i>, by the call's own convention (GenCallVals),
+        // as the C backend forwards them (GenForward).
         if (c && c->rettypes.size() == sp->rets.size() &&
-            (c->builtin >= 0 || c->fvbody || NonFixedDispatch(c))) {
+            (c->builtin >= 0 || c->fvbody || NonFixedDispatch(c) || ForwardsAdapted(c))) {
             vector<GoDst> chans(sp->rets.size());
             vector<string> starts(sp->rets.size());
             for (size_t i = 0; i < sp->rets.size(); i++) {
@@ -978,14 +982,19 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
             return;
         }
         string names, marks;
+        vector<string> got;
         for (size_t i = 0; i < sp->rets.size(); i++) {
             auto t = T();
             NoteType(t, GoT(c->spec->rets[i], c->line));
-            rv.push_back(Coerce(t, c->spec->rets[i], sp->rets[i], c->line));
+            got.push_back(t);
             Append(names, i ? ", " : "", t);
             Append(marks, i ? "," : "", t);
         }
         L(names, " := ", call, DECLMARK, marks);
+        // Each converted once the call has made it: a variant's ADT, say,
+        // takes statements of its own (AdaptToEnum).
+        for (size_t i = 0; i < sp->rets.size(); i++)
+            rv.push_back(Coerce(got[i], c->spec->rets[i], sp->rets[i], c->line));
     } else {
         if (vals.size() != sp->rets.size()) Fail(sp->sf->line, "internal: return value count");
         for (size_t i = 0; i < vals.size(); i++) {

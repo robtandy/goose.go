@@ -1016,9 +1016,11 @@ struct CodeGenGo {
     unordered_map<FnSpec *, vector<FnSpec *>> calleesof;
     vector<string> GenCallVals(Call *c, const GoDst &d0, vector<GoDst> *alldst = nullptr);
     string CallVal0(Call *c, const string &r0, TypeExpr *want);
-    TypeExpr *AdaptedRefFrom(Call *c);
-    TypeExpr *AdaptedIbFrom(InlineBlock *ib);
-    string GenAdaptedCall(Call *c, TypeExpr *from);
+    TypeExpr *AdtFrom(Node *n);
+    void GenAdtAdapted(TypeExpr *from, TypeExpr *to, const GoDst &d, Line ln,
+                       const function<void(const GoDst &)> &gen);
+    void GenCallAs(Call *c, TypeExpr *t, const GoDst &d);
+    bool ForwardsAdapted(Call *c);
     GoLoc CallResLoc(Call *c, const string &r0);
     vector<string> GenDispatch(Call *c, const GoDst &d0, vector<GoDst> *alldst);
     bool NonFixedDispatch(Call *c);

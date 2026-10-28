@@ -710,9 +710,11 @@ inline void CodeGenGo::ConstructFromLoc(GoLoc l, TypeExpr *et, const string &stk
 // A call's first result constructed as et at stk's top (CodeGen::ConstructCall).
 inline void CodeGenGo::ConstructCall(Call *c, TypeExpr *et, const string &stk, TypeExpr *want,
                                      const string &lenlv) {
-    if (auto from = AdaptedRefFrom(c); from && !IsBytesT(et) && TEq(et, c->exprtype)) {
-        auto x = GenAdaptedCall(c, from);
-        if (!Unreached()) EmitValStore(stk, et, x);
+    // A result the checker adapted to an ADT, as C builds it (GenConstruct's
+    // GenAdtAdapted).
+    if (auto from = AdtFrom(c); from && TEq(et, c->exprtype)) {
+        GenAdtAdapted(from, et, GoDst { GD_STACK, stk, et, lenlv }, c->line,
+                      [&](const GoDst &nd) { GenCallAs(c, from, nd); });
         return;
     }
     auto rt0 = c->rettypes.empty() ? nullptr : c->rettypes[0];
