@@ -209,8 +209,8 @@ inline string CodeGenGo::GenLitVal(Node *n) {
         al->exprtype = save;
         return LoadLoc(AtVar(a, at), t, n->line);
     }
-    auto v = T();
-    Decl(v, LocalT(t, n->line));
+    // A large value's temporary is on a data stack, as C's is, zeroed first.
+    auto v = FixedLocal(t, T(), "", false, n->line);
     LitInto(n, AtVar(v, t), true);
     return v;
 }

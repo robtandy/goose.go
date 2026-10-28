@@ -1057,6 +1057,16 @@ inline void CodeGenGo::BindLocal(VarDef *d, Node *init, bool forlocal) {
         Decl(name, "GsPref", x);
         return;
     }
+    // A large fixed-size value: on a data stack of its own, as C holds it
+    // (FixedLocal), taken before its initializer runs, which builds the
+    // value there; the name points at it.
+    if (IsLargeFixed(t) && !(curspec && curspec->incycle)) {
+        auto name = LocalName(d);
+        auto lv = FixedLocal(t, name, "", forlocal, d->line, !init);
+        fvptr.insert(d);
+        if (init) GenAny(init, GoDst { GD_LVALUE, lv, t });
+        return;
+    }
     auto gt = LocalT(t, d->line);
     if (!init) {
         Decl(LocalName(d), gt);

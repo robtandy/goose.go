@@ -255,13 +255,40 @@ inline bool CodeGenGo::BitwiseEq(TypeExpr *t) {
 // temporary, outside a recursive cycle (CodeGen::FixedLocal), and passes
 // and returns one through such a copy. Those stacks are part of the counts
 // both backends report and reserve (--stacks), so this version keeps such a
-// value only where the C backend keeps none: in a global, which is filled
-// in place, and in the locals of a recursive cycle. Anything else is not
+// value where it takes the stacks the C backend does: in a global, which is
+// filled in place; in the locals of a recursive cycle, which take none; and
+// on a data stack where C takes one too (FixedLocal): a named local, a
+// literal's or a default's temporary, a queue's value; a thread_fn's
+// parameter is the worker's copy in its spawn packet. Anything else is not
 // supported yet.
 
 inline bool CodeGenGo::IsLargeFixed(TypeExpr *t) {
     return t && t->kind != TY_VOID && t->kind != TY_FN && t->kind != TY_GENERIC && IsFix(t) &&
            FixedSize(t) > NATIVE_VALUE_LIMIT;
+}
+
+// A local or temporary of fixed-size type t named `name`, with an initial
+// value where init is not empty (CodeGen::FixedLocal): a Go variable, or one
+// of more than NATIVE_VALUE_LIMIT bytes outside a recursive cycle a slot on
+// a data stack, which the innermost scope (the block's, for a local) gives
+// back, and `name` points at. Without an initial value it holds T's zero
+// value, as a Go variable does, but where `zero` is false, for a slot that
+// is written whole next. The lvalue it is: name, or (*name).
+inline string CodeGenGo::FixedLocal(TypeExpr *t, const string &name, const string &init, bool forlocal,
+                                    Line ln, bool zero) {
+    if (!IsLargeFixed(t) || (curspec && curspec->incycle)) {
+        Decl(name, LocalT(t, ln), init);
+        return name;
+    }
+    auto gt = GoT(t, ln);
+    auto stk = AllocStk(forlocal);
+    Decl(name, cat("*", gt), cat("(*", gt, ")(", Top(stk), ")"));
+    SaveBase(forlocal, stk, cat("unsafe.Pointer(", name, ")"));
+    Bump(stk, cat(FixedSize(t)));
+    auto lv = cat("(*", name, ")");
+    if (!init.empty()) L(lv, " = ", init);
+    else if (zero) L("clear(unsafe.Slice((*byte)(unsafe.Pointer(", name, ")), ", FixedSize(t), "))");
+    return lv;
 }
 
 // The Go type of a local or a temporary of type t.

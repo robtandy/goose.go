@@ -912,7 +912,10 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             auto t = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
             GoT(t, ln);
             auto want = d.t ? d.t : c->exprtype;
-            if (!c->defaultinit) {
+            // A large one is built in a slot on a data stack, as C's is
+            // (FixedLocal), with a default of its own or none.
+            auto large = IsLargeFixed(t) && !(curspec && curspec->incycle);
+            if (!c->defaultinit && !large) {
                 if (d.k == GD_DISCARD) return;
                 if (IsRelRef(want)) {
                     L(d.s, " = 0");
@@ -921,8 +924,11 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
                 L(d.s, " = ", Coerce(ZeroOf(t, ln), t, want, ln));
                 return;
             }
-            auto v = T();
-            Decl(v, LocalT(t, ln));
+            auto v = FixedLocal(t, T(), "", false, ln);
+            if (!c->defaultinit) {
+                if (d.k != GD_DISCARD) L(d.s, " = ", Coerce(v, t, want, ln));
+                return;
+            }
             if (t->kind == TY_ARRAY) {
                 auto av = ArrayView(AtVar(v, t), ln);
                 auto i = T();

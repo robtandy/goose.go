@@ -202,6 +202,8 @@ struct CodeGenGo {
     bool BitwiseEq(TypeExpr *t);
     static constexpr int64_t NATIVE_VALUE_LIMIT = 4096;
     bool IsLargeFixed(TypeExpr *t);
+    string FixedLocal(TypeExpr *t, const string &name, const string &init, bool forlocal, Line ln,
+                      bool zero = true);
     string LocalT(TypeExpr *t, Line ln);
     // The globals the C backend makes static data, with their initializers.
     unordered_map<const VarDef *, Node *> cstatic;
