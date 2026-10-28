@@ -165,11 +165,19 @@ type GsStackBlock struct {
 	// the Go heap, the locals never move, so a value's bytes may hold their
 	// addresses where the collector does not look.
 	Frame, FrameBase, FrameEnd unsafe.Pointer
+	// Gl is the program instance the block runs (goose_spec.md §11.2), in
+	// a program with workers: its globals, which the generated code lays
+	// out. Main's is a static one; a worker's, and an exported entry
+	// point's caller's, is in memory of the block's own (NewInstance),
+	// outside the Go heap as the stacks are. nil where the block has none.
+	Gl unsafe.Pointer
 
 	reserve int64    // usable bytes asked of each new region
 	gap     int64    // guard bytes behind each region
 	regions [][]byte // each region's mapping, guard gap included
 	frame   []byte   // the fixed-frame stack's mapping
+	inst    []byte   // the block's own program instance's mapping
+	worker  int64    // the worker running on the block, its id plus one; 0 for none
 }
 
 // GsFrameReserve is the address space a block's fixed-frame stack
@@ -266,11 +274,17 @@ func (gs *GsStackBlock) EnsureStacks(n int) {
 // Reset empties every stack of the block at once, rewinding each top to
 // its base. The memory stays reserved, and the pages the stacks reached
 // stay with the process, ready for the next use.
+//
+// A program instance of the block's own goes with them: the next exported
+// entry point to run on the block copies the program's globals in again.
 func (gs *GsStackBlock) Reset() {
 	for i := range gs.Stks {
 		gs.Stks[i] = gs.Base[i]
 	}
 	gs.Frame = gs.FrameBase
+	if gs.inst != nil {
+		gs.Gl = nil
+	}
 }
 
 // Close releases every region of the block, which is then empty again:
@@ -298,7 +312,61 @@ func (gs *GsStackBlock) Close() error {
 		gs.frame = nil
 		gs.Frame, gs.FrameBase, gs.FrameEnd = nil, nil, nil
 	}
+	if gs.inst != nil {
+		if e := syscall.Munmap(gs.inst); e != nil && err == nil {
+			err = e
+		}
+		gs.inst, gs.Gl = nil, nil
+	}
 	return err
+}
+
+// gsMapPrivate maps n bytes of zeroed memory outside the Go heap, at least
+// a page of them, for a program instance's globals and a worker's spawn
+// image: what points into them never moves, and the collector frees none
+// of it.
+func gsMapPrivate(n int64) []byte {
+	n = (n + gsPageSize - 1) / gsPageSize * gsPageSize
+	if n == 0 {
+		n = gsPageSize
+	}
+	mem, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+	if err != nil {
+		GsPanic("out of memory copying globals")
+	}
+	return mem
+}
+
+// NewInstance gives the block a program instance of its own, size zeroed
+// bytes at Gl, where it has none; the memory is the block's until Close.
+func (gs *GsStackBlock) NewInstance(size uintptr) {
+	if gs.Gl != nil {
+		return
+	}
+	if gs.inst == nil || uintptr(len(gs.inst)) < size {
+		if gs.inst != nil {
+			syscall.Munmap(gs.inst)
+		}
+		gs.inst = gsMapPrivate(int64(size))
+	} else {
+		clear(gs.inst[:size])
+	}
+	gs.Gl = unsafe.Pointer(unsafe.SliceData(gs.inst))
+}
+
+// owns says whether p points into memory of the block's own: a data stack's
+// region, its fixed-frame stack, its program instance.
+func (gs *GsStackBlock) owns(p unsafe.Pointer) bool {
+	in := func(r []byte) bool {
+		return r != nil && uintptr(p)-uintptr(unsafe.Pointer(unsafe.SliceData(r))) < uintptr(len(r))
+	}
+	for _, r := range gs.regions {
+		if in(r) {
+			return true
+		}
+	}
+	return in(gs.frame) || in(gs.inst)
 }
 
 // The blocks exported entry points share: per-P caches that the collector
