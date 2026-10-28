@@ -80,7 +80,7 @@ run as part of the test suite.
 
 | Sample | What it shows |
 |---|---|
-| [24_call_c](24_call_c.goose) | `extern fn` to libm and to a small C header (`call_c.h`): scalars, a slice, a struct through a reference, a string builder C appends to. Build with `goose --include call_c.h ...`. |
+| [24_call_c](24_call_c.goose) | `extern fn` to libm and to a small C header (`call_c.h`): scalars, a slice, a struct through a reference, a string builder C appends to. Build with `goose --include call_c.h ...`, or with the Go backend and the header's Go port, `goose --target=go --include call_c.go ...`. |
 
 ## Serialization
 

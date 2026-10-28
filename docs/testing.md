@@ -565,7 +565,9 @@ slices and string literals, plain, optional and self-relative references,
 elementwise arithmetic and large globals and locals, with one program per
 runtime check those make (`index_abort`, `slice_abort`, `capacity_abort`,
 `pop_abort`, `popn_abort`, `resize_abort`, `reloff_abort`, `relnull_abort`),
-and the workers and queues beyond what `test/threads/` has (`threads_*`).
+the workers and queues beyond what `test/threads/` has (`threads_*`), and
+what the corpus's runs found at one level only (`varint_widen`,
+`relative_call_results`, `adapted_ref_results`).
 
 The programs in `test/go/build_only/` never end, as a program whose loop only
 stopping it leaves: each is written as Go at both levels, which must vet and
@@ -576,7 +578,7 @@ Data stack overflow is checked on programs the runner generates: with
 `--stack-reserve 64K`, a print whose line runs past its stack's region, by
 its literal or inside a value's text (an `i64`, `u64`, `f64`, `f32` or
 `bool`), and lines that just fit, must run in Go as they do in C, with the
-C runtime's message and exit status.
+C runtime's message and exit status, built with `-d=checkptr` as well.
 
 Every fixture of `test/stdlib/` and of `test/threads/` runs through both
 backends as well, at `-O2`, at `-O0` and, where its first line asks
@@ -586,12 +588,20 @@ its own, since the `os` fixtures write files where they run: the Go must
 vet, build (with `-d=checkptr` too, at `-O2`) and run as the C does, print
 what `test/expected/` holds at `-O2`, and report the same data stacks. One
 that differs by design (`SWEEP_KNOWN`) is counted, not run:
-`thread_stack_overflow`, a worker's native stack exhaustion. The samples
-`SAMPLES` names (`23_mandelbrot_threads`) run in `samples/` through both
-backends at both levels, which must agree on stdout and the exit code and
-print what `samples/expected/` holds; their stderr is timings. A program
-with workers needs a C compiler for its reference, since a JIT run cannot
-build one, and is counted, not run, without one.
+`thread_stack_overflow`, a worker's native stack exhaustion. Every sample
+of `samples/` but those importing the `gfx`, `ui`, `audio` and `physics`
+modules, which only the C backend has, runs through both backends at both
+levels (and at `-O2` with `-d=checkptr`), as `samples/run_samples.py` runs
+one: with the words of `data/<name>.args` as its arguments and
+`data/<name>.stdin` as its stdin, the C with the header beside it
+(`call_c.h`) and the Go with its Go port (`call_c.go`) spliced in by
+`--include`, each run in a directory of its own whose `data/` is the
+samples'. The runs must agree on stdout and the exit code, and on stderr,
+which is the sample's timings, once every number in it is masked; the Go's
+stdout must be what `samples/expected/` holds, and both must report the
+same data stacks. A program with workers needs a C compiler for its
+reference, since a JIT run cannot build one, and is counted, not run,
+without one.
 
 Each directory of `test/go/export/` is a library of `export fn`s,
 `<name>.goose`, and the Go tests that call its Go entry points,
@@ -612,19 +622,25 @@ a library of `export fn`s and its entry points, `--include` of Go (a `.h`
 refused, a file's errors named by its own lines), `goose run --target=go`
 with the program's exit code, and `goose build --target=go`.
 
-`--sweep` also runs the other fixtures of this suite (`test/<category>/`)
-through the Go backend. The ones it compiles must vet, build and print what
-`test/expected/` holds for them, as a C run must; the ones it refuses as not
-supported yet are counted, not failed, and so are the few that differ by
-design (`SWEEP_KNOWN`, with the reason): a recursion that exhausts the native
-stack is a Goose abort in C, and a fatal error of the Go runtime, which grows
-a goroutine's stack to 1 GB first. (`test/stdlib/` and `test/threads/` have
-the section above instead.) `--fuzz N` generates `N` programs of
-random arithmetic, shifts, conversions and comparisons at every scalar type
-(from `--fuzz-seed` on, every other one built with `--debug`), each of which
-both backends must run alike. `--fuzz-flow N` generates `N` programs of
-random control flow: returns, breaks, continues and guards that end it in
-every position Go's flow analysis follows (conditions, scrutinees, arguments,
-loop bounds, values), with code after them that is never reached, among
-defers and bounded loops. Each must vet, build and run as its C does at both
-levels, with the same `--stacks` report.
+`--sweep` also runs the other categories' fixtures of this suite
+(`test/<category>/`, the ones that compile and run) through both backends
+as the `test/stdlib/` fixtures run: at `-O2`, at `-O0` and with `--debug`
+where they ask for it, vetted, built with `-d=checkptr` too at `-O2`, and
+run as the C runs, with the same stdout, stderr and exit code, printing what
+`test/expected/` holds for them, with the same `--stacks` report. One the Go
+backend refuses as not supported yet is counted, not failed, at the level
+it is refused at (a value `-O0` passes to a call where `-O2` inlines the
+call away), and so are the few that differ by design (`SWEEP_KNOWN`, with
+the reason): a recursion that exhausts the native stack is a Goose abort in
+C, and a fatal error of the Go runtime, which grows a goroutine's stack to
+1 GB first. (`test/stdlib/` and `test/threads/` have the section above
+instead.) `--fuzz N` generates `N` programs of random arithmetic, shifts,
+conversions and comparisons at every scalar type (from `--fuzz-seed` on,
+every other one built with `--debug`), each of which both backends must run
+alike, the Go built with `-d=checkptr` as well. `--fuzz-flow N` generates
+`N` programs of random control flow: returns, breaks, continues and guards
+that end it in every position Go's flow analysis follows (conditions,
+scrutinees, arguments, loop bounds, values), with code after them that is
+never reached, among defers and bounded loops. Each must vet, build and run
+as its C does at both levels (at `-O2` with `-d=checkptr` too), with the
+same `--stacks` report.

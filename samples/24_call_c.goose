@@ -9,6 +9,8 @@
 // Build and run (from this directory):
 //   goose --include call_c.h -o call_c.c 24_call_c.goose
 //   cc call_c.c -o call_c -lm -pthread && ./call_c   (or: cl call_c.c && call_c)
+// or as Go, with call_c.go, the header's Go port, in its place:
+//   goose run --target=go --include call_c.go 24_call_c.goose
 
 import std;
 
