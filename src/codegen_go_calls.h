@@ -1111,7 +1111,16 @@ inline void CodeGenGo::EmitPrint(Call *c) {
     rt.base = base;
     auto saved = rtarget;
     rtarget = &rt;
-    for (auto a : c->ArgNodes()) RenderInto(cur, end, a, c);
+    for (auto a : c->ArgNodes()) {
+        // An argument that runs code may trim the data stacks
+        // (os.trim_memory), which keeps what lies below each stack's top:
+        // the line so far goes below it first, as C's builder has it.
+        if (HasStmts(a) && !Unreached()) {
+            L(Top(k), " = ", cur);
+            rt.used = true;
+        }
+        RenderInto(cur, end, a, c);
+    }
     rtarget = saved;
     L(cur, " = gsPutStr(", cur, ", ", end, ", \"\\n\")");
     L("gsOut(", base, ", ", cur, ")");

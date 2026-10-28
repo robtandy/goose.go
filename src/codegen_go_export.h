@@ -165,6 +165,17 @@ static bool GoOsFn(string_view c) {
     return fns.count(c) != 0;
 }
 
+// The export fn whose C symbol an extern fn binds, if any: a call of it is
+// a call of the export's C wrapper in C, and of the export's function in Go,
+// as its entry points make it (EmitExports).
+inline FnSpec *CodeGenGo::ExportOfExtern(FnSpec *sp) {
+    if (!sp || !sp->sf->isextern || !sp->sf->dylib.empty()) return nullptr;
+    for (auto sf : ast.functions)
+        if (sf->isexport && sf->cname == sp->sf->cname && sf->specs.size() == 1 && sinfo.count(sf->specs[0]))
+            return sf->specs[0];
+    return nullptr;
+}
+
 // Whether a call of the extern fn hands it the data stack block first: one
 // taking a u8[>..] builder appends to it through the block (GsBldAppend),
 // and os.trim_memory trims the block's stacks.
@@ -249,6 +260,20 @@ inline string CodeGenGo::ExternCallX(Call *c, FnSpec *sp) {
         auto x = Coerce(GenX(an[i]), an[i]->exprtype, pt, an[i]->line);
         if (later[i + 1] && !IsGoConst(x) && x != "nil") x = Snapshot(pt, x);
         a.push_back(x);
+    }
+    // The program's own export, called back through its symbol: its
+    // function, on this block, its stacks from 0, as its C wrapper's gs_sp
+    // is (no call of the program's own hands it a stack, so none counts).
+    if (auto xsp = ExportOfExtern(sp)) {
+        auto &ki = sinfo[xsp];
+        if (xsp->argtypes.size() != a.size())
+            Fail(ln, cat("extern fn ", sp->sf->name, " binds export fn ", xsp->sf->name, " with another count of "
+                         "parameters"));
+        auto list = ki.needssp ? string("gs, 0") : ki.needsgs ? string("gs") : GsArgPh(xsp);
+        for (size_t i = 0; i < a.size(); i++)
+            Append(list, list.empty() ? "" : ", ", Coerce(a[i], sp->argtypes[i], xsp->argtypes[i], ln));
+        if (ki.hasrf) Fail(ln, cat("internal: export fn ", xsp->sf->name, " with a long-distance return"));
+        return cat(ki.name, "(", list, ")");
     }
     string x;
     if (GoLibExtern(c, sp, a, x)) return x;
@@ -335,7 +360,7 @@ inline void CodeGenGo::EmitExports() {
                 gt = tp;
                 arg = cat("GsBytesOf(", pn, ")");
             } else if (pt->kind == TY_SLICE) {
-                gt = cat("[]", GoT(pt->sub, ln));
+                gt = IsU8(pt->sub) ? string("[]byte") : cat("[]", GoT(pt->sub, ln));
                 arg = cat("GsSliceOf(", pn, ")");
             } else if (IsPlainRef(pt) && !pt->ref->optional && IsFix(pt->ref->sub)) {
                 auto st = GoT(pt->ref->sub, ln);
@@ -410,20 +435,26 @@ inline void CodeGenGo::EmitExports() {
             for (auto &c : l) if ((uint8_t)c < 32 && c != '\t') c = ' ';
             Append(doc, l.rfind("//", 0) == 0 ? l : cat("// ", l), "\n");
         }
-        if (!doc.empty()) doc += "//\n";
-        Append(xcode, doc, "// ", with, " runs ", where, " on the data stacks of gs, which\n"
-               "// it gives back as it found them; it makes sure gs has the ", stacks, " stack(s) it takes.\n",
+        if (!doc.empty()) doc = cat("//\n", doc);
+        auto stackstext = cat(stacks, stacks == 1 ? " data stack" : " data stacks");
+        Append(xcode, "// ", with, " runs ", where, "\n",
+               !takesgs ? string("// with no data stacks: it leaves gs alone.\n")
+               : stacks ? cat("// on the ", stackstext, " of gs it takes, which it makes sure gs has, and gives\n"
+                              "// ", stacks == 1 ? "it" : "them", " back as it found ", stacks == 1 ? "it" : "them", ".\n")
+                        : string("// on gs, whose fixed-frame stack it gives back as it found it.\n"),
                inst ? "// It runs on gs's program instance, whose globals stay gs's across calls: a copy of\n"
                       "// the package's, made where gs has none (gsEnter).\n" : "",
-               "func ", with, tps, "(", join(params, "gs *GsStackBlock"), ")", retsig, " {\n");
+               doc, "func ", with, tps, "(", join(params, "gs *GsStackBlock"), ")", retsig, " {\n");
         if (stacks) Append(xcode, "\tgs.EnsureStacks(", stacks, ")\n");
         else if (!takesgs) xcode += "\t_ = gs\n";
         if (inst) Append(xcode, "\tif gs.Gl == nil {\n\t\t", enterall, "(gs)\n\t}\n");
         Append(xcode, "\t", ret(call), "\n}\n\n");
-        Append(xcode, doc, "// ", name, " runs ", where, " on a block of data stacks\n"
-               "// from the runtime's pool (AcquireStackBlock), which it gives back as it returns.\n",
+        Append(xcode, "// ", name, " runs ", where, "\n",
+               !takesgs ? string("// with no data stacks.\n")
+                        : string("// on a block of data stacks from the runtime's pool (AcquireStackBlock), which\n"
+                                 "// it gives back as it returns.\n"),
                inst ? "// It runs on a program instance of its own, copied from the package's for the call.\n" : "",
-               "func ", name, tps, "(", join(params, ""), ")", retsig, " {\n");
+               doc, "func ", name, tps, "(", join(params, ""), ")", retsig, " {\n");
         if (!takesgs) {
             // Nothing of the block's is used: the function is called itself.
             Append(xcode, "\t", ret(cat(si.name, "(", join(args, ""), ")")), "\n}\n\n");
