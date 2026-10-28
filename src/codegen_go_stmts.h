@@ -398,6 +398,21 @@ inline void CodeGenGo::GenEarlyBlock(EarlyBlock *eb, const GoDst &d) {
 // as a break leaves a block.
 inline void CodeGenGo::GenInlineBlock(InlineBlock *ib, const GoDst &d) {
     if (Unreached()) return GenUnreached([&] { GenInlineBlock(ib, d); });
+    // A body delivering a variable-mode ADT, or a reference to one, whose
+    // value the checker adapted to the fixed-mode ADT: built on a temporary
+    // stack, as C builds it (GenAdtAdapted), and read as that from there.
+    if (auto from = AdaptedIbFrom(ib);
+        from && ((d.k == GD_LVALUE && !d.pool && !d.truth) || d.k == GD_STACK) &&
+        (!d.t || TEq(d.t, ib->exprtype))) {
+        string stk;
+        auto base = BytesTemp(stk);
+        EmitIbBody(ib, GoDst { GD_STACK, stk, from });
+        if (Unreached()) return;
+        auto x = LoadLoc(BytesLoc(base, from, GoLoc {}), ib->exprtype, ib->line);
+        if (d.k == GD_LVALUE) L(d.s, " = ", x);
+        else EmitValStore(d.s, ib->exprtype, x);
+        return;
+    }
     // A call passed where a slice is expected was checked as that slice
     // (§3.10), while the body returns a resizable array: built where the
     // call would have put its result, a temporary of the caller's scope, and

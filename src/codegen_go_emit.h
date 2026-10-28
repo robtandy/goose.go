@@ -77,6 +77,10 @@ inline void CodeGenGo::CollectSpecs() {
             if (auto m = Is<MatchExpr>(n))
                 for (auto &arm : m->arms)
                     si.needssp |= arm.binder && typed(arm.binder->type) && NeedsStack(arm.binder->type);
+            // A reference result's variable-mode pointee adapted to the
+            // fixed-mode ADT is copied onto a stack first (GenAdaptedCall).
+            if (auto c = Is<Call>(n); c && AdaptedRefFrom(c)) si.needssp = true;
+            if (auto ib = Is<InlineBlock>(n); ib && AdaptedIbFrom(ib)) si.needssp = true;
             if (auto c = Is<Call>(n)) {
                 auto add = [&](FnSpec *k) {
                     pair<FnSpec *, const Call *> e { k, c->fvremap.empty() ? nullptr : c };

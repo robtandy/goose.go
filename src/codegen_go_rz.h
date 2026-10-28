@@ -710,6 +710,11 @@ inline void CodeGenGo::ConstructFromLoc(GoLoc l, TypeExpr *et, const string &stk
 // A call's first result constructed as et at stk's top (CodeGen::ConstructCall).
 inline void CodeGenGo::ConstructCall(Call *c, TypeExpr *et, const string &stk, TypeExpr *want,
                                      const string &lenlv) {
+    if (auto from = AdaptedRefFrom(c); from && !IsBytesT(et) && TEq(et, c->exprtype)) {
+        auto x = GenAdaptedCall(c, from);
+        if (!Unreached()) EmitValStore(stk, et, x);
+        return;
+    }
     auto rt0 = c->rettypes.empty() ? nullptr : c->rettypes[0];
     // A bytes-class result feeding a fixed-class slot, or a slot of an array
     // kind it cannot be built in, is built on a temporary of its own and

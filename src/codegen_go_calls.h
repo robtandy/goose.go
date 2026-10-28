@@ -344,6 +344,46 @@ inline vector<string> CodeGenGo::GenCallVals(Call *c, const GoDst &d0, vector<Go
     return EmitSpecCall(c, c->spec, d0, alldst);
 }
 
+// The variable-mode ADT (or variant) a call's reference result points at,
+// where the checker adapted the call's value to the fixed-mode ADT, its
+// type (CodeGen::AdtFrom); null elsewhere.
+inline TypeExpr *CodeGenGo::AdaptedRefFrom(Call *c) {
+    auto et = c->exprtype;
+    if (c->builtin >= 0 || c->fvbody || !c->dispatch.empty() || c->rettypes.empty() || !et ||
+        et->kind != TY_ENUM || !IsFix(et) || !IsPlainRef(c->rettypes[0]))
+        return nullptr;
+    auto from = c->rettypes[0]->ref->sub;
+    if ((from->kind != TY_ENUM && from->kind != TY_VARIANT) || !IsBytesT(from) || TEq(from, et))
+        return nullptr;
+    return from;
+}
+
+// The variable-mode ADT (or variant) an inlined call's body delivers, by
+// reference or by value, where the checker adapted its value to the
+// fixed-mode ADT, its type (CodeGen::AdtFrom); null elsewhere.
+inline TypeExpr *CodeGenGo::AdaptedIbFrom(InlineBlock *ib) {
+    auto et = ib->exprtype;
+    if (!et || et->kind != TY_ENUM || !IsFix(et) || !ib->spec || ib->spec->rets.empty()) return nullptr;
+    auto from = ib->spec->rets[0];
+    if (IsPlainRef(from)) from = from->ref->sub;
+    if ((from->kind != TY_ENUM && from->kind != TY_VARIANT) || !IsBytesT(from) || TEq(from, et))
+        return nullptr;
+    return from;
+}
+
+// Such a call's value (AdaptedRefFrom), as C builds it (GenAdtAdapted): on
+// a temporary stack taken before the call, which both backends count, the
+// pointee copied there from the reference the call returns, once, and read
+// as the fixed-mode ADT from there.
+inline string CodeGenGo::GenAdaptedCall(Call *c, TypeExpr *from) {
+    string stk;
+    auto base = BytesTemp(stk);
+    auto rets = GenCallVals(c, GoDst {}, nullptr);
+    if (rets.empty() || Unreached()) return ZeroOf(c->exprtype, c->line);
+    ConstructFromLoc(CallResLoc(c, rets[0]), from, stk, "", c->line);
+    return LoadLoc(BytesLoc(base, from, GoLoc {}), c->exprtype, c->line);
+}
+
 // The first result as its receiver takes it (CodeGen::CallVal0): a
 // reference received in a value context reads its pointee, and a fixed
 // value converts to the type the receiver wants.
@@ -610,6 +650,7 @@ inline string CodeGenGo::GenCall(Call *c) {
         return Coerce(res[0], rt, c->exprtype, c->line);
     }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
+    if (auto from = AdaptedRefFrom(c)) return GenAdaptedCall(c, from);
     auto sp = c->spec;
     if (sp->sf->isextern && !PlainSig(sp)) Unsupported(c->line, "a call to an extern fn");
     if (sp->rets.empty()) Fail(c->line, "internal: a call without results as a value");
@@ -672,6 +713,12 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
         return;
     }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
+    if (auto from = AdaptedRefFrom(c);
+        from && d.k == GD_LVALUE && !d.pool && (!d.t || TEq(d.t, c->exprtype))) {
+        auto x = GenAdaptedCall(c, from);
+        if (!Unreached()) L(d.s, " = ", x);
+        return;
+    }
     auto sp = c->spec;
     if (sp->sf->isextern && !PlainSig(sp)) Unsupported(c->line, "a call to an extern fn");
     if (!PlainSig(sp)) {
