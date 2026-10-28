@@ -551,7 +551,7 @@ supported, 64-bit only. The design is in [DESIGN.md](../DESIGN.md).
 
 The Go toolchain is `go` on `PATH`, or the one `GOOSE_GO` names.
 
-This version compiles the language's single-threaded core: integers,
+This version compiles the language's core: integers,
 floats and `bool` with their operators and conversions, structs (with `pad`
 and `pad n`), fixed and limited arrays, fixed-mode ADTs with `match` and
 case functions, slices and string literals, plain, optional and relative
@@ -569,16 +569,24 @@ stand in for (math's transcendental functions are Go's, which can differ
 from a C library's in the last place), the C library's functions of
 floats that Go's `math` has, by their C names, and Go functions of the
 package (`--include`). So the standard library compiles: the
-`test/stdlib/` fixtures run as they do in C. Every fixed-size value keeps its exact C layout: a
+`test/stdlib/` fixtures run as they do in C. So does concurrency (§11.2):
+`thread_fn`s, `thread_spawn`, `thread_spawn_contained`, `thread_wait`,
+`hardware_threads()` and the typed queues, a worker being a goroutine on
+data stacks of its own; in a program with workers each thread program has
+its own instance of the globals, as does each call of an `export fn`'s
+entry points (DESIGN.md §2.3, §3.5). Every fixed-size value keeps its exact C layout: a
 struct Go aligns as C packs it, holding no reference, is a Go struct, any
 other the bytes of its layout, read and written at each field's offset, a
 reference or a slice in them byte for byte; a local whose address is taken
 lives on the fixed-frame stack (`gs.Frame`, DESIGN.md §3.6), so nothing a
-value's bytes hold is Go-heap memory. A program using anything else --
-threads, fixed-size locals and temporaries of more than 4096 bytes outside
-a recursive cycle (which C holds on a data stack; such globals are
-supported), index types, the members of `extern` blocks (shared libraries,
-which a Go program built without cgo cannot load) and std's `ffi` among
-them -- stops with an error at the first such construct, naming it: `...
-is not supported by --target=go yet`. `test/run_go_tests.py` checks what it
+value's bytes hold is Go-heap memory. A fixed-size value of more than 4096
+bytes is held on a data stack where C holds one: a local, a literal's or a
+default's temporary, a queue's value. A program using anything else -- such
+a value as a parameter, a result or another temporary, index types, the
+members of `extern` blocks (shared libraries, which a Go program built
+without cgo cannot load) and std's `ffi` among them -- stops with an error
+at the first such construct, naming it: `... is not supported by
+--target=go yet`. A recursion deeper than a goroutine's stack holds is a
+fatal error of the Go runtime at 1 GB, where C reports its native stack's
+overflow as an abort. `test/run_go_tests.py` checks what it
 compiles against the C backend ([testing.md](testing.md)).
