@@ -53,12 +53,17 @@
 //   NameWithStack(gs, ...) and Name(...), the second on a block from the
 //   runtime's pool, both taking Go's own slices, strings and pointers.
 //
-// This version covers the single-threaded language: scalars and their
-// operators and conversions, fixed-size values, the values on data stacks
-// (codegen_go_rz.h, codegen_go_bytes.h), control flow, calls, extern and
-// export fns. Anything else -- threads, among them -- stops the compile
-// with an error naming the construct (Unsupported) rather than emitting Go
-// that would be wrong.
+// * Workers and queues (codegen_go_threads.h, DESIGN.md §2.3): a worker is
+//   a goroutine running its thread program on a block of its own; in a
+//   program with workers each thread program has an instance of its own of
+//   the globals (gsGlobals), which its functions reach through the block
+//   (gs_gl), and a queue is a GsQueue per element type.
+//
+// This version covers scalars and their operators and conversions,
+// fixed-size values, the values on data stacks (codegen_go_rz.h,
+// codegen_go_bytes.h), control flow, calls, extern and export fns, and
+// workers and queues. Anything else stops the compile with an error naming
+// the construct (Unsupported) rather than emitting Go that would be wrong.
 //
 // The members are declared here in the order they are defined across
 // codegen_go_values.h, codegen_go_types.h, codegen_go_places.h,
@@ -636,7 +641,7 @@ struct CodeGenGo {
     string EmitThreadWait(Call *c, vector<Node *> &an);
     void EmitRzImage(GoLoc src, TypeExpr *t, const string &stk, Line ln);
     void EmitGlobalImage(VarDef *d, const string &stk, Line ln);
-    void EmitRecvImage(TypeExpr *t, const string &img, const string &sz, const string &stk,
+    void EmitRecvImage(TypeExpr *t, const string &img, const string &bs, const string &sz, const string &stk,
                        const string &lenlv);
     void EmitGlobalRecv(VarDef *d, const string &img, const string &sz, const string &stkidx);
     string EmitQPut(Call *c, vector<Node *> &an);

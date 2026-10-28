@@ -174,15 +174,11 @@ inline void CodeGenGo::EmitRzImage(GoLoc src, TypeExpr *t, const string &stk, Li
 // at img, received at stk's top: its elements land there, and its count,
 // with a frame object's fixed fields, in the receiving lenlv, a header's
 // count or the frame object, whose tail starts at the top. `bs`, where the
-// image is the Go slice of a queue's message, is that slice, which the
-// elements are copied out of as the slice they are.
-static string GoImageFrom(const string &img, const string &bs, int64_t off, const string &n) {
-    if (!bs.empty()) return cat(bs, "[", off, ":]");
-    return cat("unsafe.Slice((*byte)(unsafe.Add(", img, ", ", off, ")), ", n, ")");
-}
-
-inline void CodeGenGo::EmitRecvImage(TypeExpr *t, const string &img, const string &sz, const string &stk,
-                                     const string &lenlv) {
+// image is a queue's message, is its Go slice, which the elements are
+// copied out of as a slice: their address would be one past its end where
+// there are none.
+inline void CodeGenGo::EmitRecvImage(TypeExpr *t, const string &img, const string &bs, const string &sz,
+                                     const string &stk, const string &lenlv) {
     int64_t pre = 0;
     if (IsFrameObj(t)) {
         pre = FoBytesPrefix(t);
@@ -195,11 +191,9 @@ inline void CodeGenGo::EmitRecvImage(TypeExpr *t, const string &img, const strin
     }
     auto n = T();
     Decl(n, "int64", cat(sz, " - ", 8 + pre));
-    // A queue's message is a Go slice, which is copied from as one: its
-    // elements' address would be one past its end where there are none.
-    auto bs = img.size() > 34 && img.compare(0, 34, "unsafe.Pointer(unsafe.SliceData(") == 0
-                  ? img.substr(34, img.size() - 36) : string();
-    L("copy(unsafe.Slice((*byte)(", Top(stk), "), ", n, "), ", GoImageFrom(img, bs, 8 + pre, n), ")");
+    auto from = !bs.empty() ? cat(bs, "[", 8 + pre, ":]")
+                            : cat("unsafe.Slice((*byte)(unsafe.Add(", img, ", ", 8 + pre, ")), ", n, ")");
+    L("copy(unsafe.Slice((*byte)(", Top(stk), "), ", n, "), ", from, ")");
     Bump(stk, n);
 }
 
@@ -249,7 +243,7 @@ inline void CodeGenGo::EmitGlobalRecv(VarDef *d, const string &img, const string
             // [count][elements][freelist count][nodes]: fixed-size elements,
             // the count's bytes of them.
             auto &p = gpools.at(d);
-            auto esz = FixedSize(t->arr->sub);
+            auto esz = ImgSize(t->arr->sub);
             auto flsz = d->reusable == RU_SLICES ? int64_t(512) : int64_t(8);
             auto k2 = IsGoConst(k) ? cat(stoll(k) + 1) : cat(k, " + 1");
             auto cnt = T(), eb = T(), fln = T();
@@ -267,7 +261,7 @@ inline void CodeGenGo::EmitGlobalRecv(VarDef *d, const string &img, const string
             return;
         }
         if (!IsFrameObj(t)) L(gn, ".Base = ", Top(k));
-        EmitRecvImage(t, img, sz, k, RzLenLv(t, gn));
+        EmitRecvImage(t, img, "", sz, k, RzLenLv(t, gn));
         return;
     }
     if (IsBytesT(t)) {
@@ -298,10 +292,11 @@ inline string CodeGenGo::EmitThreadSpawn(Call *c, vector<Node *> &an) {
     auto i64 = ast.inttypes[IS_I64];
     string stk;
     auto base = BytesTemp(stk);
+    // What follows an argument that ends the flow is generated all the
+    // same, its text dropped (GenUnreached), as everywhere else.
     for (size_t i = 0; i < sp->argtypes.size(); i++) {
         auto pt = sp->argtypes[i];
         auto node = an[1 + i];
-        if (Unreached()) break;
         if (!IsResz(pt)) {
             GenConstruct(node, stk, pt);
             continue;
@@ -322,17 +317,15 @@ inline string CodeGenGo::EmitThreadSpawn(Call *c, vector<Node *> &an) {
             if (pre) Bump(stk, cat(pre));
             Decl(h, RzGoT(pt, c->line));
             GenConstruct(node, stk, pt, h);
-            if (Unreached()) break;
             L("*(*int64)(", cntp, ") = ", FoTailHdr(pt, h), ".Len");
             if (pre) FoBytes(pt, h, pp, true);
         } else {
             GenConstruct(node, stk, pt, cat("*(*int64)(", cntp, ")"));
-            if (Unreached()) break;
         }
         L("*(*int64)(", szp, ") = int64(uintptr(", Top(stk), ") - uintptr(", szp, ")) - 8");
     }
-    if (Unreached()) return "0";
     for (auto d : ThreadGlobals(sp)) EmitGlobalImage(d, stk, c->line);
+    if (Unreached()) return "0";
     auto id = T();
     Decl(id, "int64", cat("GsThreadSpawn(", thunk, ", ", thunk, "_stacks, unsafe.Sizeof(gsGlobals{}), ", base,
                           ", int64(uintptr(", Top(stk), ") - uintptr(", base, ")), ",
@@ -374,7 +367,7 @@ inline void CodeGenGo::EmitThreadThunk(FnSpec *sp, int64_t stacks) {
             Decl(sz, "int64", "*(*int64)(p)");
             L("p = unsafe.Add(p, 8)");
             if (!IsFrameObj(pt)) L(a, ".Base = ", Top(ks));
-            EmitRecvImage(pt, "p", sz, ks, RzLenLv(pt, a));
+            EmitRecvImage(pt, "p", "", sz, ks, RzLenLv(pt, a));
             L("p = unsafe.Add(p, ", sz, ")");
             ind--;
             LS("}");
@@ -561,7 +554,7 @@ inline vector<string> CodeGenGo::EmitQGet(Call *c, const GoDst &d0) {
         }
         L(poll ? cat("if ", got, " {") : string("{"));
         ind++;
-        EmitRecvImage(t, img, sz, stk, lenlv);
+        EmitRecvImage(t, img, nn, sz, stk, lenlv);
         ind--;
         LS("}");
         return ret(hv);
