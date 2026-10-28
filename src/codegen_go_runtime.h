@@ -2613,10 +2613,10 @@ var gsThreads struct {
 }
 
 // GsThreadSpawn starts a worker running run on a block of its own and
-// returns its id (gs_thread_start): `stacks` data stacks, a program instance
-// of glsize zeroed bytes at its Gl, and a copy of the n-byte spawn image at
-// args, which run is handed and the worker owns, outside the Go heap as the
-// stacks are. In a contained worker an abort ends run early, its message
+// returns its id (gs_thread_start): `stacks` data stacks, which the worker
+// reserves as it starts, a program instance of glsize zeroed bytes at its
+// Gl, and a copy of the n-byte spawn image at args, taken now, which run is
+// handed and the worker owns, outside the Go heap as the stacks are. In a contained worker an abort ends run early, its message
 // kept for thread_wait (§11.2). Whichever way it ends, the worker releases
 // all it holds before thread_wait sees it ended.
 func GsThreadSpawn(run func(gs *GsStackBlock, p unsafe.Pointer), stacks int, glsize uintptr,
@@ -2624,11 +2624,10 @@ func GsThreadSpawn(run func(gs *GsStackBlock, p unsafe.Pointer), stacks int, gls
 	if n < 0 {
 		GsPanic("invalid thread argument size")
 	}
-	gs := NewStackBlock(stacks, gsStackReserve, gsStackGap)
+	// The instance and the image, in one mapping the worker's block owns.
 	off := (int64(glsize) + 7) &^ 7
-	gs.inst = gsMapPrivate(off + n)
-	gs.Gl = unsafe.Pointer(unsafe.SliceData(gs.inst))
-	p := unsafe.Add(gs.Gl, off)
+	inst := gsMapPrivate(off + n)
+	p := unsafe.Add(unsafe.Pointer(unsafe.SliceData(inst)), off)
 	copy(unsafe.Slice((*byte)(p), n), unsafe.Slice((*byte)(args), n))
 	done := make(chan struct{})
 	gsThreads.mu.Lock()
@@ -2643,18 +2642,24 @@ func GsThreadSpawn(run func(gs *GsStackBlock, p unsafe.Pointer), stacks int, gls
 	}
 	gsThreads.running[id] = done
 	gsThreads.mu.Unlock()
-	gs.worker = id + 1
-	go gsThreadMain(gs, run, p, contained, id, done)
+	go gsThreadMain(inst, stacks, run, p, contained, id, done)
 	return id
 }
 
-// gsThreadMain is a worker's goroutine (gs_thread_main): its thread program,
-// then the release of everything it holds, and only then its end published.
-func gsThreadMain(gs *GsStackBlock, run func(*GsStackBlock, unsafe.Pointer), p unsafe.Pointer,
+// gsThreadMain is a worker's goroutine (gs_thread_main): its block, whose
+// stacks it reserves as it starts (gs_stack_block), its thread program,
+// then the release of everything it holds, and only then its end
+// published.
+func gsThreadMain(inst []byte, stacks int, run func(*GsStackBlock, unsafe.Pointer), p unsafe.Pointer,
 	contained bool, id int64, done chan struct{}) {
 	// A fault in a guard gap reaches the worker's recover, as main's does.
 	debug.SetPanicOnFault(true)
-	msg, aborted := gsRunWorker(gs, run, p, contained)
+	var gs *GsStackBlock
+	msg, aborted := gsRunWorker(func() {
+		gs = NewStackBlock(stacks, gsStackReserve, gsStackGap)
+		gs.inst, gs.Gl, gs.worker = inst, unsafe.Pointer(unsafe.SliceData(inst)), id+1
+		run(gs, p)
+	}, contained)
 	_ = gs.Close()
 	gsThreads.mu.Lock()
 	delete(gsThreads.running, id)
@@ -2672,13 +2677,12 @@ func gsThreadMain(gs *GsStackBlock, run func(*GsStackBlock, unsafe.Pointer), p u
 	gsThreads.mu.Unlock()
 }
 
-// gsRunWorker runs a worker's thread program. An abort in a contained one
+// gsRunWorker runs a worker's thread program, f. An abort in a contained one
 // returns here, with its message (gs_run_contained); anything else ends the
 // process, as it does on main's (gsEndOnPanic): an abort in a worker that is
 // not contained, the runtime's own failures, which have no location in the
 // program, a fault in a guard gap.
-func gsRunWorker(gs *GsStackBlock, run func(*GsStackBlock, unsafe.Pointer), p unsafe.Pointer,
-	contained bool) (msg string, aborted bool) {
+func gsRunWorker(f func(), contained bool) (msg string, aborted bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(*GsError); ok && contained && e.File != "" {
@@ -2688,7 +2692,7 @@ func gsRunWorker(gs *GsStackBlock, run func(*GsStackBlock, unsafe.Pointer), p un
 			gsEndOnPanic(r)
 		}
 	}()
-	run(gs, p)
+	f()
 	return "", false
 }
 
