@@ -551,7 +551,9 @@ inline string CodeGenGo::LoadLoc(GoLoc l, TypeExpr *et, Line ln) {
         return l.addr;
     }
     if (et->kind == TY_ENUM && l.t->kind == TY_VARIANT) return AdaptToEnum(l, et, ln);
-    if (IsScalarT(l.t) && IsScalarT(et)) return Coerce(l.lv, l.t, et, ln);
+    // A scalar landing in a varint slot is the i64 the slot encodes (§3.6),
+    // whatever integer type it is read at.
+    if (IsScalarT(l.t) && (IsScalarT(et) || IsVarintT(et))) return Coerce(l.lv, l.t, et, ln);
     return Ld(l);
 }
 
@@ -646,7 +648,9 @@ inline string CodeGenGo::GenRefVal(Node *child, Line ln) {
 // an optional one, an array as a slice, a variant as its ADT.
 inline string CodeGenGo::CoerceVal(const string &x, TypeExpr *from, TypeExpr *to, Line ln) {
     if (!to || !from || to->kind == TY_VOID || from == to) return x;
-    if (IsScalarT(from) && IsScalarT(to)) return Coerce(x, from, to, ln);
+    // A varint's value is an i64 (§3.6), which Coerce converts to and from.
+    if ((IsScalarT(from) || IsVarintT(from)) && (IsScalarT(to) || IsVarintT(to)))
+        return Coerce(x, from, to, ln);
     if (IsRelRef(to)) to = ast.RefTo(to->ref->sub, ln, to->ref->optional);
     if (from->kind == TY_REF && to->kind == TY_REF) return x;
     if (from->kind == TY_REF) {

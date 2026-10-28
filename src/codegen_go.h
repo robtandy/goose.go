@@ -87,6 +87,9 @@ struct GoDst {
     TypeExpr *t = nullptr;
     string lenlv;
     bool pool = false;
+    // A bool lvalue taking a condition's truth (C's DK_BRANCH): a value that
+    // reaches it is taken as CodeGenGo::GenBranchTruth takes it.
+    bool truth = false;
 };
 
 // An --include file's Go split into its imports and the rest
@@ -925,6 +928,10 @@ struct CodeGenGo {
     string GenCast(AsCast *c);
     string NullTestOperand(Node *n);
     string GenTruth(Node *n);
+    // A condition's truth as C's GenBranch takes it (codegen_go_values.h).
+    static bool BranchChain(Node *n);
+    string GenBranchTruth(Node *n);
+    bool HoistsCheck(IfExpr *fi);
     string CtlValX(Node *n);
     void GenAny(Node *n, const GoDst &d);
     void LeafAny(Node *n, const GoDst &d);
@@ -998,6 +1005,7 @@ struct CodeGenGo {
     // The foreign boundary (codegen_go_export.h): extern fns' calls, export
     // fns' Go entry points.
     bool usesos = false;   // A call needs the OS layer (go_runtime_os).
+    FnSpec *ExportOfExtern(FnSpec *sp);
     bool ExternTakesGs(FnSpec *sp);
     bool GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a, string &x);
     void EmitExports();
@@ -1008,6 +1016,11 @@ struct CodeGenGo {
     unordered_map<FnSpec *, vector<FnSpec *>> calleesof;
     vector<string> GenCallVals(Call *c, const GoDst &d0, vector<GoDst> *alldst = nullptr);
     string CallVal0(Call *c, const string &r0, TypeExpr *want);
+    TypeExpr *AdtFrom(Node *n);
+    void GenAdtAdapted(TypeExpr *from, TypeExpr *to, const GoDst &d, Line ln,
+                       const function<void(const GoDst &)> &gen);
+    void GenCallAs(Call *c, TypeExpr *t, const GoDst &d);
+    bool ForwardsAdapted(Call *c);
     GoLoc CallResLoc(Call *c, const string &r0);
     vector<string> GenDispatch(Call *c, const GoDst &d0, vector<GoDst> *alldst);
     bool NonFixedDispatch(Call *c);

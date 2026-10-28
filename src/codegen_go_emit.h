@@ -77,6 +77,10 @@ inline void CodeGenGo::CollectSpecs() {
             if (auto m = Is<MatchExpr>(n))
                 for (auto &arm : m->arms)
                     si.needssp |= arm.binder && typed(arm.binder->type) && NeedsStack(arm.binder->type);
+            // A value adapted to a fixed-mode ADT from a variable-mode one, a
+            // reference result's pointee included, is built as that first
+            // (GenAdtAdapted).
+            if (auto from = AdtFrom(n)) si.needssp |= NeedsStack(from);
             if (auto c = Is<Call>(n)) {
                 auto add = [&](FnSpec *k) {
                     pair<FnSpec *, const Call *> e { k, c->fvremap.empty() ? nullptr : c };
@@ -84,6 +88,8 @@ inline void CodeGenGo::CollectSpecs() {
                         calls.push_back(e);
                 };
                 if (c->builtin < 0) add(c->spec);
+                // An extern fn calling the program's own export back.
+                if (c->builtin < 0) add(ExportOfExtern(c->spec));
                 for (auto d : c->dispatch) add(d);
                 for (auto &fs : c->fmtspecs) add(fs.second);
                 // print renders its line on a data stack, and thread_spawn

@@ -710,6 +710,13 @@ inline void CodeGenGo::ConstructFromLoc(GoLoc l, TypeExpr *et, const string &stk
 // A call's first result constructed as et at stk's top (CodeGen::ConstructCall).
 inline void CodeGenGo::ConstructCall(Call *c, TypeExpr *et, const string &stk, TypeExpr *want,
                                      const string &lenlv) {
+    // A result the checker adapted to an ADT, as C builds it (GenConstruct's
+    // GenAdtAdapted).
+    if (auto from = AdtFrom(c); from && TEq(et, c->exprtype)) {
+        GenAdtAdapted(from, et, GoDst { GD_STACK, stk, et, lenlv }, c->line,
+                      [&](const GoDst &nd) { GenCallAs(c, from, nd); });
+        return;
+    }
     auto rt0 = c->rettypes.empty() ? nullptr : c->rettypes[0];
     // A bytes-class result feeding a fixed-class slot, or a slot of an array
     // kind it cannot be built in, is built on a temporary of its own and
@@ -724,6 +731,13 @@ inline void CodeGenGo::ConstructCall(Call *c, TypeExpr *et, const string &stk, T
     auto own = rt0 && IsBytesT(rt0) && (!IsBytesT(et) || !builds(rt0));
     auto rets = GenCallVals(c, own ? GoDst {} : GoDst { GD_STACK, stk, want, lenlv });
     if (rets.empty() || IsVoidT(et) || Unreached()) return;
+    // A returned reference landing in a relative-reference slot stores the
+    // offset, as any other reference value does there (§3.9).
+    if (auto slot = want ? want : et; IsRelRef(slot)) {
+        auto pt = ast.RefTo(slot->ref->sub, c->line, slot->ref->optional);
+        EmitRelStoreStk(stk, slot, Snapshot(pt, CallVal0(c, rets[0], pt)), NonNullRef(c), c->line);
+        return;
+    }
     // A resizable result with no receiving header was built behind a
     // temporary one: copied into the slot as the slot's array kind.
     if (rt0 && IsResz(rt0) && rt0->kind == TY_ARRAY && lenlv.empty() && et->kind == TY_ARRAY &&

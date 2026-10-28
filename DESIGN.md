@@ -82,6 +82,7 @@ Goose specifies exact byte layouts (`FixedSize`, `LayoutFields` in `src/codegen_
 ### 3.3 Variable-Size Byte Images (`Bytes` Class)
 - Represented as `unsafe.Pointer` pointing to the start of the self-describing byte image on a Data Stack.
 - Fields after a variable-size field are reached via generated `gs_size_<T>(p unsafe.Pointer) int64` walkers and `unsafe.Add(p, offset)`, identical to C Goose (`FieldPtr`, `SizeX`).
+- **An ADT adapted from another type.** Where the checker adapts the result of a call -- a function's, a case function's, a builtin's or a function value's -- or of an inlined body to an ADT it does not arrive as (a variant to its ADT, or an ADT to its other mode, `goose_spec.md` §3.5), the value is built as the type it arrives as and converted, as C builds it (`CodeGenGo::AdtFrom`, `GenAdtAdapted`, after `CodeGen`'s): a variant becoming the variable-mode ADT is built behind the ADT's tag; a fixed-mode ADT becoming the variable-mode one is built in a local and written out as the image of the variant it holds; a variable-mode value becoming the fixed-mode ADT, a reference's pointee included, is built on a temporary stack, taken before the call as C takes it, and read from there. A result a return forwards is adapted at the function's destination for it the same way (`GenForward`). Each call is made once, and both backends take the same stacks. A fixed-size value holding relative references adapted so is not supported yet.
 
 ### 3.4 Resizable Data-Stack Values (`Resizable` Class) & Slices
 - **Slices (`T[:]`)**:
@@ -129,3 +130,48 @@ Goose specifies exact byte layouts (`FixedSize`, `LayoutFields` in `src/codegen_
 
 ### 3.6 The Fixed-Frame Stack (`gs.Frame`)
 A Goose local whose address the program never takes is a Go local, which Go keeps in registers. One whose address it does take (`&x`, `x[..]`, a by-reference argument, a field access of a value held as bytes) cannot be: Go may move its goroutine's stack while the bytes of a value, a data stack or a frame hold its address, and the collector scans none of those. Each `GsStackBlock` therefore has one more `mmap` region, the fixed-frame stack: a function holding such locals (or parameters) takes its frame there as it starts, `gs_fr := gs.Frame; gs.Frame = unsafe.Add(gs_fr, gs_fo<n>)`, each local a pointer to its slot, and gives the frame back at every return and where its body's end is reached. Fixed-size locals never grow, so the frames obey a strict call discipline, recursion included, and a local declared in a loop has the same slot every iteration, as C's does. Each slot is 8-aligned and at least a byte, so that two variables never share an address, a zero-length array's or a payload-less variant's included. `FinishBody` (`src/codegen_go_emit.h`) finds those locals once a body is generated and rewrites their declarations and uses; whether a function then takes the block is settled once every body is (`ResolveGsArgs`). The region's 1 GB reservation is address space only; a frame that does not fit is reported as C reports its native stack's overflow.
+
+---
+
+## 4. Using the Go Backend
+
+The command line is in [`docs/command_line.md` §15](docs/command_line.md#15-writing-go---targetgo); in short:
+
+| Command | What it does |
+|---|---|
+| `goose --target=go -o out.go prog.goose` (or `goose -o out.go prog.goose`) | Writes one Go source file holding the program and the runtime it uses (§2), `package main`, which `go build out.go` builds with nothing but Go's standard library and `CGO_ENABLED=0`. |
+| `goose run --target=go prog.goose [-- args]` | Writes the Go to the program's build directory under `GOOSE_HOME` (as `main.go`), builds it with `go build` and runs it, exiting with its exit code. `goose --target=go prog.goose` does the same. |
+| `goose build --target=go prog.goose [-o exe]` | Builds the executable beside the root file, or where `-o` says. |
+| `--go-package name` | The file's package: `main` for a program, `goose` for a library by default. |
+| `--library` | A package with no `func main`, whose `init` initializes the globals on a block of its own; a `fn main()` the program has is not run. A file with `export fn`s and no `fn main()` is a library without it. |
+| `--include helper.go` | Go source spliced into the file for the `extern fn`s the program calls (§3.5): its package clause and build constraints dropped, its imports merged, its lines kept (`//line helper.go:1`). A C header is refused. |
+| `--debug`, `--stack-reserve`, `-DGS_STACK_RESERVE`, `-DGS_STACK_GAP` | As for C: the checked arithmetic and casts of §3.1, and the size of each data stack's reservation and guard gap (§2.1), which the compiler reads as integer constants and writes into the file (`gsStackReserve`, `gsStackGap`). |
+
+An `export fn name` is two Go entry points (§3.5), named after its symbol with each word capitalized: `Name(args...)`, on a block from the runtime's pool, and `NameWithStack(gs, args...)`, on a `*GsStackBlock` the caller holds. A Go program imports the library's package and calls them:
+
+```go
+n := stats.CountWords("the quick brown fox")   // export fn count_words(text: const u8[:]) -> i64
+gs := stats.AcquireStackBlock(0)                // or stats.NewStackBlock, and gs.Close()
+defer stats.ReleaseStackBlock(gs)
+m := stats.MedianWithStack(gs, []int64{9, 1, 7}) // export fn median(xs: i64[:]) -> i64
+```
+
+The README has the whole example, and one of `--include`.
+
+---
+
+## 5. Testing: `test/run_go_tests.py`
+
+`python3 test/run_go_tests.py` checks the Go backend against the C backend. Every program it runs is compiled by both, at `-O2` and, but for the generated overflow and `--fuzz` programs, at `-O0` too, where nothing is inlined and every call stays a call. The Go must pass `go vet` with `CGO_ENABLED=0` (the `unsafeptr` analyzer included), build, and run exactly as the C does -- stdout, stderr and exit code -- also when built with `-gcflags=all=-d=checkptr` (at `-O2`), which checks every `unsafe.Pointer` conversion and the arithmetic on one at run time (what `go test -race` turns on, without cgo). Both backends must print the same `--stacks` report, which their shared accounting gives (`src/codegen_stacks.h`), and the runs must print what the expected files hold. Its sections:
+
+| Section | What runs |
+|---|---|
+| `test/go/programs/` | The Go backend's own programs, one or more per construct and per runtime check, judged against `test/go/expected/` (`<name>.out`, `.stderr`, `.exit`), which `--bless` writes from the C runs. |
+| `test/stdlib/`, `test/threads/` | The C suite's fixtures of the standard library and of workers and queues, also with `--debug` where a fixture's first line asks for a `GS_DEBUG` run, with the `-D` it names, each run in a directory of its own, judged against `test/expected/` as `run_tests.py` judges a C run. |
+| `samples/` | Every sample but those importing the C-only `gfx`, `ui`, `audio` and `physics` modules: run with `data/<name>.args` and `data/<name>.stdin` in a directory of its own whose `data/` is the samples', the C with its header (`call_c.h`) and the Go with its Go port (`call_c.go`) spliced in by `--include`. Stderr is the samples' timings, compared with every number masked; stdout must be what `samples/expected/` holds. |
+| `test/go/export/<name>/` | Libraries of `export fn`s compiled with `--target=go --library` (and the directory's other `.go` files by `--include`), with Go tests that call the entry points: `go vet` and `go test`, also with `-d=checkptr`, including `testing.AllocsPerRun` checks that a call allocates nothing on Go's heap, and calls from many goroutines at once. |
+| `test/go/build_only/`, overflow, `test/go/unsupported/`, the command line | Programs that never end, only built; data stack overflow at a 64 KB reservation; programs using what this version refuses, which must name it; `-o out.go`, `--go-package`, `--library`, `--include`, `goose run` and `goose build --target=go`. |
+| `--sweep` | Every program of the C suite's other categories (`test/codegen/`, `test/lifetimes/`, `test/optimizer/`, `test/runtime/`, `test/storage/`, `test/syntax/`, `test/typing/`) through the checks of the `test/stdlib/` section. One the Go backend refuses as not supported yet, at a level or at all, is counted, not failed, and so is one that differs by design (`SWEEP_KNOWN`: a recursion that exhausts the native stack is an abort in C and a fatal error of the Go runtime). |
+| `--fuzz N`, `--fuzz-flow N`, `--fuzz-values N` | Random programs of scalar arithmetic and conversions, of control flow, and of fixed-size values, which both backends must run alike. |
+
+`-j N` runs N checks at once, `-v` prints each one, `--workdir` names where the generated files go (`build/go-tests` by default), `--jit-reference` takes the C reference from TinyCC in the compiler's process, and names run only those programs. [`docs/testing.md`](docs/testing.md#the-go-backends-suite) has the details. The runtime's own tests are `cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...` (the race detector needs cgo on Linux; `CGO_ENABLED=0 go test -gcflags=all=-d=checkptr ./...` runs the pointer checks without it).

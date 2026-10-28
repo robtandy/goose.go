@@ -32,7 +32,8 @@ run.
 
 Data stack overflow is checked on programs generated for it: a print whose
 line, at --stack-reserve 64K, runs past its stack by a literal or inside a
-value's text, or just fits, must run in Go as it does in C.
+value's text, or just fits, must run in Go as it does in C, built with
+-d=checkptr as well.
 
 The programs of test/go/unsupported/ use what this version of the Go backend
 does not compile yet. Each must stop the compile with every `// error:`
@@ -43,27 +44,36 @@ backends as the suite's programs do, at -O2 and at -O0 (and with --debug
 where their first line asks run_tests.py for a GS_DEBUG run), with the -D
 their first line names, and must print what test/expected/ holds for them,
 as run_tests.py judges a C run (Runner.fixture); one that differs by design
-(SWEEP_KNOWN) is counted, not run. The samples SAMPLES names run in
-samples/ through both backends, which must agree on stdout and the exit
-code and print what samples/expected/ holds: their stderr is timings. A
-program with workers needs a C compiler for its reference, which a JIT run
-cannot build; without one it is counted, not run.
+(SWEEP_KNOWN) is counted, not run. Every sample of samples/ but those
+importing a module only the C backend has (gfx, ui, audio and physics)
+runs through both backends at both levels, as samples/run_samples.py runs
+one -- with its arguments, its stdin, and its C header, which the Go
+backend takes a Go port of -- each run in a directory of its own: the runs
+must agree on stdout and the exit code, and on stderr, the sample's
+timings, once its numbers are masked, and print what samples/expected/
+holds (Runner.sample). A program with workers needs a C compiler for its
+reference, which a JIT run cannot build; without one it is counted, not
+run.
 
 A few checks of the command line follow: the target -o out.go implies, `goose
 run --target=go` and `goose build --target=go`, --go-package and --library.
 
---sweep also runs the C suite's own programs (test/<category>/*.goose)
-through the Go backend: the ones it compiles must vet, build, and print what
-test/expected/ holds for them, as run_tests.py judges a C run; one it
-refuses as not supported yet is counted, not failed, and so is one that
-differs by design (SWEEP_KNOWN, with the reason). --fuzz N generates N
-programs of random scalar arithmetic, conversions and comparisons (from
---fuzz-seed on, every other one built with --debug), which both backends
-must run alike. --fuzz-flow N generates N programs of random control flow,
-whose returns, breaks, continues and guards end it in every position Go's
-flow analysis follows (conditions, arguments, loop bounds, values), with
-code after them that is never reached: their Go must vet and build, and run
-as their C does at both levels, with the same --stacks report. --fuzz-values
+--sweep also runs the C suite's own programs (test/<category>/*.goose) of
+its other categories through both backends as the test/stdlib/ fixtures
+run: at both levels, with --debug where they ask for it, vetted, built with
+-d=checkptr as well, and run as their C runs, printing what test/expected/
+holds for them, with the same --stacks report. One the Go backend refuses
+as not supported yet, at all or at a level (a value -O0 passes where -O2
+inlines it away), is counted there, not failed, and so is one that differs
+by design (SWEEP_KNOWN, with the reason). --fuzz N generates N programs of
+random scalar arithmetic, conversions and comparisons (from --fuzz-seed on,
+every other one built with --debug), which both backends must run alike,
+the Go built with -d=checkptr as well. --fuzz-flow N generates N programs
+of random control flow, whose returns, breaks, continues and guards end it
+in every position Go's flow analysis follows (conditions, arguments, loop
+bounds, values), with code after them that is never reached: their Go must
+vet and build, and run as their C does at both levels (and at -O2 with
+-d=checkptr), with the same --stacks report. --fuzz-values
 N generates N programs of fixed-size values: random structs (packed, padded,
 nested), ADTs and fixed and limited arrays, built from literals, written in
 place, compared, copied, matched, handed to functions by value and by
@@ -78,6 +88,7 @@ backend's runs instead of comparing with it.
 
 import argparse
 import concurrent.futures
+import contextlib
 import os
 import random
 import re
@@ -103,22 +114,41 @@ SWEEP_KNOWN = {
     "runtime/render_reference_cycle.goose": "native stack exhaustion",
     "threads/thread_stack_overflow.goose": "native stack exhaustion, in a worker",
 }
-# The samples whose output the Go backend's must match (Runner.sample): the
-# rest are issue #6's, which puts them all through both backends.
-SAMPLES = ["23_mandelbrot_threads.goose"]
-FLOW_TIMEOUT = 60   # Seconds a --fuzz-flow program may run.
+FLOW_TIMEOUT = 60     # Seconds a --fuzz-flow program may run.
+SAMPLE_TIMEOUT = 300  # Seconds a sample may run.
 
 
-def run_capture(argv, cwd=None, timeout=None):
+def parity_samples():
+    """The samples the Go backend's runs must match the C backend's on
+    (Runner.sample): every one but those importing a module only the C
+    backend has, which draws, plays sound or simulates physics through a C
+    library (gfx, ui, audio and physics, tc.NATIVE_MODULES)."""
+    return [f for f in sorted((REPO / "samples").glob("*.goose"))
+            if not tc.native_imports(f.read_text(encoding="utf-8"))]
+
+
+def run_capture(argv, cwd=None, timeout=None, stdin_path=None):
     """tc.run_capture, or with a limit on the time it takes: what runs on
-    past it is stopped, and the result is (None, "", "")."""
+    past it is stopped, and the result is (None, "", ""). The program reads
+    the file stdin_path names as its stdin where given."""
     if timeout is None:
-        return tc.run_capture(argv, cwd=cwd)
+        return tc.run_capture(argv, cwd=cwd, stdin_path=stdin_path)
     try:
-        r = subprocess.run([str(a) for a in argv], cwd=cwd, capture_output=True, timeout=timeout)
+        with open(stdin_path, "rb") if stdin_path else contextlib.nullcontext() as f:
+            r = subprocess.run([str(a) for a in argv], cwd=cwd, stdin=f, capture_output=True,
+                               timeout=timeout)
     except subprocess.TimeoutExpired:
         return None, "", ""
     return r.returncode, tc.decode(r.stdout), tc.decode(r.stderr)
+
+
+# Every number in a text: a sample's timings, masked where its stderr is
+# compared (Runner.sample).
+NUMBER = re.compile(r"\d+(?:\.\d+)?(?:e[+-]?\d+)?")
+
+
+def masked(text):
+    return NUMBER.sub("N", text)
 
 
 def first_line(path):
@@ -681,13 +711,13 @@ class Runner:
 
     # --- processes -----------------------------------------------------------
 
-    def goose(self, *args, timeout=None):
+    def goose(self, *args, timeout=None, stdin_path=None):
         """The compiler, run from the repository's root, where a source named
         relative to it is named as the messages of what it compiles say: the
         same on every machine."""
         args = [a.relative_to(REPO).as_posix() if isinstance(a, Path) and a.is_relative_to(REPO)
                 and a.suffix == ".goose" else str(a) for a in args]
-        return run_capture([self.exe] + args, cwd=REPO, timeout=timeout)
+        return run_capture([self.exe] + args, cwd=REPO, timeout=timeout, stdin_path=stdin_path)
 
     def gotool(self, *args):
         r = subprocess.run([self.go] + [str(a) for a in args], cwd=self.work, env=go_env(),
@@ -721,18 +751,23 @@ class Runner:
 
     # --- the steps -----------------------------------------------------------
 
-    def go_program(self, src, name, flags, out, checkptr=False):
+    def go_program(self, src, name, flags, out, checkptr=False, unsupported=None):
         """Compiles src to Go, vets and builds it: the executable, or None
         after saying why in `out`. With checkptr, the executable built with
         Go's checks of every unsafe.Pointer conversion and arithmetic, which
         `go test -race` turns on as well (-d=checkptr), is returned too, as
-        (exe, checked)."""
+        (exe, checked). A compile the Go backend refuses as not supported
+        yet is counted as `unsupported` names it, where it does, and not
+        failed."""
         gofile = self.work / f"{name}.go"
         exe = self.work / f"{name}-go{tc.EXE_SUFFIX}"
         gofile.unlink(missing_ok=True)
         code, o, e = self.goose(*flags, "--target=go", "-o", gofile, src)
         if code != 0:
-            out.append(("fail", f"goose --target=go {name}", o + e))
+            if unsupported and UNSUPPORTED in e:
+                out.append(("skip", unsupported, None))
+            else:
+                out.append(("fail", f"goose --target=go {name}", o + e))
             return None
         code, o, e = self.gotool("vet", gofile.name)
         if code != 0 or (o + e).strip():
@@ -752,25 +787,40 @@ class Runner:
             return None
         return exe, checked
 
-    def c_run(self, src, name, flags, out, timeout=None, cwd=None):
+    def c_run(self, src, name, flags, out, timeout=None, cwd=None, args=(), stdin=None,
+              jit_in_cwd=False):
         """The C backend's run of src: (exit code, stdout, stderr), or None
         after saying why. The exit code is None where it ran past timeout.
-        A compiled program runs in cwd where given (a TinyCC run in the
-        compiler's process, from the repository's root)."""
+        The program gets args and reads stdin (a file) where given. A
+        compiled program runs in cwd where given; a TinyCC run in the
+        compiler's process does from the repository's root, where the
+        messages name the source as the Go's do, or in cwd as well with
+        jit_in_cwd (a sample reading its data, whose source is then named
+        by its whole path)."""
         if self.cc is None:
             # TinyCC in the compiler's process: what the compile itself
             # prints to stderr (its warnings) comes before the program's.
-            code, o, e = self.goose(*flags, "--jit", src, timeout=timeout)
+            if jit_in_cwd and cwd:
+                # The standard library is the repository's, which a run from
+                # its root finds there, whatever compiler it is.
+                compiler = lambda *a, **kw: run_capture(
+                    [self.exe, "--stdlib", REPO / "stdlib"] +
+                    [x.resolve() if isinstance(x, Path) else x for x in a], cwd=cwd, **kw)
+            else:
+                compiler = self.goose
+            run = ["--", *args] if args else []
+            code, o, e = compiler(*flags, "--jit", src, *run, timeout=timeout, stdin_path=stdin)
             if code != 0 and "JIT mode does not support threads" in e:
                 out.append(("skip", f"{name}: a program with workers, which a JIT run cannot build",
                             None))
                 return None
-            _, _, warnings = self.goose(*flags, "--check", src)
+            _, _, warnings = compiler(*flags, "--check", src)
             if warnings and e.startswith(warnings):
                 e = e[len(warnings):]
             return code, o, e
         exe = self.c_build(src, name, flags, out)
-        return None if exe is None else run_capture([exe], cwd=cwd, timeout=timeout)
+        return None if exe is None else run_capture([exe] + list(args), cwd=cwd, timeout=timeout,
+                                                    stdin_path=stdin)
 
     def c_build(self, src, name, flags, out):
         """The C backend's executable for src, at the Goose level flags name
@@ -787,13 +837,17 @@ class Runner:
             return None
         return exe
 
-    def stacks(self, src, name, flags, out):
+    def stacks(self, src, name, flags, out, unsupported=False):
         """The data stack counts, from the analysis both backends share,
-        which must agree at both levels."""
+        which must agree at both levels; with unsupported, not at a level
+        whose Go the backend refuses as not supported yet, which is counted
+        instead."""
         for level in ("2", "0"):
             c = self.goose(*flags, f"-O{level}", "--check", "--stacks", src)
             g = self.goose(*flags, f"-O{level}", "--check", "--stacks", "--target=go", src)
-            if c != g or c[0] != 0:
+            if unsupported and g[0] != 0 and UNSUPPORTED in g[2]:
+                out.append(("skip", f"--stacks {name} -O{level}", None))
+            elif c != g or c[0] != 0:
                 out.append(("fail", f"--stacks {name} -O{level}",
                             f"--- go:\n{g[1]}{g[2]}\n--- c:\n{c[1]}{c[2]}"))
             else:
@@ -878,28 +932,31 @@ class Runner:
         return out
 
     def fuzz(self, seed):
-        """A random program, which both backends must run alike."""
+        """A random program, which both backends must run alike, the Go
+        built with its unsafe.Pointer checks as well."""
         out = []
         name = f"fuzz-{seed}"
         src = self.work / f"{name}.goose"
         tc.write_text(src, fuzz_program(seed))
         flags = ["--debug"] if seed % 2 else []
-        exe = self.go_program(src, name, flags, out)
+        exes = self.go_program(src, name, flags, out, checkptr=True)
         ref = self.c_run(src, name, flags, out)
-        if exe is None or ref is None:
+        if exes is None or ref is None:
             return out
-        got = tc.run_capture([exe])
-        if got != ref:
-            out.append(("fail", f"fuzz seed {seed}{' --debug' if flags else ''} ({src})",
-                        f"--- go (exit {got[0]}):\n{got[1][-2000:]}{got[2]}\n"
-                        f"--- c (exit {ref[0]}):\n{ref[1][-2000:]}{ref[2]}"))
-        else:
-            out.append(("ok", f"fuzz seed {seed}", None))
+        for exe, kind in zip(exes, ("", " -d=checkptr")):
+            got = tc.run_capture([exe])
+            if got != ref:
+                out.append(("fail", f"fuzz seed {seed}{' --debug' if flags else ''}{kind} ({src})",
+                            f"--- go (exit {got[0]}):\n{got[1][-2000:]}{got[2]}\n"
+                            f"--- c (exit {ref[0]}):\n{ref[1][-2000:]}{ref[2]}"))
+            else:
+                out.append(("ok", f"fuzz seed {seed}{kind}", None))
         return out
 
     def fuzz_flow(self, seed):
         """A random program of control flow (FlowProgram), which both
-        backends must run alike at both levels, with the same stacks."""
+        backends must run alike at both levels, the Go built with its
+        unsafe.Pointer checks as well at -O2, with the same stacks."""
         out = []
         name = f"flow-{seed}"
         src = self.work / f"{name}.goose"
@@ -912,16 +969,20 @@ class Runner:
                 out.append(("fail", f"fuzz-flow seed {seed} -O{level}: the C run did not end in "
                             f"{FLOW_TIMEOUT}s ({src})", None))
                 continue
-            exe = self.go_program(src, f"{name}-O{level}", [f"-O{level}"], out)
-            if exe is None:
+            exes = self.go_program(src, f"{name}-O{level}", [f"-O{level}"], out,
+                                   checkptr=level == "2")
+            if exes is None:
                 continue
-            got = run_capture([exe], timeout=FLOW_TIMEOUT)
-            if got != ref:
-                out.append(("fail", f"fuzz-flow seed {seed} -O{level} ({src})",
-                            f"--- go (exit {got[0]}):\n{got[1][-2000:]}{got[2]}\n"
-                            f"--- c (exit {ref[0]}):\n{ref[1][-2000:]}{ref[2]}"))
-            else:
-                out.append(("ok", f"fuzz-flow seed {seed} -O{level}", None))
+            if not isinstance(exes, tuple):
+                exes = (exes,)
+            for exe, kind in zip(exes, ("", " -d=checkptr")):
+                got = run_capture([exe], timeout=FLOW_TIMEOUT)
+                if got != ref:
+                    out.append(("fail", f"fuzz-flow seed {seed} -O{level}{kind} ({src})",
+                                f"--- go (exit {got[0]}):\n{got[1][-2000:]}{got[2]}\n"
+                                f"--- c (exit {ref[0]}):\n{ref[1][-2000:]}{ref[2]}"))
+                else:
+                    out.append(("ok", f"fuzz-flow seed {seed} -O{level}{kind}", None))
         self.stacks(src, name, [], out)
         return out
 
@@ -966,7 +1027,8 @@ class Runner:
     def overflow(self, name):
         """A print whose line may run past its stack's region (OVERFLOW_CASES):
         the C runtime's guard gap finds it, and the Go must report it alike,
-        with the same text and status, and print what fits as C does."""
+        with the same text and status, and print what fits as C does, also
+        built with its unsafe.Pointer checks."""
         out = []
         src = self.work / f"overflow-{name}.goose"
         tc.write_text(src, overflow_program(name))
@@ -978,15 +1040,16 @@ class Runner:
         if (ref[0] != 0) != over or over != ("data stack overflow" in ref[2]):
             out.append(("fail", f"overflow {name}: the C run is not the case", f"exit {ref[0]}\n{ref[2]}"))
             return out
-        exe = self.go_program(src, f"overflow-{name}", flags, out)
-        if exe is None:
+        exes = self.go_program(src, f"overflow-{name}", flags, out, checkptr=True)
+        if exes is None:
             return out
-        got = tc.run_capture([exe])
-        if got != ref:
-            out.append(("fail", f"overflow {name}", f"--- go (exit {got[0]}):\n{got[2]}\n"
-                        f"--- c (exit {ref[0]}):\n{ref[2]}"))
-        else:
-            out.append(("ok", f"overflow {name}", None))
+        for exe, kind in zip(exes, ("", " -d=checkptr")):
+            got = tc.run_capture([exe])
+            if got != ref:
+                out.append(("fail", f"overflow {name}{kind}", f"--- go (exit {got[0]}):\n{got[2]}\n"
+                            f"--- c (exit {ref[0]}):\n{ref[2]}"))
+            else:
+                out.append(("ok", f"overflow {name}{kind}", None))
         return out
 
     def unsupported(self, src):
@@ -1008,37 +1071,53 @@ class Runner:
             out.append(("fail", f"unsupported {src.name}: the C backend's check fails", o + e))
         return out
 
-    def fixture(self, src):
+    def fixture(self, src, sweep=False):
         """A fixture of the C suite's test/stdlib/ (issue #5) or test/threads/
-        (issue #12): compiled by both backends at -O2 and at -O0, and with
-        --debug at -O2 where its first line asks run_tests.py for a GS_DEBUG
-        run (`runtime-debug`), each with the -D its first line names
+        (issue #12), or with sweep any other category's (--sweep): compiled
+        by both backends at -O2 and at -O0, and with --debug at -O2 where
+        its first line asks run_tests.py for a GS_DEBUG run
+        (`runtime-debug`), each with the -D its first line names
         (`runtime-define`), each run in a directory of its own, since the os
         fixtures write files where they run. The Go must vet, build (at -O2
         with -d=checkptr as well) and run as the C does, its -O2 run print
         what test/expected/ holds, as run_tests.py judges a C run, and the
         two report the same data stacks. One that differs by design
-        (SWEEP_KNOWN) is counted, not run."""
+        (SWEEP_KNOWN) is counted, not run, and so is one of the sweep's the
+        Go backend refuses as not supported yet."""
         out = []
         section = src.parent.name
+        what = f"{'sweep ' if sweep else ''}{section}/{src.name}"
         known = SWEEP_KNOWN.get(f"{section}/{src.name}")
         if known:
-            out.append(("known", f"{section}/{src.name} ({known})", None))
+            out.append(("known", f"{what} ({known})", None))
             return out
-        name = f"{section}-{src.stem}"
+        name = f"{'sweep-' if sweep else ''}{section}-{src.stem}"
         flags = runtime_defines(src)
+        if sweep:
+            code, o, e = self.goose(*flags, "--target=go", "-o", self.work / f"{name}-probe.go", src)
+            if code != 0:
+                if UNSUPPORTED in e:
+                    out.append(("skip", what, None))
+                else:
+                    out.append(("fail", f"{what}: goose --target=go", o + e))
+                return out
         builds = [["-O2"], ["-O0"]]
         if "runtime-debug" in first_line(src):
             builds.append(["--debug", "-O2"])
         gotrun = None
         for b in builds:
             tag = "-".join(x.strip("-") for x in b)
-            label = f"{section}/{src.name} {' '.join(b)}"
+            label = f"{what} {' '.join(b)}"
             rundir = self.work / f"{name}-{tag}-run"
             rundir.mkdir(parents=True, exist_ok=True)
+            # A level of the sweep's the Go backend does not compile yet (a
+            # value -O0 passes where -O2 inlines it away) is counted.
+            exes = self.go_program(src, f"{name}-{tag}", flags + b, out, checkptr=b == ["-O2"],
+                                   unsupported=label if sweep else None)
+            if exes is None:
+                continue
             ref = self.c_run(src, f"{name}-{tag}", flags + b, out, cwd=rundir)
-            exes = self.go_program(src, f"{name}-{tag}", flags + b, out, checkptr=b == ["-O2"])
-            if exes is None or ref is None:
+            if ref is None:
                 continue
             if not isinstance(exes, tuple):
                 exes = (exes,)
@@ -1047,12 +1126,12 @@ class Runner:
                 if b == ["-O2"] and not kind:
                     gotrun = got
                 same = True
-                for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
+                for part, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
                                    ("stderr", got[2], ref[2])):
                     if g != c:
                         same = False
-                        out.append(("fail", f"parity {label}{kind}: {what}",
-                                    f"--- go:\n{g}\n--- c:\n{c}" if what != "exit code"
+                        out.append(("fail", f"parity {label}{kind}: {part}",
+                                    f"--- go:\n{g}\n--- c:\n{c}" if part != "exit code"
                                     else f"go {g}, c {c}"))
                 if same:
                     out.append(("ok", f"run {label}{kind}", None))
@@ -1074,42 +1153,74 @@ class Runner:
             elif o.rstrip("\n") != tc.decode(outfile.read_bytes()).rstrip("\n"):
                 bad.append("stdout")
             if bad:
-                out.append(("fail", f"expected {section}/{src.name} (Go -O2): {', '.join(bad)}",
+                out.append(("fail", f"expected {what} (Go -O2): {', '.join(bad)}",
                             f"--- stdout:\n{o}\n--- stderr:\n{e}"))
             else:
-                out.append(("ok", f"expected {section}/{src.name}", None))
-        self.stacks(src, name, flags, out)
+                out.append(("ok", f"expected {what}", None))
+        self.stacks(src, name, flags, out, unsupported=sweep)
         return out
 
     def sample(self, src):
-        """A sample of samples/ (SAMPLES) whose output the Go backend's
-        must match: compiled by both backends at -O2 and at -O0, run in
-        samples/ as run_samples.py runs one, the Go built with -d=checkptr
-        at -O2 as well. The runs must agree on stdout and the exit code, and
-        print what samples/expected/ holds; stderr is the sample's timings,
-        which no two runs share. The two report the same data stacks."""
+        """A sample of samples/ (parity_samples()): compiled by both backends
+        at -O2 and at -O0, the C with the header beside it (<name>.h) and
+        the Go with its Go port (<name>.go) spliced in by --include, and run
+        as run_samples.py runs one, with the words of data/<name>.args as
+        its arguments and data/<name>.stdin as its stdin, but each run in a
+        directory of its own whose data/ is the samples' (a sample writes
+        files where it runs); the Go built with -d=checkptr at -O2 as well.
+        The runs must agree on stdout and the exit code, and on stderr once
+        each number in it is masked: a sample's stderr is its timings, which
+        no two runs share. The Go's stdout at -O2 must be what
+        samples/expected/ holds, and the two report the same data stacks."""
         out = []
         name = f"sample-{src.stem}"
+        bare = re.sub(r"^\d+_", "", src.stem)
+        data = src.parent / "data"
+        argfile, infile = data / f"{bare}.args", data / f"{bare}.stdin"
+        args = argfile.read_text(encoding="utf-8").split() if argfile.exists() else []
+        stdin = infile if infile.exists() else None
+        cflags, goflags = [], []
+        header, port = src.parent / f"{bare}.h", src.parent / f"{bare}.go"
+        if header.exists():
+            if not port.exists():
+                out.append(("fail", f"samples/{src.name}: {header.name} has no Go port, {port.name}",
+                            None))
+                return out
+            cflags, goflags = ["--include", header], ["--include", port]
         for level in ("2", "0"):
             label = f"samples/{src.name} -O{level}"
-            ref = self.c_run(src, f"{name}-O{level}", [f"-O{level}"], out, cwd=src.parent)
-            exes = self.go_program(src, f"{name}-O{level}", [f"-O{level}"], out, checkptr=level == "2")
+            rundir = self.work / f"{name}-O{level}-run"
+            shutil.rmtree(rundir, ignore_errors=True)
+            rundir.mkdir(parents=True)
+            (rundir / "data").symlink_to(data, target_is_directory=True)
+            ref = self.c_run(src, f"{name}-O{level}", cflags + [f"-O{level}"], out, cwd=rundir,
+                             timeout=SAMPLE_TIMEOUT, args=args, stdin=stdin, jit_in_cwd=True)
+            exes = self.go_program(src, f"{name}-O{level}", goflags + [f"-O{level}"], out,
+                                   checkptr=level == "2")
             if exes is None or ref is None:
+                continue
+            if ref[0] is None:
+                out.append(("fail", f"{label}: the C run did not end in {SAMPLE_TIMEOUT}s", None))
                 continue
             if not isinstance(exes, tuple):
                 exes = (exes,)
             for exe, kind in zip(exes, ("", " -d=checkptr")):
-                got = run_capture([exe], cwd=src.parent)
-                bad = [what for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]))
+                got = run_capture([exe] + args, cwd=rundir, timeout=SAMPLE_TIMEOUT, stdin_path=stdin)
+                if got[0] is None:
+                    out.append(("fail", f"{label}{kind}: the Go run did not end in {SAMPLE_TIMEOUT}s",
+                                None))
+                    continue
+                bad = [what for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
+                                               ("stderr", masked(got[2]), masked(ref[2])))
                        if g != c]
                 if bad:
                     out.append(("fail", f"parity {label}{kind}: {', '.join(bad)}",
-                                f"--- go (exit {got[0]}):\n{got[1]}{got[2]}\n--- c (exit {ref[0]}):\n"
-                                f"{ref[1]}{ref[2]}"))
+                                f"--- go (exit {got[0]}):\n{got[1][-2000:]}{got[2]}\n"
+                                f"--- c (exit {ref[0]}):\n{ref[1][-2000:]}{ref[2]}"))
                     continue
                 out.append(("ok", f"run {label}{kind}", None))
                 if level == "2" and not kind:
-                    exp = src.parent / "expected" / f"{src.stem.split('_', 1)[1]}.out"
+                    exp = src.parent / "expected" / f"{bare}.out"
                     want = tc.decode(exp.read_bytes()) if exp.exists() else None
                     if want is None or got[1].rstrip("\n") != want.rstrip("\n"):
                         out.append(("fail", f"expected samples/{src.name} (Go -O2)",
@@ -1163,49 +1274,6 @@ class Runner:
                     out.append(("fail", f"{label}: {what}", text))
                     break
                 out.append(("ok", f"{label}: {what}", None))
-        return out
-
-    def sweep(self, src):
-        """A C suite fixture: skipped where the Go backend refuses it, judged
-        by its blessed output otherwise."""
-        out = []
-        name = f"sweep-{src.parent.name}-{src.stem}"
-        known = SWEEP_KNOWN.get(f"{src.parent.name}/{src.name}")
-        if known:
-            out.append(("known", f"sweep {src.parent.name}/{src.name} ({known})", None))
-            return out
-        flags = runtime_defines(src)
-        gofile = self.work / f"{name}.go"
-        code, o, e = self.goose(*flags, "--target=go", "-o", gofile, src)
-        if code != 0:
-            if UNSUPPORTED in e:
-                out.append(("skip", f"sweep {src.parent.name}/{src.name}", None))
-            else:
-                out.append(("fail", f"sweep {src.parent.name}/{src.name}: compile", o + e))
-            return out
-        exe = self.go_program(src, name, flags, out)
-        if exe is None:
-            return out
-        code, o, e = tc.run_capture([exe])
-        exp = HERE / "expected"
-        aborts = (exp / f"{src.stem}.aborts").exists()
-        bad = []
-        if aborts != (code != 0):
-            bad.append(f"exit {code}")
-        stderr_file = exp / f"{src.stem}.stderr"
-        if stderr_file.exists():
-            markers = [m.strip() for m in tc.decode(stderr_file.read_bytes()).splitlines()
-                       if m.strip()]
-            if any(m not in e for m in markers):
-                bad.append("stderr")
-        outfile = exp / f"{src.stem}.out"
-        if outfile.exists() and o.rstrip("\n") != tc.decode(outfile.read_bytes()).rstrip("\n"):
-            bad.append("stdout")
-        if bad:
-            out.append(("fail", f"sweep {src.parent.name}/{src.name}: {', '.join(bad)}",
-                        f"--- stdout:\n{o}\n--- stderr:\n{e}"))
-        else:
-            out.append(("ok", f"sweep {src.parent.name}/{src.name}", None))
         return out
 
     # --- the command line ----------------------------------------------------
@@ -1409,7 +1477,7 @@ def main():
     # The C suite's fixtures of the stdlib and of the threads (issue #12),
     # sections of their own (Runner.fixture).
     stdlib = sorted((HERE / "stdlib").glob("*.goose")) + sorted((HERE / "threads").glob("*.goose"))
-    samples = [REPO / "samples" / n for n in SAMPLES]
+    samples = parity_samples()
     exports = sorted(p for p in (HERE / "go" / "export").iterdir() if p.is_dir())
     if args.names:
         programs = [p for p in programs if p.stem in args.names]
@@ -1442,7 +1510,7 @@ def main():
         futures += [pool.submit(r.sample, p) for p in samples]
         futures += [pool.submit(r.export, p) for p in exports]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
-        futures += [pool.submit(r.sweep, p) for p in sweep]
+        futures += [pool.submit(r.fixture, p, True) for p in sweep]
         futures += [pool.submit(r.fuzz, seed)
                     for seed in range(args.fuzz_seed, args.fuzz_seed + args.fuzz)]
         futures += [pool.submit(r.fuzz_flow, seed)

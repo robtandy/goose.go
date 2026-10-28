@@ -344,6 +344,113 @@ inline vector<string> CodeGenGo::GenCallVals(Call *c, const GoDst &d0, vector<Go
     return EmitSpecCall(c, c->spec, d0, alldst);
 }
 
+// ------------------------------------------------------------------
+// Results adapted to an ADT (CodeGen::AdtFrom, GenAdtAdapted).
+
+// The type a call or an inlined call's body delivers its value as, where the
+// checker adapted that value to an ADT it does not arrive as (FitsAt: a
+// variant to its ADT, or the ADT to its other mode, §3.5); null elsewhere.
+// A reference result counts as its pointee, which the receiver loads.
+inline TypeExpr *CodeGenGo::AdtFrom(Node *n) {
+    auto et = n->exprtype;
+    if (!et || et->kind != TY_ENUM) return nullptr;
+    TypeExpr *from = nullptr;
+    if (auto c = Is<Call>(n)) {
+        if (c->fvbody) from = c->fvbody->exprtype;
+        else if (c->builtin != B_COPY && !c->rettypes.empty()) from = c->rettypes[0];
+    } else if (auto ib = Is<InlineBlock>(n)) {
+        if (ib->spec && !ib->spec->rets.empty()) from = ib->spec->rets[0];
+    }
+    if (from && IsPlainRef(from)) from = from->ref->sub;
+    if (!from || (from->kind != TY_VARIANT && from->kind != TY_ENUM) || TEq(from, et)) return nullptr;
+    return from;
+}
+
+// A value produced as `from` reaching d as the ADT `to` it was adapted to
+// (AdtFrom), as C builds it (CodeGen::GenAdtAdapted): `gen` builds the
+// value, as `from`, into the destination it is handed. A variant building
+// the variable-mode ADT needs only the ADT's tag in front of it, so it
+// builds in place; every other adaptation builds into a temporary -- a
+// local for a fixed-size value, a stack for any other, which both backends
+// take before the value is built -- and converts from there.
+inline void CodeGenGo::GenAdtAdapted(TypeExpr *from, TypeExpr *to, const GoDst &d, Line ln,
+                                     const function<void(const GoDst &)> &gen) {
+    if (d.k == GD_DISCARD) {
+        gen(d);
+        return;
+    }
+    // Relative references inside are offsets from where the value is built,
+    // which a copy would not keep.
+    if (IsFix(from) && HasRelRef(from))
+        Unsupported(ln, cat("a ", TypeText(from), " holding relative references adapted to ", TypeText(to)));
+    if (to->enu->varmode) {
+        if (d.k != GD_STACK) Fail(ln, cat("internal: a ", TypeText(to), " adapted outside a stack"));
+        if (from->kind == TY_VARIANT) {
+            // The tag, and the variant behind it (CodeGen::VariantBehindTag).
+            auto ei = EIOf(to);
+            EmitValStoreTag(d.s, TagStore(ei->en), cat(ei->en->VariantIndex(from->var->variant)));
+            auto rz = IsResz(from);
+            if (!d.lenlv.empty() && !rz) L(d.lenlv, " = 0");
+            gen(GoDst { GD_STACK, d.s, from, rz ? d.lenlv : "" });
+            return;
+        }
+        // The fixed-mode ADT, whose variants are all fixed-size.
+        auto v = FixedLocal(from, T(), "", false, ln);
+        gen(GoDst { GD_LVALUE, v, from });
+        if (Unreached()) return;
+        GenVarEnumFromLoc(AtVar(v, from), to, d.s);
+        if (!d.lenlv.empty()) L(d.lenlv, " = 0");
+        return;
+    }
+    // The fixed-mode ADT, from a variant or from the variable-mode ADT.
+    GoLoc l;
+    if (IsBytesT(from)) {
+        string stk;
+        auto base = BytesTemp(stk);
+        gen(GoDst { GD_STACK, stk, from });
+        l = BytesLoc(base, from, GoLoc {});
+    } else {
+        auto v = FixedLocal(from, T(), "", false, ln);
+        gen(GoDst { GD_LVALUE, v, from });
+        l = AtVar(v, from);
+    }
+    if (Unreached()) return;
+    auto x = LoadLoc(l, to, ln);
+    if (d.k == GD_LVALUE) L(d.s, " = ", x);
+    else EmitValStore(d.s, to, x);
+}
+
+// A call's first result, as the type t it arrives as (AdtFrom), into d
+// (CodeGen::GenCallAs): constructed at a stack, or its value into an
+// lvalue. A function value's block delivers t itself, into either, and a
+// builtin, whose code takes the call's type for its result's, is typed as
+// its result arrives while it builds it.
+inline void CodeGenGo::GenCallAs(Call *c, TypeExpr *t, const GoDst &d) {
+    if (c->fvbody) {
+        auto rv = GenFvCall(c, d.k == GD_DISCARD ? GoDst {} : GoDst { d.k, d.s, t, d.lenlv });
+        if (d.k == GD_STACK && IsFix(t) && !rv.empty() && !Unreached()) EmitValStore(d.s, t, rv);
+        return;
+    }
+    struct Retype {
+        Call *c;
+        TypeExpr *was;
+        explicit Retype(Call *c) : c(c), was(c->exprtype) {
+            if (c->builtin >= 0) c->exprtype = c->rettypes[0];
+        }
+        ~Retype() { c->exprtype = was; }
+    } retype(c);
+    if (d.k == GD_STACK) {
+        ConstructCall(c, t, d.s, t, d.lenlv);
+        return;
+    }
+    // A builtin given no destination discards its value (GenRzBuiltin).
+    auto d0 = c->builtin >= 0 && d.k == GD_LVALUE ? GoDst { GD_LVALUE, d.s, c->exprtype } : GoDst {};
+    auto rets = GenCallVals(c, d0, nullptr);
+    if (d.k == GD_DISCARD || rets.empty() || Unreached()) return;
+    auto x = CallVal0(c, rets[0], t);
+    if (x != d.s) L(d.s, " = ", x);
+}
+
 // The first result as its receiver takes it (CodeGen::CallVal0): a
 // reference received in a value context reads its pointee, and a fixed
 // value converts to the type the receiver wants.
@@ -601,7 +708,15 @@ inline bool CodeGenGo::NonFixedDispatch(Call *c) {
 
 // A call as a value: made at this point, its first result in a temporary.
 inline string CodeGenGo::GenCall(Call *c) {
-    if (c->builtin >= 0 || c->fvbody) return CtlValX(c);
+    // A result adapted to an ADT converts into a temporary (GenCallAny), a
+    // stack's where the ADT is not fixed-size, whose address it is.
+    if (AdtFrom(c) && IsBytesT(c->exprtype) && !IsResz(c->exprtype)) {
+        string stk;
+        auto base = BytesTemp(stk);
+        GenConstruct(c, stk, c->exprtype);
+        return base;
+    }
+    if (AdtFrom(c) || c->builtin >= 0 || c->fvbody) return CtlValX(c);
     if (!c->dispatch.empty()) {
         auto res = GenDispatch(c, GoDst {}, nullptr);
         if (res.empty()) Fail(c->line, "internal: a call without results as a value");
@@ -637,6 +752,11 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
     // there as anywhere else (Call::CgAny).
     if (d.k == GD_STACK) {
         GenConstruct(c, d.s, d.t, d.lenlv);
+        return;
+    }
+    // A result the checker adapted to an ADT arrives as the callee's type.
+    if (auto from = AdtFrom(c)) {
+        GenAdtAdapted(from, c->exprtype, d, c->line, [&](const GoDst &nd) { GenCallAs(c, from, nd); });
         return;
     }
     if (c->builtin >= 0) { GenBuiltin(c, d); return; }
@@ -879,7 +999,8 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
     switch ((BuiltinKind)c->builtin) {
         case B_PRINT: EmitPrint(c); return;
         case B_ASSERT: {
-            auto x = GenTruth(an[0]);
+            // A && or || as C branches on it (CodeGen::GenBranch).
+            auto x = BranchChain(an[0]) ? GenBranchTruth(an[0]) : GenTruth(an[0]);
             if (Unreached()) return GenUnreached([&] { GenBuiltin(c, d); });
             L("if !", x, " {");
             ind++;
@@ -1111,7 +1232,16 @@ inline void CodeGenGo::EmitPrint(Call *c) {
     rt.base = base;
     auto saved = rtarget;
     rtarget = &rt;
-    for (auto a : c->ArgNodes()) RenderInto(cur, end, a, c);
+    for (auto a : c->ArgNodes()) {
+        // An argument that runs code may trim the data stacks
+        // (os.trim_memory), which keeps what lies below each stack's top:
+        // the line so far goes below it first, as C's builder has it.
+        if (HasStmts(a) && !Unreached()) {
+            L(Top(k), " = ", cur);
+            rt.used = true;
+        }
+        RenderInto(cur, end, a, c);
+    }
     rtarget = saved;
     L(cur, " = gsPutStr(", cur, ", ", end, ", \"\\n\")");
     L("gsOut(", base, ", ", cur, ")");

@@ -76,7 +76,7 @@ export fn json_sum(text: const u8[:]) -> f64 {
     for &n in doc {
         match n.val {
             Num x => { sum += x.v; },
-            Int i => { sum += i.v as f64; },
+            Int i => { sum += i.v; },
             _ => {},
         }
     }
