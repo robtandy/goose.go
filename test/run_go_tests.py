@@ -100,7 +100,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
-sys.path.insert(0, str(REPO / "scripts"))
+UPSTREAM = REPO / "vendor" / "goose"
+UPSTREAM_TEST = UPSTREAM / "test"
+sys.path.insert(0, str(UPSTREAM / "scripts"))
 import toolchain as tc
 
 UNSUPPORTED = "is not supported by --target=go yet"
@@ -123,7 +125,7 @@ def parity_samples():
     (Runner.sample): every one but those importing a module only the C
     backend has, which draws, plays sound or simulates physics through a C
     library (gfx, ui, audio and physics, tc.NATIVE_MODULES)."""
-    return [f for f in sorted((REPO / "samples").glob("*.goose"))
+    return [f for f in sorted((UPSTREAM / "samples").glob("*.goose"))
             if not tc.native_imports(f.read_text(encoding="utf-8"))]
 
 
@@ -695,7 +697,8 @@ def go_env():
 
 class Runner:
     def __init__(self, args):
-        self.exe = tc.find_goose(args.exe)
+        default_exe = REPO / "build" / f"goose{tc.EXE_SUFFIX}"
+        self.exe = tc.find_goose(args.exe or (str(default_exe) if default_exe.exists() else None))
         self.go = os.environ.get("GOOSE_GO") or shutil.which("go")
         self.verbose = args.verbose
         self.bless = args.bless
@@ -712,12 +715,16 @@ class Runner:
     # --- processes -----------------------------------------------------------
 
     def goose(self, *args, timeout=None, stdin_path=None):
-        """The compiler, run from the repository's root, where a source named
-        relative to it is named as the messages of what it compiles say: the
-        same on every machine."""
-        args = [a.relative_to(REPO).as_posix() if isinstance(a, Path) and a.is_relative_to(REPO)
+        """The compiler, run from the repository's root (or UPSTREAM when a
+        fixture lives under vendor/goose/), where a source named relative to
+        it is named as the messages of what it compiles say: the same on
+        every machine."""
+        in_upstream = any(isinstance(a, Path) and a.is_relative_to(UPSTREAM) and a.suffix == ".goose"
+                          for a in args)
+        base = UPSTREAM if in_upstream else REPO
+        args = [a.relative_to(base).as_posix() if isinstance(a, Path) and a.is_relative_to(base)
                 and a.suffix == ".goose" else str(a) for a in args]
-        return run_capture([self.exe] + args, cwd=REPO, timeout=timeout, stdin_path=stdin_path)
+        return run_capture([self.exe] + args, cwd=base, timeout=timeout, stdin_path=stdin_path)
 
     def gotool(self, *args):
         r = subprocess.run([self.go] + [str(a) for a in args], cwd=self.work, env=go_env(),
@@ -804,7 +811,7 @@ class Runner:
                 # The standard library is the repository's, which a run from
                 # its root finds there, whatever compiler it is.
                 compiler = lambda *a, **kw: run_capture(
-                    [self.exe, "--stdlib", REPO / "stdlib"] +
+                    [self.exe, "--stdlib", UPSTREAM / "stdlib"] +
                     [x.resolve() if isinstance(x, Path) else x for x in a], cwd=cwd, **kw)
             else:
                 compiler = self.goose
@@ -1137,7 +1144,7 @@ class Runner:
                     out.append(("ok", f"run {label}{kind}", None))
         if gotrun is not None:
             code, o, e = gotrun
-            exp = HERE / "expected"
+            exp = UPSTREAM_TEST / "expected"
             bad = []
             if (exp / f"{src.stem}.aborts").exists() != (code != 0):
                 bad.append(f"exit {code}")
@@ -1180,7 +1187,10 @@ class Runner:
         args = argfile.read_text(encoding="utf-8").split() if argfile.exists() else []
         stdin = infile if infile.exists() else None
         cflags, goflags = [], []
-        header, port = src.parent / f"{bare}.h", src.parent / f"{bare}.go"
+        header = src.parent / f"{bare}.h"
+        port = src.parent / f"{bare}.go"
+        if not port.exists():
+            port = HERE / "go" / "samples" / f"{bare}.go"
         if header.exists():
             if not port.exists():
                 out.append(("fail", f"samples/{src.name}: {header.name} has no Go port, {port.name}",
@@ -1476,7 +1486,7 @@ def main():
     build_only = sorted((HERE / "go" / "build_only").glob("*.goose"))
     # The C suite's fixtures of the stdlib and of the threads (issue #12),
     # sections of their own (Runner.fixture).
-    stdlib = sorted((HERE / "stdlib").glob("*.goose")) + sorted((HERE / "threads").glob("*.goose"))
+    stdlib = sorted((UPSTREAM_TEST / "stdlib").glob("*.goose")) + sorted((UPSTREAM_TEST / "threads").glob("*.goose"))
     samples = parity_samples()
     exports = sorted(p for p in (HERE / "go" / "export").iterdir() if p.is_dir())
     if args.names:
@@ -1499,7 +1509,7 @@ def main():
         # (Runner.fixture).
         skipdirs = {"errors", "errors_tc", "goose_in_goose", "lsp", "go", "packages", "gfx",
                     "physics", "ui", "audio", "stdlib", "threads"}
-        sweep = [f for f in sorted(HERE.glob("*/*.goose"))
+        sweep = [f for f in sorted(UPSTREAM_TEST.glob("*/*.goose"))
                  if f.parent.name not in skipdirs and f.name != "lexer_tokens.goose" and
                  not error_markers(f) and "parse-only" not in first_line(f)]
     with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:

@@ -150,7 +150,11 @@ vector<string> StdlibDirs(const string &stdlibdir, const string &exe) {
     cands.push_back(cat(exedir, "../stdlib/"));
     cands.push_back(cat(exedir, "../../stdlib/"));
     cands.push_back(cat(exedir, "../../../stdlib/"));
+    cands.push_back(cat(exedir, "../vendor/goose/stdlib/"));
+    cands.push_back(cat(exedir, "../../vendor/goose/stdlib/"));
+    cands.push_back(cat(exedir, "../../../vendor/goose/stdlib/"));
     cands.push_back("stdlib/");
+    cands.push_back("vendor/goose/stdlib/");
     vector<string> dirs;
     set<string> seen;
     for (auto &dir : cands) {

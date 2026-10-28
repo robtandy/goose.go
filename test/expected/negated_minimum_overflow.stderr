@@ -1,2 +1,0 @@
-integer overflow (debug): -(-9223372036854775808) at i64
-negated_minimum_overflow.goose:7)

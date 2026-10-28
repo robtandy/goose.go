@@ -1,9 +1,0 @@
-# Every checkout sees the same bytes on Windows, Linux and macOS. Two things
-# in this repo depend on that: the test and sample runners compare program
-# output with blessed files in expected/, and src/runtime_inline.h carries the
-# generated C runtime inside a raw string literal, so its line ends travel into
-# every program the compiler emits.
-* text=auto eol=lf
-
-# Checks that a """ string's line breaks come out as \n from a CRLF file.
-test/syntax/raw_strings_crlf.goose -text

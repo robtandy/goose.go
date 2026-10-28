@@ -1,0 +1,3 @@
+[submodule "vendor/goose"]
+	path = vendor/goose
+	url = https://github.com/aardappel/goose.git

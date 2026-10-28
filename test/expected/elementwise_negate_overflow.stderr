@@ -1,2 +1,0 @@
-integer overflow (debug): -(-2147483648) at i32
-elementwise_negate_overflow.goose:7)
