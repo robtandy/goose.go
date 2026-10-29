@@ -559,7 +559,7 @@ inline string CodeGenGo::GenUnary(Unary *u) {
         auto x = Snapshot(t, CoerceVal(GenX(u->child), u->child->exprtype, t, u->line));
         auto v = T();
         Decl(v, LocalT(t, u->line));
-        ElemwiseNegInto(t, u->line, x, AtVar(v, t));
+        ElemwiseNegInto(t, u->line, x, AtLocal(v, t));
         return v;
     }
     auto ct = u->child->exprtype;
@@ -661,7 +661,7 @@ inline string CodeGenGo::GenBinary(Binary *b) {
         ElemwiseOperands(b, l, ls, r, rs);
         auto v = T();
         Decl(v, LocalT(b->exprtype, b->line));
-        ElemwiseInto(b->exprtype, op, b->line, l, ls, r, rs, AtVar(v, b->exprtype));
+        ElemwiseInto(b->exprtype, op, b->line, l, ls, r, rs, AtLocal(v, b->exprtype));
         return v;
     }
     // A varint operand or result is the i64 it encodes (§3.6).
