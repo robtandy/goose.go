@@ -140,6 +140,34 @@ goose run --target=go --include helper.go shout.goose
 
 `samples/24_call_c.goose` runs this way too, with `samples/call_c.go`, the Go port of its C header, in place of `call_c.h`.
 
+## Integers in bytes: one load, one store
+
+An integer assembled from the bytes of consecutive elements of a `u8` array or slice, or taken apart into them, is one load or one store of 2, 4 or 8 bytes under `--target=go`, little- or big-endian, as a C compiler makes it: the Go is `binary.LittleEndian.Uint64((*[8]byte)(p)[:])` and its kin, which Go compiles to one load (and a byte swap for the other order) on arm64 and amd64. Write the bytes out, with their span proven once, and no `extern fn` is needed:
+
+```goose
+// One 8-byte load: a slice of the span, and constant indices into it.
+fn le64(s: const u8[:], i: i64) -> u64 {
+    let c = s[i..i + 8];
+    c[0] | (c[1] as u64) << 8 | (c[2] as u64) << 16 | (c[3] as u64) << 24 |
+        (c[4] as u64) << 32 | (c[5] as u64) << 40 | (c[6] as u64) << 48 | (c[7] as u64) << 56
+}
+
+// One 4-byte load, big-endian: a guard BCE can use whatever i is (not
+// `i + 4 > s.len`, since i + 4 can wrap).
+fn be32(s: const u8[:], i: i64) -> u32 {
+    if i < 0 || i > s.len - 4 { return 0; }
+    (s[i] as u32) << 24 | (s[i + 1] as u32) << 16 | (s[i + 2] as u32) << 8 | s[i + 3]
+}
+
+// One 8-byte store: a loop over the bytes, or the eight statements.
+fn put_le64(o: u8[:], j: i64, v: u64) {
+    let c = o[j..j + 8];
+    for k in 8 { c[k] = (v >> (8 * k)) as! u8; }
+}
+```
+
+The bytes can come in any order of the OR's operands, at any integer type wide enough, from any `u8` array or slice -- a local `u8[8]` too, which a function that fills and reads it a byte at a time keeps as a Go array, not in its frame -- and a store converts each byte with `as!` (or masks it to 255 first). Every byte's bounds check must be proven away and the index's arithmetic 64-bit; anything else is compiled as it is written, a byte at a time. [`DESIGN.md` §3.8](DESIGN.md#38-wide-loads-and-stores-issue-23) has the details.
+
 ## Testing
 
 ```bash
@@ -154,6 +182,7 @@ cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...
 - the C suite's `test/stdlib/` and `test/threads/` fixtures;
 - every sample in `samples/` but those using the C-only `gfx`, `ui`, `audio` and `physics` modules, run in a directory of their own with their arguments and stdin, against `samples/expected/`;
 - the `export fn` libraries of `test/go/export/`, whose Go tests call their entry points (with `testing.AllocsPerRun` checking that a call allocates nothing, and a `TestMain` checking that importing the package mapped nothing);
+- the code Go makes of the wide loads and stores of `test/go/export/wide/`, for arm64 and for amd64: one load or one store each, of the width its `// asm:` line names;
 - programs that never end, which it only builds (`test/go/build_only/`), data stack overflow, the constructs this version refuses (`test/go/unsupported/`), and the command line (`-o out.go`, `--go-package`, `--go-build`, `--library`, `--frame-reserve`, `--include` and the positions in what it splices in, `goose run`/`goose build --target=go`).
 
 `--sweep` puts the programs of the C suite's other categories (`test/codegen/`, `test/lifetimes/`, `test/optimizer/`, `test/runtime/`, `test/storage/`, `test/syntax/`, `test/typing/`: every fixture that runs, not the ones that must fail to compile) through the same checks, judged against `test/expected/`, aborts included. A fixture using what the Go backend does not compile yet is counted, not failed, and so is one of the few that differ by design (a recursion that exhausts the native stack, which C reports as an abort and Go as a fatal error). `--fuzz N`, `--fuzz-flow N` and `--fuzz-values N` add random programs of scalar arithmetic, control flow and fixed-size values. `-j N` sets the parallelism, `-v` lists every check, and names run only those programs. [`docs/testing.md`](docs/testing.md#the-go-backends-suite) has the details.
