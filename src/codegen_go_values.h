@@ -595,6 +595,11 @@ inline string CodeGenGo::GenUnary(Unary *u) {
 
 inline string CodeGenGo::GenBinary(Binary *b) {
     auto op = b->op;
+    // Bytes assembled into an integer: one load (codegen_go_wide.h).
+    if (op == T_BITOR) {
+        auto x = GenWideLoad(b);
+        if (!x.empty()) return x;
+    }
     if (op == T_DOTEQ || op == T_DOTNEQ) {
         // Reference identity (§3.8): the addresses, null the null one; a
         // reference to a resizable value (a fat or a pool reference) is its

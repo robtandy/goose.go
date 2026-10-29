@@ -47,6 +47,10 @@
 //   lvalue (GoLoc, codegen_go_places.h). A fixed array that is a Go local's
 //   own is indexed as Go indexes it, which leaves the local a Go value.
 //
+// * An integer assembled from the bytes of consecutive elements of a u8
+//   array or slice, or taken apart into them, whose bounds BCE proved, is one
+//   load or one store (codegen_go_wide.h), as a C compiler makes it.
+//
 // * The foreign boundary (codegen_go_export.h, DESIGN.md §3.5): an extern
 //   fn calls the Go runtime's function its C symbol names (std's, math's
 //   and os's), Go's math, or a Go function of the package that an
@@ -68,7 +72,7 @@
 //
 // The members are declared here in the order they are defined across
 // codegen_go_values.h, codegen_go_types.h, codegen_go_places.h,
-// codegen_go_aggr.h, codegen_go_rz.h, codegen_go_stmts.h,
+// codegen_go_aggr.h, codegen_go_wide.h, codegen_go_rz.h, codegen_go_stmts.h,
 // codegen_go_calls.h, codegen_go_export.h, codegen_go_emit.h and
 // codegen_go_threads.h; codegen_go_rz.h is included after
 // codegen_go_calls.h, whose helpers it uses.
@@ -441,6 +445,31 @@ struct CodeGenGo {
     void RenderScalar(const string &cur, const string &end, const string &x, TypeExpr *t, Line ln);
     string RenderFn(TypeExpr *t, Line ln);
     void EmitRenderFns();
+
+    // ------------------------------------------------------------------
+    // Wide loads and stores (codegen_go_wide.h): an integer assembled from
+    // the bytes of consecutive elements of a u8 array or slice, or taken
+    // apart into them, as one load or one store, through encoding/binary.
+
+    // A byte of one: its element, the constant its index adds to the rest
+    // of it, and how far left the byte goes in the integer.
+    struct WideByte {
+        Index *ix = nullptr;
+        int64_t off = 0, shift = 0;
+    };
+    // A wide load or store needs encoding/binary: one that is emitted, not
+    // one in code no path reaches, whose text is dropped (GenUnreached).
+    bool usesbinary = false;
+    bool SamePure(Node *a, Node *b);
+    bool WideIndex(Node *idx, Node *&base, int64_t &off);
+    bool WideElem(Index *ix);
+    bool WideLeaf(Node *n, TypeExpr *ot, WideByte &w);
+    string WideBytes(const GoView &v, const string &at, int64_t n);
+    string GenWideLoad(Binary *b);
+    bool WideStoreByte(Node *rhs, int64_t bits, Node *&v, Node *&count);
+    bool GenWideStoreLoop(ForLoop *f);
+    size_t GenWideStoreRun(const vector<Node *> &stmts, size_t i);
+    void GenStmts(const vector<Node *> &stmts, size_t first = 0);
 
     // ------------------------------------------------------------------
     // Values on data stacks (codegen_go_rz.h): resizable values and their

@@ -39,6 +39,7 @@ add_executable(goose
     src/codegen_go_types.h
     src/codegen_go_places.h
     src/codegen_go_aggr.h
+    src/codegen_go_wide.h
     src/codegen_go_stmts.h
     src/codegen_go_calls.h
     src/codegen_go_rz.h

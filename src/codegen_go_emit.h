@@ -667,7 +667,7 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
             fdstsaves.push_back(cat(fdst, " = ", sav));
         }
     }
-    for (auto st : sp->body->stmts) GenStmt(st);
+    GenStmts(sp->body->stmts);
     if (auto tail = sp->body->tail) {
         auto asvalue = !sp->rets.empty() && !IsVoidT(tail->exprtype);
         if (auto fi = Is<IfExpr>(tail); fi && !fi->elseb) asvalue = false;
@@ -1105,6 +1105,7 @@ inline string CodeGenGo::Source(const string &srcname) {
     for (auto p : { "math", "os", "runtime", "runtime/debug", "strconv", "sync", "sync/atomic", "syscall", "unsafe" })
         add("", p);
     if (usesbits) add("", "math/bits");
+    if (usesbinary) add("", "encoding/binary");
     if (usesos)
         for (auto p : { "bytes", "io", "path/filepath", "strings", "time" }) add("", p);
     if (usesthreads) add("", "time");

@@ -44,6 +44,7 @@
 #include "codegen_go_types.h"
 #include "codegen_go_places.h"
 #include "codegen_go_aggr.h"
+#include "codegen_go_wide.h"
 #include "codegen_go_stmts.h"
 #include "codegen_go_calls.h"
 #include "codegen_go_rz.h"
