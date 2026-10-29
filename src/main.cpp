@@ -49,6 +49,7 @@
 #include "codegen_go_rz.h"
 #include "codegen_go_bytes.h"
 #include "codegen_go_export.h"
+#include "codegen_go_format.h"
 #include "codegen_go_emit.h"
 #include "codegen_go_threads.h"
 #include "runtime_inline.h"
@@ -687,6 +688,9 @@ R"(  --stats               Print what the compile did: the declarations parsed,
                         --target=c, --target=go). -o out.go picks Go too.
   --go-package name     The package of the Go file (default main, or goose
                         for a library).
+  --go-build expr       With --target=go, start the Go file with the build
+                        constraint //go:build expr: --go-build goose_x makes
+                        a file go build builds with -tags goose_x only.
   --library             With --target=go, a package with no func main, for
                         a Go program to use: fn main() is optional.
   --frame-reserve size  With --target=go, the address space each block of
@@ -1382,7 +1386,7 @@ int Main(int argc, char **argv) {
     auto jsondiag = false;
     string ccrequest;
     // The backend (--target): "c", "go", or "" for the one -o's name implies.
-    string target, gopackage;
+    string target, gopackage, gobuild;
     auto golibrary = false;
     uint64_t goframereserve = 0;
     // The inlining at its highest. The C compiler optimizes whatever the
@@ -1518,6 +1522,15 @@ int Main(int argc, char **argv) {
                 return 1;
             }
         }
+        else if ((arg == "--go-build" && i + 1 < argc) || arg.rfind("--go-build=", 0) == 0) {
+            string expr = arg == "--go-build" ? argv[++i] : arg.substr(11);
+            string why;
+            if (!GoBuildConstraint(expr, gobuild, why)) {
+                fprintf(stderr, "--go-build takes a build constraint, as a //go:build line has one (%s): %s\n",
+                        why.c_str(), expr.c_str());
+                return 1;
+            }
+        }
         else if (arg == "--library") golibrary = true;
         else if (arg == "--frame-reserve" && i + 1 < argc) {
             // As --stack-reserve's: the runtime halves a reservation the
@@ -1614,8 +1627,8 @@ int Main(int argc, char **argv) {
     auto gotarget = target == "go" ||
                     (target.empty() && verb != "build" && outname.size() > 3 &&
                      outname.compare(outname.size() - 3, 3, ".go") == 0);
-    if (!gotarget && (!gopackage.empty() || golibrary || goframereserve)) {
-        fprintf(stderr, "--go-package, --library and --frame-reserve are for --target=go\n");
+    if (!gotarget && (!gopackage.empty() || !gobuild.empty() || golibrary || goframereserve)) {
+        fprintf(stderr, "--go-package, --go-build, --library and --frame-reserve are for --target=go\n");
         return 1;
     }
     if (gotarget && !headername.empty()) {
@@ -1642,6 +1655,11 @@ int Main(int argc, char **argv) {
     if ((gorun || (gotarget && verb == "build")) && !gopackage.empty() && gopackage != "main") {
         fprintf(stderr, "an executable is package main: --go-package is for the Go that -o "
                         "writes\n");
+        return 1;
+    }
+    if ((gorun || (gotarget && verb == "build")) && !gobuild.empty()) {
+        fprintf(stderr, "--go-build constrains the Go that -o writes, for a go build of its own: goose %s "
+                        "builds the executable itself\n", verb == "build" ? "build" : "run");
         return 1;
     }
     if (!headername.empty() && (jit || multitest)) {
@@ -1803,6 +1821,7 @@ int Main(int argc, char **argv) {
             GoOptions go;
             go.library = golib;
             go.package = !gopackage.empty() ? gopackage : golib ? "goose" : "main";
+            go.build = gobuild;
             go.debug = debug;
             for (auto &d : cdefines) {
                 auto eq = d.find('=');

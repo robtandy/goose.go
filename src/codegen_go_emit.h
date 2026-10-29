@@ -1083,8 +1083,267 @@ inline void CodeGenGo::ResolveGsArgs() {
     fill(eqcode);
 }
 
-// The whole file: a header Go tools know generated code by, the package,
-// the runtime configuration and the runtime, then the program.
+// --go-build's expression in go/build/constraint's syntax -- tags (letters,
+// digits, _ and .) under !, && and ||, and parentheses -- into canon as
+// gofmt writes a //go:build line, which parenthesizes an && inside an ||
+// and an || inside an && (constraint.Expr's String); false, with why,
+// where it is not one.
+static bool GoBuildConstraint(string_view text, string &canon, string &why) {
+    struct Parser {
+        string_view s;
+        size_t i = 0;
+        string_view tok;
+        bool istag = false;
+        string err;
+        int size = 0;
+        struct Expr {
+            char op;   // t a tag, ! not, & and, | or
+            string_view tag;
+            int x, y;
+        };
+        vector<Expr> e;
+        int Fail(string m) {
+            if (err.empty()) err = std::move(m);
+            tok = {};
+            istag = false;
+            return -1;
+        }
+        int New(char op, int x, int y, string_view tag = {}) {
+            if (!err.empty()) return -1;
+            e.push_back({ op, tag, x, y });
+            return (int)e.size() - 1;
+        }
+        void Lex() {
+            istag = false;
+            while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+            if (i >= s.size()) {
+                tok = {};
+                return;
+            }
+            auto c = s[i];
+            if (c == '(' || c == ')' || c == '!') {
+                tok = s.substr(i++, 1);
+                return;
+            }
+            if (c == '&' || c == '|') {
+                if (i + 1 >= s.size() || s[i + 1] != c) {
+                    Fail(cat("invalid syntax at ", string(1, c)));
+                    return;
+                }
+                tok = s.substr(i, 2);
+                i += 2;
+                return;
+            }
+            auto b = i;
+            while (i < s.size() && (isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '.' ||
+                                    (unsigned char)s[i] >= 0x80))
+                i++;
+            if (i == b) {
+                Fail((unsigned char)c < 32 ? string("invalid syntax at a control character")
+                                           : cat("invalid syntax at ", string(1, c)));
+                return;
+            }
+            tok = s.substr(b, i - b);
+            istag = true;
+        }
+        int Or() {
+            auto x = And();
+            while (err.empty() && tok == "||") x = New('|', x, And());
+            return x;
+        }
+        int And() {
+            auto x = Not();
+            while (err.empty() && tok == "&&") x = New('&', x, Not());
+            return x;
+        }
+        int Not() {
+            if (++size > 1000) return Fail("build expression too large");
+            Lex();
+            if (!err.empty()) return -1;
+            if (tok == "!") {
+                Lex();
+                if (tok == "!") return Fail("double negation not allowed");
+                auto x = Atom();
+                return New('!', x, -1);
+            }
+            return Atom();
+        }
+        int Atom() {
+            if (!err.empty()) return -1;
+            if (tok == "(") {
+                auto x = Or();
+                if (err == "unexpected end of expression") err = "missing close paren";
+                if (!err.empty()) return -1;
+                if (tok != ")") return Fail("missing close paren");
+                Lex();
+                return x;
+            }
+            if (!istag) return Fail(tok.empty() ? string("unexpected end of expression") : cat("unexpected token ", tok));
+            auto t = tok;
+            Lex();
+            return New('t', -1, -1, t);
+        }
+        string Text(int x) const {
+            auto &n = e[x];
+            auto arg = [&](int k, char paren) {
+                auto a = Text(k);
+                return e[k].op == paren ? cat("(", a, ")") : a;
+            };
+            switch (n.op) {
+                case 't': return string(n.tag);
+                case '!': {
+                    auto a = Text(n.x);
+                    return cat("!", e[n.x].op == '&' || e[n.x].op == '|' ? cat("(", a, ")") : a);
+                }
+                case '&': return cat(arg(n.x, '|'), " && ", arg(n.y, '|'));
+                default: return cat(arg(n.x, '&'), " || ", arg(n.y, '&'));
+            }
+        }
+    };
+    Parser p;
+    p.s = text;
+    auto x = p.Or();
+    if (p.err.empty() && !p.tok.empty()) p.Fail(cat("unexpected token ", p.tok));
+    if (!p.err.empty()) {
+        why = p.err;
+        return false;
+    }
+    canon = p.Text(x);
+    return true;
+}
+
+// An --include file's Go as the generated file holds it, its package clause
+// and imports gone (GoSplitInclude): each run of lines between blank ones
+// under a //line directive naming the file and the run's first line, which
+// keeps every position Go reports in it -- an error's, a panic's frame's --
+// the file's own, whatever blank lines gofmt collapses. A run that starts
+// with a comment at the package level that a declaration follows, its
+// documentation, takes the directive at its end instead, after an empty
+// comment line, which is where gofmt keeps a directive in a doc comment
+// (go/printer's formatDocComment); a run of nothing but comments needs
+// none. Each run follows a blank line, as text for the end of the file.
+static string GoIncludeLines(const string &name, const string &body) {
+    // Each line: whether it is blank, outside a raw string and a /* */
+    // comment; nothing but comments; inside a raw string at its end, which
+    // keeps the blanks there; a comment at its start; a // comment and
+    // nothing else.
+    struct L {
+        size_t b, e;
+        bool blank, comments, rawend, comment1, slashes;
+    };
+    vector<L> lines;
+    auto state = 0;   // 1 in a raw string, 2 in a /* */ comment
+    for (size_t pos = 0; pos <= body.size();) {
+        auto nl = body.find('\n', pos);
+        if (nl == string::npos) nl = body.size();
+        L l { pos, nl, false, false, false, false, false };
+        auto start = state;
+        auto code = false, text = false;
+        l.comment1 = !state && (body.compare(pos, 2, "//") == 0 || body.compare(pos, 2, "/*") == 0);
+        auto first = std::min(body.find_first_not_of(" \t", pos), nl);
+        l.slashes = !state && body.compare(first, 2, "//") == 0;
+        for (auto i = pos; i < nl;) {
+            auto c = body[i];
+            if (state == 1) {
+                if (c == '`') state = 0;
+                code = true;
+                i++;
+            } else if (state == 2) {
+                text = true;
+                if (body.compare(i, 2, "*/") == 0) {
+                    state = 0;
+                    i += 2;
+                } else {
+                    i++;
+                }
+            } else if (c == ' ' || c == '\t' || c == '\r') {
+                i++;
+            } else if (body.compare(i, 2, "//") == 0) {
+                text = true;
+                break;
+            } else if (body.compare(i, 2, "/*") == 0) {
+                text = true;
+                state = 2;
+                i += 2;
+            } else {
+                code = true;
+                if (c == '`') {
+                    state = 1;
+                    i++;
+                } else if (c == '"' || c == '\'') {
+                    for (i++; i < nl && body[i] != c; i++)
+                        if (body[i] == '\\') i++;
+                    i++;
+                } else {
+                    i++;
+                }
+            }
+        }
+        l.blank = !start && !code && !text;
+        l.comments = !code && start != 1 && !l.blank;
+        l.rawend = state == 1;
+        lines.push_back(l);
+        pos = nl + 1;
+    }
+    // A line as gofmt keeps it: without the blanks that end it.
+    auto line = [&](const L &l) {
+        auto e = l.e;
+        if (!l.rawend)
+            while (e > l.b && (body[e - 1] == ' ' || body[e - 1] == '\t' || body[e - 1] == '\r')) e--;
+        return cat(body.substr(l.b, e - l.b), "\n");
+    };
+    // A directive in a comment (go/printer's isDirective): //line, //extern,
+    // //export, or //word:word.
+    auto directive = [&](const L &l) {
+        string_view c(body.data() + l.b, l.e - l.b);
+        if (c.substr(0, 2) != "//") return false;
+        c.remove_prefix(2);
+        if (c.rfind("line ", 0) == 0 || c.rfind("extern ", 0) == 0 || c.rfind("export ", 0) == 0) return true;
+        auto colon = c.find(':');
+        if (colon == 0 || colon == string_view::npos || colon + 1 >= c.size()) return false;
+        for (size_t i = 0; i <= colon + 1; i++)
+            if (i != colon && !(islower((unsigned char)c[i]) || isdigit((unsigned char)c[i]))) return false;
+        return true;
+    };
+    string out;
+    for (size_t a = 0; a < lines.size();) {
+        if (lines[a].blank) {
+            a++;
+            continue;
+        }
+        auto b = a;
+        while (b < lines.size() && !lines[b].blank) b++;
+        out += "\n";
+        auto m = a;
+        while (m < b && lines[m].comments) m++;
+        if (m == b) {
+            // Comments alone.
+        } else if (!lines[a].comment1) {
+            Append(out, "//line ", name, ":", a + 1, "\n");
+        } else {
+            // A doc comment, when a declaration at the package level
+            // follows it, which go/doc/comment lays out where it is all //
+            // comments: the directive after the text, an empty comment line
+            // between them.
+            auto top = lines[m].e > lines[m].b && body[lines[m].b] != ' ' && body[lines[m].b] != '\t';
+            auto slashes = true;
+            for (; a < m; a++) {
+                slashes = slashes && lines[a].slashes;
+                out += line(lines[a]);
+            }
+            auto last = line(lines[m - 1]);
+            if (top && slashes && !directive(lines[m - 1]) && last != "//\n") out += "//\n";
+            Append(out, "//line ", name, ":", m + 1, "\n");
+        }
+        for (; a < b; a++) out += line(lines[a]);
+    }
+    return out;
+}
+
+// The whole file: a build constraint where --go-build gives one, a header
+// Go tools know generated code by, the package, the imports, the runtime
+// configuration and the runtime, then the program, laid out as gofmt lays
+// it out (GoFormat), and the --include files.
 inline string CodeGenGo::Source(const string &srcname) {
     // Go source is UTF-8 throughout, comments included: the file's name as
     // printable ASCII.
@@ -1092,7 +1351,8 @@ inline string CodeGenGo::Source(const string &srcname) {
     for (auto &c : name)
         if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
     // The imports: the runtime's, the OS layer's where the program calls it,
-    // and the --include files' (incimports), each package once.
+    // and the --include files' (incimports), each package once, in gofmt's
+    // order: by path, then by name.
     vector<pair<string, string>> imports;
     auto add = [&](const string &n, const string &path) {
         // A name that is the package's own is no name.
@@ -1108,11 +1368,14 @@ inline string CodeGenGo::Source(const string &srcname) {
     if (usesos)
         for (auto p : { "bytes", "io", "path/filepath", "strings", "time" }) add("", p);
     if (usesthreads) add("", "time");
-    sort(imports.begin(), imports.end(), [](auto &a, auto &b) { return a.second < b.second; });
     for (auto &[n, p] : incimports) add(n, p);
+    sort(imports.begin(), imports.end(), [](auto &a, auto &b) {
+        return a.second != b.second ? a.second < b.second : a.first < b.first;
+    });
     string imps;
     for (auto &[n, p] : imports) Append(imps, "\t", n, n.empty() ? "" : " ", GoStr(p), "\n");
-    string s = cat("// Code generated by the Goose compiler from ", name, ". DO NOT EDIT.\n"
+    string s = cat(opts.build.empty() ? "" : cat("//go:build ", opts.build, "\n\n"),
+                   "// Code generated by the Goose compiler from ", name, ". DO NOT EDIT.\n"
                    "//\n"
                    "// Names from the program carry a _g suffix, which keeps them clear of Go's\n"
                    "// keywords and of the runtime's gs and Gs names; a namespaced name ns::x is\n"
@@ -1144,17 +1407,17 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "// The block main's program runs, whose stacks hold main's instance's values.\n"
                    "var gsMainBlock *GsStackBlock\n\n");
     if (!qdecls.empty()) inst += cat("// The queues (§11.2), one per element type.\n", qdecls, "\n");
-    Append(s, "\n// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, inst, gdecls,
-           gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code,
-           xcode.empty() ? "" : "// ---- export fns' entry points ----\n\n", xcode, eqcode, bcode, ldstcode);
-    // The --include files, last, so that the //line directive naming each
-    // holds to the end.
+    Append(s, "\n", GoFormat(cat("// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, inst,
+                                 gdecls, gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code,
+                                 xcode.empty() ? "" : "// ---- export fns' entry points ----\n\n", xcode, eqcode,
+                                 bcode, ldstcode)));
+    // The --include files, last, so that the //line directives naming each
+    // hold to its end.
     for (auto &[iname, ibody] : incbodies) {
         string n = iname;
         for (auto &c : n)
             if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
-        Append(s, "\n// ---- --include ", n, " ----\n\n//line ", n, ":1\n", ibody,
-               ibody.empty() || ibody.back() != '\n' ? "\n" : "");
+        Append(s, "\n// ---- --include ", n, " ----\n", GoIncludeLines(n, ibody));
     }
     return s;
 }
