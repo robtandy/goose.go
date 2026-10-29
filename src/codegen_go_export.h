@@ -25,7 +25,9 @@
 //   for itself only, on its caller's goroutine.
 // * An --include file is Go source: its package clause and build
 //   constraints are dropped, its imports join the generated file's, and the
-//   rest follows the program, under a //line directive naming the file.
+//   rest follows the program, each run of lines between blank ones under a
+//   //line directive naming the file and the run's line (GoIncludeLines,
+//   codegen_go_emit.h), which gofmt leaves be.
 #pragma once
 
 namespace goose {
@@ -422,20 +424,31 @@ inline void CodeGenGo::EmitExports() {
         auto retsig = rt.empty() ? string() : cat(" ", rt);
         auto where = cat("export fn ", sf->name, " (", ast.sources[ln.fileidx].first, ":", ln.line, ")");
         for (auto &c : where) if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
-        // The Goose documentation, as Go's.
+        // The Goose documentation, as Go's: a paragraph of the text of its
+        // lines, which go/doc/comment lays out as it is (gofmt lays a doc
+        // comment out as go/doc/comment does, which would make an indented
+        // line code, say).
         string doc;
         for (size_t p = 0; p < sf->doc.size();) {
             auto e = sf->doc.find('\n', p);
             if (e == string_view::npos) e = sf->doc.size();
             auto line = sf->doc.substr(p, e - p);
             p = e + 1;
-            auto b = line.find_first_not_of(" \t");
-            if (b == string_view::npos) continue;
-            line = line.substr(b);
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.remove_suffix(1);
+            auto trim = [&] {
+                auto b = line.find_first_not_of(" \t\r");
+                line = b == string_view::npos ? string_view() : line.substr(b);
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+                    line.remove_suffix(1);
+            };
+            trim();
+            if (line.substr(0, 2) == "//") {
+                line.remove_prefix(2);
+                trim();
+            }
+            if (line.empty()) continue;
             string l(line);
             for (auto &c : l) if ((uint8_t)c < 32 && c != '\t') c = ' ';
-            Append(doc, l.rfind("//", 0) == 0 ? l : cat("// ", l), "\n");
+            Append(doc, "// ", l, "\n");
         }
         if (!doc.empty()) doc = cat("//\n", doc);
         // A library starts at the first call of either entry point
@@ -490,8 +503,10 @@ inline void CodeGenGo::EmitExports() {
 // An --include file's Go (text) for the generated file: its imports, each
 // as Go writes one (`"fmt"`, `m "math"`), into imports, and the rest of it
 // into body, with its package clause and build constraints, and the imports,
-// blanked so that every line keeps its number. False, with why, where it
-// is not Go of that shape: a package clause, then imports, then the rest.
+// blanked so that every line keeps its number (GoIncludeLines numbers them),
+// and the comments left among them starting their lines, as gofmt starts a
+// comment at the package level. False, with why, where it is not Go of that
+// shape: a package clause, then imports, then the rest.
 static bool GoSplitInclude(const string &text, vector<pair<string, string>> &imports, string &body,
                            string &why) {
     body = text;
@@ -604,6 +619,16 @@ static bool GoSplitInclude(const string &text, vector<pair<string, string>> &imp
         while (p < body.size() && (body[p] == ' ' || body[p] == '\t' || body[p] == ';')) p++;
         blank(at, p);
     }
+    // The lines up to the rest's first, without the blanks that start them.
+    auto end = std::min(body.find('\n', p), body.size());
+    string head;
+    for (size_t pos = 0; pos < end;) {
+        auto nl = std::min(body.find('\n', pos), end);
+        auto b = std::min(body.find_first_not_of(" \t", pos), nl);
+        Append(head, string_view(body).substr(b, nl - b), nl < end ? "\n" : "");
+        pos = nl + 1;
+    }
+    body = head + body.substr(end);
     return true;
 }
 

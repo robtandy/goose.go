@@ -58,6 +58,11 @@
 //   NameWithStack(gs, ...) and Name(...), the second on a block from the
 //   runtime's pool, both taking Go's own slices, strings and pointers.
 //
+// * The file is laid out as gofmt lays it out, so that gofmt -l finds
+//   nothing to change in it (codegen_go_format.h): the program's Go is
+//   written a statement to a line, and GoFormat spaces and aligns it at the
+//   end as go/printer does; the runtime's text is gofmt's already.
+//
 // * Workers and queues (codegen_go_threads.h, DESIGN.md §2.3): a worker is
 //   a goroutine running its thread program on a block of its own; in a
 //   program with workers each thread program has an instance of its own of
@@ -105,13 +110,14 @@ static bool GoSplitInclude(const string &text, vector<pair<string, string>> &imp
 // What the driver hands the Go backend.
 struct GoOptions {
     string package = "main";   // --go-package.
+    string build;              // --go-build: the //go:build expression, as gofmt writes it.
     bool library = false;      // A package without func main (--library).
     bool debug = false;        // --debug, or -DGS_DEBUG=1.
     bool stackstats = false;   // -DGS_STACK_STATS=1: report the stacks taken as main ends.
     CodeGen::StackConfig stacks { 0, 0, 0, 0 };   // As main.cpp's StackConfigOf reads them.
     uint64_t framereserve = 0;  // --frame-reserve; 0 for the default (CodeGenGo::FrameReserve).
     // The --include files, Go source spliced into the file (codegen_go_export.h):
-    // the name its //line directive gives each, and its text.
+    // the name its //line directives give each, and its text.
     struct Include {
         string name, text;
     };
@@ -136,7 +142,7 @@ struct CodeGenGo {
     string code;        // Functions, gsInitGlobals and main.
     string xcode;       // The export fns' Go entry points (codegen_go_export.h).
     // The --include files' imports, (name, path), and the rest of each,
-    // (name, Go), which follow the program (GoSplitInclude).
+    // (name, Go), which follow the program (GoSplitInclude, GoIncludeLines).
     vector<pair<string, string>> incimports, incbodies;
 
     // The line of the node being generated, which a message about code with
