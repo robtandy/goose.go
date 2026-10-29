@@ -48,7 +48,7 @@ func TestAKeptBlockKeepsItsGlobals(t *testing.T) {
 		t.Fatalf("LastLogWithStack = %q", got)
 	}
 	// A kept block's result views its instance's log, in place.
-	if !gs.owns(unsafe.Pointer(&got[0])) {
+	if !gs.Owns(unsafe.Pointer(&got[0])) {
 		t.Errorf("LastLogWithStack made a copy")
 	}
 	// The package's own are as init left them.

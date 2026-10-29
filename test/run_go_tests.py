@@ -58,6 +58,19 @@ run.
 A few checks of the command line follow: the target -o out.go implies, `goose
 run --target=go` and `goose build --target=go`, --go-package and --library.
 
+The runtime (issue #19): every program (at -O2), fixture, sample, overflow
+case and export library is compiled again with --go-runtime=import, into a
+module that requires the runtime's package, runtime/go, and built with
+-d=checkptr, and every program at -O0 with --go-unexported, which must run
+as the C does. runtime/go's own tests run (vet, test, -race where cgo
+builds, checkptr), and the runtime the compiler embedded must be
+runtime/go's (goose --emit-go-runtime). test/go/kernels/ is a library of
+kernels whose file must hold none of the runtime's data stacks, pools or
+text forms (KERNEL_ABSENT), test/go/unexported/ one compiled with
+--go-unexported whose go doc must list its entry points alone, and
+test/go/shared/ two programs compiled into one package with
+--go-runtime-file, whose tests pass together in each mode.
+
 --sweep also runs the C suite's own programs (test/<category>/*.goose) of
 its other categories through both backends as the test/stdlib/ fixtures
 run: at both levels, with --debug where they ask for it, vetted, built with
@@ -118,6 +131,21 @@ SWEEP_KNOWN = {
 }
 FLOW_TIMEOUT = 60     # Seconds a --fuzz-flow program may run.
 SAMPLE_TIMEOUT = 300  # Seconds a sample may run.
+
+# The Go runtime's package (issue #19), which the Go --go-runtime=import
+# writes imports, and the files of it that are its alone, which the compiler
+# does not embed: every other file of runtime/go is the compiler's runtime.
+RUNTIME = REPO / "runtime" / "go"
+RUNTIME_MODULE = "github.com/robtandy/goose.go/runtime/go"
+RUNTIME_PACKAGE_ONLY = {"goose_package.go", "goose_extra.go"}
+# Runtime functions a library of kernels has no use for (issue #19): the
+# data stacks', the slice pools' and the text forms'.
+KERNEL_ABSENT = ["func NewStackBlock", "func AcquireStackBlock", "func ReleaseStackBlock",
+                 "func gsNewBlock", "func gsReserveRegion", "func gsMap", "func (gs *GsStackBlock)",
+                 "func GsSpans", "gsSpLeaf", "func GsFmt", "func GsPutStr", "func gsAppendFloat",
+                 "func GsOut", "type gsProgram", "gsLibStart", "gsInitGlobals", '"syscall"', '"sync"',
+                 '"os"']
+KERNEL_MAX_LINES = 450
 
 
 def parity_samples():
@@ -779,6 +807,61 @@ class Runner:
 
     # --- the steps -----------------------------------------------------------
 
+    def runtime_module(self, mod, module):
+        """mod made a module that requires the Go runtime's package as this
+        repository has it (runtime/go), where the Go --go-runtime=import
+        writes builds: None, or why not."""
+        mod.mkdir(parents=True, exist_ok=True)
+        if (mod / "go.mod").exists():
+            return None
+        # The module's go line is the toolchain's own.
+        for cmd in (["mod", "init", module],
+                    ["mod", "edit", f"-require={RUNTIME_MODULE}@v0.0.0", f"-replace={RUNTIME_MODULE}={RUNTIME}"]):
+            r = subprocess.run([self.go] + cmd, cwd=mod, env=go_env(), capture_output=True)
+            if r.returncode != 0:
+                return tc.decode(r.stdout) + tc.decode(r.stderr)
+        return None
+
+    def import_program(self, src, name, flags, out, unsupported=None):
+        """src compiled to Go with --go-runtime=import (issue #19), as a
+        package of a module that requires the runtime's, which must vet and
+        be laid out as gofmt lays it out: the executable, built with Go's
+        unsafe.Pointer checks (-d=checkptr), the runtime's package's
+        included, or None after saying why."""
+        mod = self.work / "import-mod"
+        with self.lock:
+            why = self.runtime_module(mod, "goosetest/imports")
+        if why is not None:
+            out.append(("fail", f"the module of --go-runtime=import's Go", why))
+            return None
+        pkg = mod / f"p-{name}"
+        pkg.mkdir(parents=True, exist_ok=True)
+        gofile = pkg / "main.go"
+        gofile.unlink(missing_ok=True)
+        code, o, e = self.goose(*flags, "--target=go", "--go-runtime=import", "-o", gofile, src)
+        if code != 0:
+            if unsupported and UNSUPPORTED in e:
+                out.append(("skip", unsupported, None))
+            else:
+                out.append(("fail", f"goose --target=go --go-runtime=import {name}", o + e))
+            return None
+        r = subprocess.run([self.go, "vet", f"./p-{name}"], cwd=mod, env=go_env(), capture_output=True)
+        text = tc.decode(r.stdout) + tc.decode(r.stderr)
+        if r.returncode != 0 or text.strip():
+            out.append(("fail", f"go vet {name} (--go-runtime=import)", text))
+            return None
+        diff = self.gofmt_clean(gofile)
+        if diff is not None:
+            out.append(("fail", f"gofmt -l {name} (--go-runtime=import)", diff))
+            return None
+        exe = mod / f"{name}-import{tc.EXE_SUFFIX}"
+        r = subprocess.run([self.go, "build", "-gcflags=all=-d=checkptr", "-o", str(exe), f"./p-{name}"],
+                           cwd=mod, env=go_env(), capture_output=True)
+        if r.returncode != 0:
+            out.append(("fail", f"go build {name} (--go-runtime=import)", tc.decode(r.stdout) + tc.decode(r.stderr)))
+            return None
+        return exe
+
     def go_program(self, src, name, flags, out, checkptr=False, unsupported=None):
         """Compiles src to Go, vets and builds it: the executable, or None
         after saying why in `out`. With checkptr, the executable built with
@@ -916,6 +999,28 @@ class Runner:
                                     else f"go {g}, c {c}"))
                 if same:
                     out.append(("ok", f"run {label}{kind}", None))
+        # The runtime imported (--go-runtime=import), at -O2, and every name
+        # of the runtime's and of the program's unexported (--go-unexported),
+        # at -O0, which change none of what the program does (issue #19).
+        for level, how in (("2", "--go-runtime=import"), ("0", "--go-unexported")):
+            ref = refs[level]
+            if ref is None:
+                continue
+            lflags = flags + [f"-O{level}"]
+            if how == "--go-runtime=import":
+                exe = self.import_program(src, f"{name}-O{level}", lflags, out)
+            else:
+                exe = self.go_program(src, f"{name}-O{level}-unexported", lflags + [how], out)
+            if exe is None:
+                continue
+            got = tc.run_capture([exe])
+            bad = [what for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
+                                           ("stderr", got[2], ref[2])) if g != c]
+            if bad:
+                out.append(("fail", f"parity {name} -O{level} {how}: {', '.join(bad)}",
+                            f"--- go (exit {got[0]}):\n{got[1]}{got[2]}\n--- c (exit {ref[0]}):\n{ref[1]}{ref[2]}"))
+            else:
+                out.append(("ok", f"run {name} -O{level} {how}", None))
         # What test/go/expected/ holds is the C run at -O2.
         ref = refs["2"]
         if ref is None:
@@ -1075,7 +1180,9 @@ class Runner:
         exes = self.go_program(src, f"overflow-{name}", flags, out, checkptr=True)
         if exes is None:
             return out
-        for exe, kind in zip(exes, ("", " -d=checkptr")):
+        exe = self.import_program(src, f"overflow-{name}", flags, out)
+        exes = exes + ((exe,) if exe else ())
+        for exe, kind in zip(exes, ("", " -d=checkptr", " --go-runtime=import")):
             got = tc.run_capture([exe])
             if got != ref:
                 out.append(("fail", f"overflow {name}{kind}", f"--- go (exit {got[0]}):\n{got[2]}\n"
@@ -1167,6 +1274,19 @@ class Runner:
                                     else f"go {g}, c {c}"))
                 if same:
                     out.append(("ok", f"run {label}{kind}", None))
+            # The runtime imported (--go-runtime=import), at -O2 (issue #19).
+            if b == ["-O2"]:
+                exe = self.import_program(src, f"{name}-{tag}", flags + b, out,
+                                          unsupported=f"{label} --go-runtime=import" if sweep else None)
+                if exe is not None:
+                    got = run_capture([exe], cwd=rundir)
+                    bad = [part for part, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
+                                                   ("stderr", got[2], ref[2])) if g != c]
+                    if bad:
+                        out.append(("fail", f"parity {label} --go-runtime=import: {', '.join(bad)}",
+                                    f"--- go (exit {got[0]}):\n{got[1]}{got[2]}\n--- c (exit {ref[0]}):\n{ref[1]}{ref[2]}"))
+                    else:
+                        out.append(("ok", f"run {label} --go-runtime=import", None))
         if gotrun is not None:
             code, o, e = gotrun
             exp = UPSTREAM_TEST / "expected"
@@ -1255,6 +1375,18 @@ class Runner:
                     continue
                 out.append(("ok", f"run {label}{kind}", None))
                 if level == "2" and not kind:
+                    # The runtime imported (--go-runtime=import) runs it alike
+                    # (issue #19).
+                    exe = self.import_program(src, f"{name}-O{level}", goflags + [f"-O{level}"], out)
+                    if exe is not None:
+                        ig = run_capture([exe] + args, cwd=rundir, timeout=SAMPLE_TIMEOUT, stdin_path=stdin)
+                        ibad = [what for what, g, c in (("exit code", ig[0], ref[0]), ("stdout", ig[1], ref[1]),
+                                                        ("stderr", masked(ig[2]), masked(ref[2]))) if g != c]
+                        if ibad:
+                            out.append(("fail", f"parity {label} --go-runtime=import: {', '.join(ibad)}",
+                                        f"--- go (exit {ig[0]}):\n{ig[1][-2000:]}{ig[2]}"))
+                        else:
+                            out.append(("ok", f"run {label} --go-runtime=import", None))
                     exp = src.parent / "expected" / f"{bare}.out"
                     want = tc.decode(exp.read_bytes()) if exp.exists() else None
                     if want is None or got[1].rstrip("\n") != want.rstrip("\n"):
@@ -1265,6 +1397,23 @@ class Runner:
         self.stacks(src, name, [], out)
         return out
 
+    def module_tests(self, mod, label, out, tags=None):
+        """The tests of the module in mod: `go vet`, which must find nothing,
+        `go test`, and `go test` built with -d=checkptr, Go's checks of every
+        unsafe.Pointer conversion and of the arithmetic on one (what `go test
+        -race` turns on): whether all passed, each reported."""
+        tag = [f"-tags={tags}"] if tags else []
+        for what, cmd in (("go vet", ["vet"] + tag + ["./..."]),
+                          ("go test", ["test", "-count=1"] + tag + ["./..."]),
+                          ("go test -d=checkptr", ["test", "-count=1", "-gcflags=all=-d=checkptr"] + tag + ["./..."])):
+            r = subprocess.run([self.go] + cmd, cwd=mod, env=go_env(), capture_output=True)
+            text = tc.decode(r.stdout) + tc.decode(r.stderr)
+            if r.returncode != 0 or (what == "go vet" and text.strip()):
+                out.append(("fail", f"{label}: {what}", text))
+                return False
+            out.append(("ok", f"{label}: {what}", None))
+        return True
+
     def export(self, d):
         """A library of export fns (test/go/export/<name>/, issue #5):
         <name>.goose compiled with --target=go --library at -O2 and at -O0,
@@ -1272,7 +1421,11 @@ class Runner:
         a module of its own with the directory's _test.go files, which must
         vet and pass `go test`, built with -d=checkptr as well: their
         checks of what the Go entry points give, and testing.AllocsPerRun's
-        that calling them in a loop allocates nothing on Go's heap."""
+        that calling them in a loop allocates nothing on Go's heap. Then
+        again with the runtime imported (--go-runtime=import, issue #19),
+        the module requiring the runtime's package, runtime/go, with
+        test/go/export/import_shim_test.go, which gives the tests the
+        runtime's names they use, under -tags goose_import."""
         out = []
         name = d.name
         src = d / f"{name}.goose"
@@ -1281,12 +1434,14 @@ class Runner:
         if not src.exists() or not tests:
             out.append(("fail", f"export {name}: no {name}.goose or no _test.go", None))
             return out
-        for level in ("2", "0"):
-            label = f"export {name} -O{level}"
-            mod = self.work / f"export-{name}-O{level}"
+        for level, imp in (("2", False), ("0", False), ("2", True), ("0", True)):
+            label = f"export {name} -O{level}" + (" --go-runtime=import" if imp else "")
+            mod = self.work / f"export-{name}-O{level}{'-import' if imp else ''}"
             shutil.rmtree(mod, ignore_errors=True)
             mod.mkdir(parents=True)
             args = [f"-O{level}", "--target=go", "--library", "-o", mod / f"{name}.go"]
+            if imp:
+                args.append("--go-runtime=import")
             for inc in includes:
                 args += ["--include", inc]
             code, o, e = self.goose(*args, src)
@@ -1298,22 +1453,242 @@ class Runner:
                 out.append(("fail", f"{label}: gofmt -l", diff))
                 continue
             out.append(("ok", f"{label}: gofmt -l", None))
-            for t in tests:
+            for t in tests + ([HERE / "go" / "export" / "import_shim_test.go"] if imp else []):
                 shutil.copy(t, mod / t.name)
-            r = subprocess.run([self.go, "mod", "init", f"goosetest/{name}"], cwd=mod, env=go_env(),
+            if imp:
+                why = self.runtime_module(mod, f"goosetest/{name}")
+                if why is not None:
+                    out.append(("fail", f"{label}: the module", why))
+                    continue
+            else:
+                r = subprocess.run([self.go, "mod", "init", f"goosetest/{name}"], cwd=mod, env=go_env(),
+                                   capture_output=True)
+                if r.returncode != 0:
+                    out.append(("fail", f"{label}: go mod init", tc.decode(r.stderr)))
+                    continue
+            self.module_tests(mod, label, out, "goose_import" if imp else None)
+        return out
+
+    # --- the runtime (issue #19) ----------------------------------------------
+
+    def runtime_package(self):
+        """The runtime's package, runtime/go, which is the compiler's runtime:
+        the files the compiler embeds are those of runtime/go as they are
+        (`goose --emit-go-runtime` writes what it embedded, which must be
+        them, every one but those the package keeps to itself), and the
+        package's own tests pass, vetted, under the race detector where cgo
+        can build it, and with -d=checkptr."""
+        out = []
+        emitted = self.work / "emit-go-runtime"
+        shutil.rmtree(emitted, ignore_errors=True)
+        code, o, e = self.goose("--emit-go-runtime", emitted)
+        if code != 0:
+            out.append(("fail", "goose --emit-go-runtime", o + e))
+        else:
+            files = sorted(p.name for p in RUNTIME.glob("*.go") if not p.name.endswith("_test.go"))
+            want = [f for f in files if f not in RUNTIME_PACKAGE_ONLY]
+            got = sorted(p.name for p in emitted.glob("*.go"))
+            if got != want:
+                out.append(("fail", "the compiler embeds runtime/go's files",
+                            f"embedded {got}, runtime/go's {want} (cmake's GOOSE_GO_RUNTIME_FILES, "
+                            "and RUNTIME_PACKAGE_ONLY here)"))
+            else:
+                stale = [f for f in want if (emitted / f).read_bytes() != (RUNTIME / f).read_bytes()]
+                if stale:
+                    out.append(("fail", "the compiler's runtime is runtime/go's",
+                                f"{', '.join(stale)} changed since the compiler was built: rebuild it"))
+                else:
+                    out.append(("ok", "the compiler's runtime is runtime/go's", None))
+        for what, cmd, env in (("go vet", ["vet", "./..."], go_env()),
+                               ("go test", ["test", "-count=1", "./..."], go_env()),
+                               ("go test -d=checkptr", ["test", "-count=1", "-gcflags=all=-d=checkptr", "./..."],
+                                go_env()),
+                               ("go test -race", ["test", "-count=1", "-race", "./..."],
+                                dict(go_env(), CGO_ENABLED="1"))):
+            r = subprocess.run([self.go] + cmd, cwd=RUNTIME, env=env, capture_output=True)
+            text = tc.decode(r.stdout) + tc.decode(r.stderr)
+            if what == "go test -race" and r.returncode != 0 and ("cgo" in text or "C compiler" in text or
+                                                                  "-race is not supported" in text):
+                # The race detector needs cgo, and a C compiler.
+                out.append(("skip", f"runtime/go: {what} (no cgo here)", None))
+            elif r.returncode != 0 or (what == "go vet" and text.strip()):
+                out.append(("fail", f"runtime/go: {what}", text))
+            else:
+                out.append(("ok", f"runtime/go: {what}", None))
+        return out
+
+    def kernels(self):
+        """A library of kernels (test/go/kernels/, issue #19), pure functions
+        over slices: the file the compiler writes holds none of the
+        runtime's data stacks, pools or text forms (KERNEL_ABSENT), and is
+        short (KERNEL_MAX_LINES); with --go-no-withstack, not even the block
+        type a NameWithStack entry point names. Its tests pass, vetted, and
+        with -d=checkptr, at -O2 and at -O0."""
+        out = []
+        d = HERE / "go" / "kernels"
+        for level, extra in (("2", []), ("0", []), ("2", ["--go-no-withstack"])):
+            label = f"kernels -O{level}" + "".join(f" {x}" for x in extra)
+            mod = self.work / f"kernels-O{level}{''.join(extra)}"
+            shutil.rmtree(mod, ignore_errors=True)
+            mod.mkdir(parents=True)
+            gofile = mod / "kernels.go"
+            code, o, e = self.goose(f"-O{level}", "--target=go", "--go-package", "kernels", *extra, "-o", gofile,
+                                    d / "kernels.goose")
+            if code != 0:
+                out.append(("fail", f"{label}: goose --target=go", o + e))
+                continue
+            text = gofile.read_text(encoding="utf-8")
+            absent = KERNEL_ABSENT + (["GsStackBlock", "WithStack"] if extra else [])
+            found = [a for a in absent if a in text]
+            lines = text.count("\n")
+            if found or lines > KERNEL_MAX_LINES:
+                out.append(("fail", f"{label}: the runtime it holds",
+                            f"{lines} lines (at most {KERNEL_MAX_LINES}); holds {found}"))
+            else:
+                out.append(("ok", f"{label}: {lines} lines, no data stacks, pools or text forms", None))
+            diff = self.gofmt_clean(gofile)
+            if diff is not None:
+                out.append(("fail", f"{label}: gofmt -l", diff))
+                continue
+            if extra:
+                continue
+            shutil.copy(d / "kernels_test.go", mod / "kernels_test.go")
+            r = subprocess.run([self.go, "mod", "init", "goosetest/kernels"], cwd=mod, env=go_env(),
                                capture_output=True)
             if r.returncode != 0:
                 out.append(("fail", f"{label}: go mod init", tc.decode(r.stderr)))
                 continue
-            for what, cmd in (("go vet", ["vet", "./..."]),
-                              ("go test", ["test", "-count=1", "./..."]),
-                              ("go test -d=checkptr", ["test", "-count=1", "-gcflags=all=-d=checkptr", "./..."])):
-                r = subprocess.run([self.go] + cmd, cwd=mod, env=go_env(), capture_output=True)
-                text = tc.decode(r.stdout) + tc.decode(r.stderr)
-                if r.returncode != 0 or (what == "go vet" and text.strip()):
-                    out.append(("fail", f"{label}: {what}", text))
+            self.module_tests(mod, label, out)
+        return out
+
+    def unexported_library(self):
+        """A library compiled with --go-unexported (test/go/unexported/,
+        issue #19): `go doc` lists its export fns' entry points, and for the
+        NameWithStack ones StackBlock, AcquireStackBlock and
+        ReleaseStackBlock, and nothing else; with --go-no-withstack too, the
+        Name entry points alone. Its tests pass, vetted, and with
+        -d=checkptr."""
+        out = []
+        d = HERE / "go" / "unexported"
+        entries = {"Words", "Kept", "CallsSoFar", "Checked"}
+        for extra in ([], ["--go-no-withstack"]):
+            label = "--go-unexported" + "".join(f" {x}" for x in extra)
+            mod = self.work / f"unexported{''.join(extra)}"
+            shutil.rmtree(mod, ignore_errors=True)
+            mod.mkdir(parents=True)
+            gofile = mod / "unexported.go"
+            code, o, e = self.goose("--target=go", "--go-package", "unexported", "--go-unexported", *extra,
+                                    "-o", gofile, d / "unexported.goose")
+            if code != 0:
+                out.append(("fail", f"{label}: goose --target=go", o + e))
+                continue
+            diff = self.gofmt_clean(gofile)
+            if diff is not None:
+                out.append(("fail", f"{label}: gofmt -l", diff))
+                continue
+            for t in d.glob("*_test.go"):
+                shutil.copy(t, mod / t.name)
+            r = subprocess.run([self.go, "mod", "init", "goosetest/unexported"], cwd=mod, env=go_env(),
+                               capture_output=True)
+            if r.returncode != 0:
+                out.append(("fail", f"{label}: go mod init", tc.decode(r.stderr)))
+                continue
+            r = subprocess.run([self.go, "doc", "."], cwd=mod, env=go_env(), capture_output=True)
+            doc = tc.decode(r.stdout) + tc.decode(r.stderr)
+            listed = set()
+            for line in doc.splitlines():
+                m = re.match(r"\s*(?:func|type|var|const)\s+(?:\([^)]*\)\s*)?(\w+)", line)
+                if m:
+                    listed.add(m.group(1))
+            want = set(entries) if extra else \
+                entries | {f"{n}WithStack" for n in entries} | {"StackBlock", "AcquireStackBlock", "ReleaseStackBlock"}
+            if r.returncode != 0 or listed != want:
+                out.append(("fail", f"{label}: go doc lists the entry points alone",
+                            f"listed {sorted(listed)}, want {sorted(want)}\n{doc}"))
+            else:
+                out.append(("ok", f"{label}: go doc lists the entry points alone", None))
+            self.module_tests(mod, label, out, "goose_nowithstack" if extra else None)
+        return out
+
+    def shared(self):
+        """Two programs compiled into one Go package (test/go/shared/,
+        issue #19), geom.goose and text.goose, with the runtime they share in
+        a file of the package's (--go-runtime-file goose_runtime.go): their
+        own names, many the same (Pt, norm, calls), carry their files' names,
+        and their tests pass together, vetted and with -d=checkptr -- with
+        the runtime the part they use of it, all of it, every name
+        unexported, or imported. The runtime file is the same whichever
+        program is compiled first, a program compiled again leaves it as it
+        is, and a program compiled with other settings than those it records
+        is refused."""
+        out = []
+        d = HERE / "go" / "shared"
+        files = {}
+        for mode, order in ((["--go-runtime=embed"], ("geom", "text")), (["--go-runtime=embed"], ("text", "geom")),
+                            (["--go-unexported"], ("geom", "text")), (["--go-runtime=full"], ("geom", "text")),
+                            (["--go-runtime=import"], ("geom", "text"))):
+            label = f"shared {' '.join(mode)} ({', '.join(order)})"
+            mod = self.work / f"shared-{mode[0].strip('-').replace('=', '-')}-{order[0]}"
+            shutil.rmtree(mod, ignore_errors=True)
+            mod.mkdir(parents=True)
+            rtfile = mod / "goose_runtime.go"
+            ok = True
+            # Each program, then the first again, which must leave the
+            # runtime file as the second left it: with what both use.
+            texts = []
+            for prog in order + (order[0],):
+                code, o, e = self.goose("--target=go", "--library", "--go-package", "shared", *mode,
+                                        "--go-runtime-file", rtfile, "-o", mod / f"{prog}.go", d / f"{prog}.goose")
+                if code != 0:
+                    out.append(("fail", f"{label}: goose --target=go {prog}", o + e))
+                    ok = False
                     break
-                out.append(("ok", f"{label}: {what}", None))
+                texts.append(rtfile.read_text(encoding="utf-8"))
+            if not ok:
+                continue
+            if texts[2] != texts[1]:
+                out.append(("fail", f"{label}: a program compiled again changes the runtime file", None))
+            for f in [rtfile] + [mod / f"{p}.go" for p in order]:
+                diff = self.gofmt_clean(f)
+                if diff is not None:
+                    out.append(("fail", f"{label}: gofmt -l {f.name}", diff))
+                    ok = False
+            if not ok:
+                continue
+            for t in d.glob("*_test.go"):
+                shutil.copy(t, mod / t.name)
+            imp = mode == ["--go-runtime=import"]
+            if imp:
+                why = self.runtime_module(mod, "goosetest/shared")
+            else:
+                r = subprocess.run([self.go, "mod", "init", "goosetest/shared"], cwd=mod, env=go_env(),
+                                   capture_output=True)
+                why = None if r.returncode == 0 else tc.decode(r.stderr)
+            if why is not None:
+                out.append(("fail", f"{label}: the module", why))
+                continue
+            self.module_tests(mod, label, out, "goose_import" if imp else None)
+            if mode == ["--go-runtime=embed"]:
+                files[("order", order[0])] = texts[-1]
+        if ("order", "geom") in files and ("order", "text") in files:
+            same = files[("order", "geom")] == files[("order", "text")]
+            out.append(("ok" if same else "fail", "shared: the runtime file is the same whichever program is first",
+                        None if same else "geom then text, and text then geom, wrote other files"))
+        # Settings of its own refused, and a package of its own, before any
+        # file is written.
+        mod = self.work / "shared-go-runtime-embed-geom"
+        for k, (flags, why) in enumerate(((["--stack-reserve", "1G"], "holds the runtime of programs compiled with"),
+                                          (["--go-unexported"], "holds the runtime of programs compiled with"),
+                                          (["--go-package", "other"], "is the runtime of package shared"))):
+            pkg = [] if "--go-package" in flags else ["--go-package", "shared"]
+            third = mod / f"third{k}.go"
+            before = (mod / "goose_runtime.go").read_bytes() if (mod / "goose_runtime.go").exists() else None
+            code, o, e = self.goose("--target=go", "--library", *pkg, *flags, "--go-runtime-file",
+                                    mod / "goose_runtime.go", "-o", third, d / "geom.goose")
+            ok = code == 1 and why in e and not third.exists() and before is not None and \
+                (mod / "goose_runtime.go").read_bytes() == before
+            out.append(("ok" if ok else "fail", f"shared: --go-runtime-file refuses {' '.join(flags)}",
+                        None if ok else f"exit {code}\n{o}{e}"))
         return out
 
     # --- the command line ----------------------------------------------------
@@ -1341,10 +1716,11 @@ class Runner:
         code, o, e = self.goose("--target=go", "--library", "-o", gofile, hello)
         text = gofile.read_text(encoding="utf-8") if gofile.exists() else ""
         # A library has no init: the first call of an entry point starts it
-        # (issue #18).
+        # (issue #18), where it has anything to start (issue #19): this one,
+        # with no globals, has not.
         check("--library", code == 0 and "\npackage goose\n" in text and
               "\nfunc main()" not in text and "\nfunc init()" not in text and
-              "\nfunc gsLibStart() {" in text and "\n\tgsLibrary      = true\n" in text, o + e)
+              "\nfunc gsLibStart() {" not in text and "gsInitGlobals" not in text, o + e)
         if code == 0:
             vc, vo, ve = self.gotool("vet", gofile.name)
             check("--library vets", vc == 0 and not (vo + ve).strip(), vo + ve)
@@ -1369,6 +1745,11 @@ class Runner:
                                         '\tdefer func() { fmt.Println("recovered", recover()) }()\n'
                                         '\tgoose.Quit(3)\n}\n')
         code, o, e = self.goose("--target=go", "--library", "-o", host / "goose" / "goose.go", libsrc)
+        text = (host / "goose" / "goose.go").read_text(encoding="utf-8") if code == 0 else ""
+        check("a --library package with globals starts at its first call, a library that never exits",
+              code == 0 and "\nfunc gsLibStart() {" in text and
+              "\nvar gsProg = gsProgram{StackReserve: gsStackReserve, StackGap: gsStackGap, "
+              "FrameReserve: gsFrameReserve, Library: true}\n" in text, o + e)
         detail = o + e
         ok = False
         if code == 0:
@@ -1465,7 +1846,7 @@ class Runner:
               code == 0 and "\npackage goose\n" in text and "\nfunc main()" not in text and
               "\nfunc Twice(x int64) int64 {" in text and
               "\nfunc TwiceWithStack(gs *GsStackBlock, x int64) int64 {" in text and
-              "\nfunc ParseCount[T0 GsBytes](s T0) int64 {" in text, o + e)
+              "\nfunc ParseCount[T0 ~string | ~[]byte](s T0) int64 {" in text, o + e)
         if code == 0:
             vc, vo, ve = self.gotool("vet", gofile.name)
             check("the export library vets", vc == 0 and not (vo + ve).strip(), vo + ve)
@@ -1490,6 +1871,13 @@ class Runner:
         code, o, e = self.goose("run", "--target=go", "--include", helper, incsrc)
         check("goose run --target=go --include helper.go", code == 0 and o == "HI! 42\n",
               f"exit {code}\n{o}{e}")
+        # The file names the runtime as runtime/go declares it (GsSlice,
+        # GsBldAppendString), which the compiler renames in it as in the
+        # program's Go (issue #19).
+        for flags in (["--go-unexported"], ["--go-runtime=full", "--go-unexported"]):
+            code, o, e = self.goose("run", "--target=go", *flags, "--include", helper, incsrc)
+            check(f"goose run --target=go {' '.join(flags)} --include helper.go", code == 0 and o == "HI! 42\n",
+                  f"exit {code}\n{o}{e}")
         code, o, e = self.goose("--target=go", "--include", helper, "-o", incdir / "out.go", incsrc)
         text = (incdir / "out.go").read_text(encoding="utf-8") if (incdir / "out.go").exists() else ""
         # Each run of the file's lines under a //line directive naming it and
@@ -1642,6 +2030,60 @@ class Runner:
             rc, ro, re_ = tc.run_capture([exe])
             ok = rc == 0 and ro.startswith("\n\nhello, world\n")
         check("goose build --target=go", ok, o + e)
+        # Where the runtime comes from (issue #19): --go-runtime=full writes
+        # every one of its declarations, which, every name unexported too,
+        # builds and runs as the part a program uses does.
+        for flags in (["--go-runtime=full"], ["--go-runtime=full", "--go-unexported"]):
+            gofile = self.work / f"cli-{'-'.join(f.strip('-').replace('=', '-') for f in flags)}.go"
+            code, o, e = self.goose("--target=go", *flags, "-o", gofile, hello)
+            text = gofile.read_text(encoding="utf-8") if code == 0 else ""
+            unexp = "--go-unexported" in flags
+            names = ["gsSpansAlloc", "gsOsReadFile", "gsQueue", "newStackBlock"] if unexp else \
+                ["GsSpansAlloc", "GsOsReadFile", "GsQueue", "NewStackBlock", "gsEscape", "gsProgram"]
+            check(f"{' '.join(flags)} writes the whole runtime", code == 0 and all(
+                re.search(rf"\n(func|type) (\([^)]*\) )?{n}\b", text) for n in names), o + e)
+            if code == 0:
+                vc, vo, ve = self.gotool("vet", gofile.name)
+                check(f"{' '.join(flags)} vets", vc == 0 and not (vo + ve).strip(), vo + ve)
+                diff = self.gofmt_clean(gofile)
+                check(f"{' '.join(flags)} is laid out as gofmt lays it out", diff is None, diff or "")
+                exe = self.work / f"{gofile.stem}{tc.EXE_SUFFIX}"
+                bc, bo, be = self.gotool("build", "-o", exe.name, gofile.name)
+                rc, ro, _ = tc.run_capture([exe]) if bc == 0 else (bc, bo + be, "")
+                check(f"{' '.join(flags)} runs", rc == 0 and ro.startswith("\n\nhello, world\n"), ro)
+        # A file with every runtime name unexported has none Go exports but
+        # the entry points, and the block type they name (whose functions
+        # leave no block to make).
+        code, o, e = self.goose("--target=go", "--go-runtime=full", "--go-unexported", "--library",
+                                "-o", self.work / "cli-unexported-lib.go", self.work / "cli-exports.goose")
+        text = (self.work / "cli-unexported-lib.go").read_text(encoding="utf-8") if code == 0 else ""
+        exported = sorted(set(re.findall(r"\n(?:func|type|var|const) ([A-Z]\w*)", text)))
+        check("--go-unexported leaves the entry points the file's only exported names",
+              code == 0 and exported == ["ParseCount", "ParseCountWithStack", "StackBlock", "Twice", "TwiceWithStack"],
+              f"{exported}\n{o}{e}")
+        # The options' checks.
+        for args, why in ((["--target=go", "--go-runtime=static", hello], "--go-runtime takes embed, import or full"),
+                          (["--go-runtime=import", "-o", self.work / "cli-c.c", hello], "are for --target=go"),
+                          (["--go-unexported", "-o", self.work / "cli-c.c", hello], "are for --target=go"),
+                          (["run", "--target=go", "--go-runtime=import", hello], "--go-runtime=import and"),
+                          (["build", "--target=go", "--go-runtime-file", self.work / "rt.go", hello],
+                           "--go-runtime-file are for the Go that -o writes"),
+                          (["--target=go", "--go-runtime-file", self.work / "rt.c", "-o", self.work / "p.go", hello],
+                           "--go-runtime-file takes a Go source file"),
+                          (["--target=go", "--go-runtime-file", self.work / "elsewhere" / "rt.go", "-o",
+                            self.work / "p.go", hello], "is in another directory than"),
+                          (["--target=go", "--go-runtime-file", self.work / "cli-same.go", "-o",
+                            self.work / "cli-same.go", hello], "names the program's own file")):
+            code, o, e = self.goose(*args)
+            check(f"{' '.join(str(a) for a in args if not isinstance(a, Path))} is refused",
+                  code == 1 and why in e, f"exit {code}\n{o}{e}")
+        # A foreign function cannot be named as the runtime's names are in a
+        # file with --go-unexported.
+        src = self.work / "cli-runtime-name.goose"
+        tc.write_text(src, 'extern fn mk() -> i64 = "newStackBlock";\nfn main() { print(mk()); }\n')
+        code, o, e = self.goose("--target=go", "-o", self.work / "cli-runtime-name.go", src)
+        check("an extern fn may not call a Go function the runtime names",
+              code == 1 and "the Go name newStackBlock is the Go runtime's" in e, f"exit {code}\n{o}{e}")
         return out
 
 
@@ -1688,19 +2130,27 @@ def main():
     stdlib = sorted((UPSTREAM_TEST / "stdlib").glob("*.goose")) + sorted((UPSTREAM_TEST / "threads").glob("*.goose"))
     samples = parity_samples()
     exports = sorted(p for p in (HERE / "go" / "export").iterdir() if p.is_dir())
+    # The runtime's sections (issue #19): its package, a library of kernels,
+    # one compiled with --go-unexported, and two programs in one package.
+    runtime_sections = {"runtime": r.runtime_package, "kernels": r.kernels, "unexported": r.unexported_library,
+                        "shared": r.shared}
     if args.names:
+        runtime_sections = {k: v for k, v in runtime_sections.items() if k in args.names}
         programs = [p for p in programs if p.stem in args.names]
         build_only = [p for p in build_only if p.stem in args.names]
         stdlib = [p for p in stdlib if p.stem in args.names]
         exports = [p for p in exports if p.name in args.names]
         samples = [p for p in samples if p.stem in args.names]
-        if not programs and not build_only and not stdlib and not exports and not samples:
+        if not programs and not build_only and not stdlib and not exports and not samples and \
+                not runtime_sections:
             ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
-                     "test/go/build_only, test/stdlib, test/threads, test/go/export or samples")
+                     "test/go/build_only, test/stdlib, test/threads, test/go/export or samples, "
+                     "and no section runtime, kernels, unexported or shared")
     if args.bless:
         # Their expected output is the C suite's (test/expected/), a
         # sample's its own, and an export library's its Go tests.
         stdlib, exports, samples = [], [], []
+        runtime_sections = {}
     unsupported = [] if args.names else sorted((HERE / "go" / "unsupported").glob("*.goose"))
     sweep = []
     if args.sweep:
@@ -1718,6 +2168,7 @@ def main():
         futures += [pool.submit(r.fixture, p) for p in stdlib]
         futures += [pool.submit(r.sample, p) for p in samples]
         futures += [pool.submit(r.export, p) for p in exports]
+        futures += [pool.submit(f) for f in runtime_sections.values()]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
         futures += [pool.submit(r.fixture, p, True) for p in sweep]
         futures += [pool.submit(r.fuzz, seed)

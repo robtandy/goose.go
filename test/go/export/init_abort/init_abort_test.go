@@ -13,9 +13,9 @@ import (
 // TestMain runs as soon as the package is imported: the import ran no
 // initializer, so the process is still here, and reserved nothing.
 func TestMain(m *testing.M) {
-	if debug.SetPanicOnFault(false) || gsMaps.Load() != 0 || len(gsBlocks) != 0 {
+	if debug.SetPanicOnFault(false) || mapCount() != 0 || blockCount() != 0 {
 		fmt.Fprintf(os.Stderr, "importing the package reserved memory (%d mappings, %d blocks) or set the "+
-			"fault handling\n", gsMaps.Load(), len(gsBlocks))
+			"fault handling\n", mapCount(), blockCount())
 		os.Exit(1)
 	}
 	os.Exit(m.Run())
