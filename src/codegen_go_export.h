@@ -23,7 +23,9 @@
 //   viewing what the slice does.
 // * An --include file is Go source: its package clause and build
 //   constraints are dropped, its imports join the generated file's, and the
-//   rest follows the program, under a //line directive naming the file.
+//   rest follows the program, each run of lines between blank ones under a
+//   //line directive naming the file and the run's line (GoIncludeLines,
+//   codegen_go_emit.h), which gofmt leaves be.
 #pragma once
 
 namespace goose {
@@ -492,8 +494,10 @@ inline void CodeGenGo::EmitExports() {
 // An --include file's Go (text) for the generated file: its imports, each
 // as Go writes one (`"fmt"`, `m "math"`), into imports, and the rest of it
 // into body, with its package clause and build constraints, and the imports,
-// blanked so that every line keeps its number. False, with why, where it
-// is not Go of that shape: a package clause, then imports, then the rest.
+// blanked so that every line keeps its number (GoIncludeLines numbers them),
+// and the comments left among them starting their lines, as gofmt starts a
+// comment at the package level. False, with why, where it is not Go of that
+// shape: a package clause, then imports, then the rest.
 static bool GoSplitInclude(const string &text, vector<pair<string, string>> &imports, string &body,
                            string &why) {
     body = text;
@@ -606,6 +610,16 @@ static bool GoSplitInclude(const string &text, vector<pair<string, string>> &imp
         while (p < body.size() && (body[p] == ' ' || body[p] == '\t' || body[p] == ';')) p++;
         blank(at, p);
     }
+    // The lines up to the rest's first, without the blanks that start them.
+    auto end = std::min(body.find('\n', p), body.size());
+    string head;
+    for (size_t pos = 0; pos < end;) {
+        auto nl = std::min(body.find('\n', pos), end);
+        auto b = std::min(body.find_first_not_of(" \t", pos), nl);
+        Append(head, string_view(body).substr(b, nl - b), nl < end ? "\n" : "");
+        pos = nl + 1;
+    }
+    body = head + body.substr(end);
     return true;
 }
 

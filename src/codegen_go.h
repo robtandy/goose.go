@@ -110,7 +110,7 @@ struct GoOptions {
     bool stackstats = false;   // -DGS_STACK_STATS=1: report the stacks taken as main ends.
     CodeGen::StackConfig stacks { 0, 0, 0, 0 };   // As main.cpp's StackConfigOf reads them.
     // The --include files, Go source spliced into the file (codegen_go_export.h):
-    // the name its //line directive gives each, and its text.
+    // the name its //line directives give each, and its text.
     struct Include {
         string name, text;
     };
@@ -135,7 +135,7 @@ struct CodeGenGo {
     string code;        // Functions, gsInitGlobals and main.
     string xcode;       // The export fns' Go entry points (codegen_go_export.h).
     // The --include files' imports, (name, path), and the rest of each,
-    // (name, Go), which follow the program (GoSplitInclude).
+    // (name, Go), which follow the program (GoSplitInclude, GoIncludeLines).
     vector<pair<string, string>> incimports, incbodies;
 
     // The line of the node being generated, which a message about code with
