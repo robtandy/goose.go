@@ -420,20 +420,31 @@ inline void CodeGenGo::EmitExports() {
         auto retsig = rt.empty() ? string() : cat(" ", rt);
         auto where = cat("export fn ", sf->name, " (", ast.sources[ln.fileidx].first, ":", ln.line, ")");
         for (auto &c : where) if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
-        // The Goose documentation, as Go's.
+        // The Goose documentation, as Go's: a paragraph of the text of its
+        // lines, which go/doc/comment lays out as it is (gofmt lays a doc
+        // comment out as go/doc/comment does, which would make an indented
+        // line code, say).
         string doc;
         for (size_t p = 0; p < sf->doc.size();) {
             auto e = sf->doc.find('\n', p);
             if (e == string_view::npos) e = sf->doc.size();
             auto line = sf->doc.substr(p, e - p);
             p = e + 1;
-            auto b = line.find_first_not_of(" \t");
-            if (b == string_view::npos) continue;
-            line = line.substr(b);
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.remove_suffix(1);
+            auto trim = [&] {
+                auto b = line.find_first_not_of(" \t\r");
+                line = b == string_view::npos ? string_view() : line.substr(b);
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+                    line.remove_suffix(1);
+            };
+            trim();
+            if (line.substr(0, 2) == "//") {
+                line.remove_prefix(2);
+                trim();
+            }
+            if (line.empty()) continue;
             string l(line);
             for (auto &c : l) if ((uint8_t)c < 32 && c != '\t') c = ' ';
-            Append(doc, l.rfind("//", 0) == 0 ? l : cat("// ", l), "\n");
+            Append(doc, "// ", l, "\n");
         }
         if (!doc.empty()) doc = cat("//\n", doc);
         auto stackstext = cat(stacks, stacks == 1 ? " data stack" : " data stacks");

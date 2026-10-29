@@ -53,6 +53,11 @@
 //   NameWithStack(gs, ...) and Name(...), the second on a block from the
 //   runtime's pool, both taking Go's own slices, strings and pointers.
 //
+// * The file is laid out as gofmt lays it out, so that gofmt -l finds
+//   nothing to change in it (codegen_go_format.h): the program's Go is
+//   written a statement to a line, and GoFormat spaces and aligns it at the
+//   end as go/printer does; the runtime's text is gofmt's already.
+//
 // * Workers and queues (codegen_go_threads.h, DESIGN.md §2.3): a worker is
 //   a goroutine running its thread program on a block of its own; in a
 //   program with workers each thread program has an instance of its own of

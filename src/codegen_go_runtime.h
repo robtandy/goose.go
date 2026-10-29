@@ -3,9 +3,11 @@
 // imports (math, os, runtime/debug, strconv, syscall, unsafe, each of which
 // it uses) and the configuration constants gsStackReserve and gsStackGap. It
 // is Go source as it is written out, in pieces under the 16 KB a string
-// literal may have in MSVC; edit it here, and check the result with go vet
-// on a generated file (test/run_go_tests.py does, for every program it
-// compiles).
+// literal may have in MSVC, laid out as gofmt lays it out (the pass that
+// gives the program's Go gofmt's layout, codegen_go_format.h, leaves it
+// alone); edit it here, and check the result with go vet and gofmt -l on a
+// generated file (test/run_go_tests.py does both, for every file it
+// writes).
 #pragma once
 
 namespace goose {
@@ -24,9 +26,9 @@ R"GSGO(// ---- runtime ----
 // function that uses data stacks, or calls one that does, takes the block
 // and its first stack index as its leading parameters (gs, gs_sp).
 type GsStackBlock struct {
-	Stks    []unsafe.Pointer // Current stack tops, indexed by gs_sp + k.
-	Base    []unsafe.Pointer // Where each stack's region starts.
-	Cap     []int64          // Each region's usable bytes, its guard gap not included.
+	Stks []unsafe.Pointer // Current stack tops, indexed by gs_sp + k.
+	Base []unsafe.Pointer // Where each stack's region starts.
+	Cap  []int64          // Each region's usable bytes, its guard gap not included.
 	// The fixed-frame stack: the address-taken fixed-size locals of the
 	// functions running, each function's frame above its caller's, taken as
 	// it starts and given back at its every return, as a native stack's
@@ -1349,6 +1351,7 @@ func gsAppendFloat(dst []byte, v float64, f32 bool) []byte {
 	}
 	return dst
 }
+
 )GSGO",
 R"GSGO(// ---------------------------------------------------------------------------
 // Slice pools (goose_spec.md §5.4, reusable[]), ported from the gs_spans_*
@@ -1977,6 +1980,7 @@ func GsSpansRegrow(base unsafe.Pointer, n *int64, top *unsafe.Pointer, length, i
 	f.release(&p, &q, &s, idx, ol)
 	return GsSpansAlloc(base, n, top, length, cnt)
 }
+
 )GSGO",
 R"GSGO(// ---------------------------------------------------------------------------
 // Variable-size values (§3.6, docs/implementation.md §6.1): a length prefix
