@@ -69,6 +69,12 @@ select (CSEL and its kin on arm64, CMOV on amd64) and exactly m conditional
 branches, those of its loop and its guard, so that no choice it makes is a
 branch (Runner.select_asm).
 
+The reproducers of the gaps in the front end's bounds-check elimination
+that issue #26 found, test/go/bce_gaps/ (whose README.md writes them up),
+are checked with `goose --check --bce-test` at -O1 and -O2: each `//
+bce:keep` and `// bce:elide` line must have the outcome it names, so that
+the write-up says what BCE does (Runner.bce_gaps).
+
 --sweep also runs the C suite's own programs (test/<category>/*.goose) of
 its other categories through both backends as the test/stdlib/ fixtures
 run: at both levels, with --debug where they ask for it, vetted, built with
@@ -1556,6 +1562,20 @@ class Runner:
                             f"{len(sels)} select(s), {len(brs)} branch(es):\n" + "\n".join(sels + brs)))
         return out
 
+    def bce_gaps(self, src):
+        """A reproducer of a gap in the front end's bounds-check elimination
+        (test/go/bce_gaps/, issue #26): at -O1 and -O2, where calls are
+        inlined, each of its `// bce:keep` lines must keep every check on it,
+        and each `// bce:elide` line elide every one (goose --check
+        --bce-test). Once the front end closes the gap, a `bce:keep` line
+        fails, and the write-up is out of date."""
+        out = []
+        for level in ("1", "2"):
+            label = f"bce gap {src.name} -O{level}"
+            code, o, e = self.goose(f"-O{level}", "--check", "--bce-test", src)
+            out.append(("ok", label, None) if code == 0 else ("fail", label, o + e))
+        return out
+
     # --- the command line ----------------------------------------------------
 
     def cli(self):
@@ -1928,19 +1948,24 @@ def main():
     stdlib = sorted((UPSTREAM_TEST / "stdlib").glob("*.goose")) + sorted((UPSTREAM_TEST / "threads").glob("*.goose"))
     samples = parity_samples()
     exports = sorted(p for p in (HERE / "go" / "export").iterdir() if p.is_dir())
+    bcegaps = sorted((HERE / "go" / "bce_gaps").glob("*.goose"))
     if args.names:
         programs = [p for p in programs if p.stem in args.names]
         build_only = [p for p in build_only if p.stem in args.names]
         stdlib = [p for p in stdlib if p.stem in args.names]
         exports = [p for p in exports if p.name in args.names]
         samples = [p for p in samples if p.stem in args.names]
-        if not programs and not build_only and not stdlib and not exports and not samples:
+        bcegaps = [p for p in bcegaps if p.stem in args.names or "bce_gaps" in args.names]
+        if not programs and not build_only and not stdlib and not exports and not samples and \
+                not bcegaps:
             ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
-                     "test/go/build_only, test/stdlib, test/threads, test/go/export or samples")
+                     "test/go/build_only, test/stdlib, test/threads, test/go/export, "
+                     "test/go/bce_gaps or samples")
     if args.bless:
         # Their expected output is the C suite's (test/expected/), a
-        # sample's its own, and an export library's its Go tests.
-        stdlib, exports, samples = [], [], []
+        # sample's its own, an export library's its Go tests, and a BCE
+        # gap's its annotations.
+        stdlib, exports, samples, bcegaps = [], [], [], []
     unsupported = [] if args.names else sorted((HERE / "go" / "unsupported").glob("*.goose"))
     sweep = []
     if args.sweep:
@@ -1964,6 +1989,7 @@ def main():
             futures.append(pool.submit(r.wide_asm))
         if not args.bless and (not args.names or "selects" in args.names):
             futures.append(pool.submit(r.select_asm))
+        futures += [pool.submit(r.bce_gaps, p) for p in bcegaps]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
         futures += [pool.submit(r.fixture, p, True) for p in sweep]
         futures += [pool.submit(r.fuzz, seed)
