@@ -2,6 +2,7 @@ package goose
 
 import (
 	"math"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -166,7 +167,7 @@ func TestQueueConcurrent(t *testing.T) {
 
 // A worker's spawn image: an i64 its thread program reads.
 func spawnI64(run func(*GsStackBlock, unsafe.Pointer), v int64, contained bool) int64 {
-	return GsThreadSpawn(run, 2, 64, unsafe.Pointer(&v), 8, contained)
+	return gsProg.ThreadSpawn(run, 2, 64, unsafe.Pointer(&v), 8, contained)
 }
 
 func TestWorkers(t *testing.T) {
@@ -262,20 +263,30 @@ func TestContainedWorkers(t *testing.T) {
 }
 
 func TestHardwareThreads(t *testing.T) {
-	defer GsRtStart(0, GsStackReserve, GsStackGap, 0, 0)
-	if n := GsHardwareThreads(); n < 1 {
+	p := &GsProgram{StackReserve: GsStackReserve, StackGap: GsStackGap, FrameReserve: GsFrameReserve}
+	if n := p.HardwareThreads(); n < 1 {
 		t.Fatalf("hardware threads %d", n)
 	}
 	// A 4 GB budget holds two regions of the default reservation, fewer
 	// than any program with a worker takes: the cap is its floor, one.
-	GsRtStart(4<<30, GsStackReserve, GsStackGap, 2, 3)
-	if n := GsHardwareThreads(); n != 1 {
+	p.Start(4<<30, 2, 3)
+	if n := p.HardwareThreads(); n != 1 {
 		t.Fatalf("capped hardware threads %d, want 1", n)
 	}
+	// Another program's cap is its own.
+	if n := gsProg.HardwareThreads(); n < 1 || (runtime.GOMAXPROCS(0) > 1 && n == 1) {
+		t.Fatalf("the package's program has %d hardware threads", n)
+	}
+	// A budget of 64 regions of 64 KB, two for main and three a worker: 20.
+	small := &GsProgram{StackReserve: 64 << 10, StackGap: 0, FrameReserve: GsFrameReserve}
+	small.Start(64*(64<<10), 2, 3)
+	if small.threadCap != 20 {
+		t.Fatalf("cap %d, want 20", small.threadCap)
+	}
 	// Workers that hold no regions leave it uncapped.
-	GsRtStart(4<<30, GsStackReserve, GsStackGap, 2, 0)
-	if gsThreadCap != math.MaxInt64 {
-		t.Fatalf("cap %d with no worker regions", gsThreadCap)
+	p.Start(4<<30, 2, 0)
+	if p.threadCap != 0 || p.HardwareThreads() != int64(runtime.GOMAXPROCS(0)) {
+		t.Fatalf("cap %d with no worker regions", p.threadCap)
 	}
 }
 

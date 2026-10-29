@@ -1,5 +1,6 @@
-// Package goose is the pure-Go runtime of the Goose compiler's Go backend
-// (goose --target=go): what src/runtime/ is to the C backend, without cgo.
+// Package goose is the runtime of the Goose compiler's Go backend (goose
+// --target=go): what src/runtime/ is to the C backend, in pure Go and
+// without cgo.
 //
 // Goose places every dynamic value on data stacks: large regions of virtual
 // memory reserved up front, which a value grows by bumping the stack's top
@@ -9,11 +10,24 @@
 // scans or frees what lives on a stack, and growth past a region faults at
 // once. A thread program's stacks make up a GsStackBlock, which the
 // generated code takes as a hidden parameter beside gs_sp, and a sync.Pool
-// of blocks gives exported entry points their stacks without allocating.
+// of blocks gives the entry points of export fns their stacks without
+// allocating.
 //
-// The other files hold what the generated code calls: goose_spans.go the
-// freelists of reusable[] slice pools, and goose_bytes.go integer and float
-// semantics, varints, memory moves, byte search and the runtime's aborts.
+// This package is the one copy of the runtime there is. The compiler embeds
+// the source of its files at its own build (cmake/go_runtime.cmake), all of
+// them but goose_package.go and goose_extra.go, and a file it writes holds
+// the part of it that the program uses (--go-runtime=embed, the default),
+// or all of it (--go-runtime=full); with --go-runtime=import the file
+// imports this package instead. So every name the generated code calls is
+// exported here, and those that a file holding the runtime keeps to itself
+// are marked //goose:internal, which the compiler unexports as it embeds
+// them: GsEscape is gsEscape there.
+//
+// Each file holds a part: this one the blocks of data stacks and what a
+// program is to the runtime (GsProgram), goose_bytes.go the aborts and the
+// operations on values, goose_format.go the text forms print uses,
+// goose_spans.go the freelists of reusable[] slice pools, goose_os.go the OS
+// layer behind stdlib/os.goose, and goose_threads.go workers and queues.
 //
 // Memory on a data stack is outside the Go heap, which brings one rule for
 // the generated code and for any code that writes there: nothing on a stack
@@ -27,214 +41,156 @@
 package goose
 
 import (
+	"math"
+	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
 
-// Data stack sizes. The C runtime's macros of the same purpose are named
-// in each comment.
-const (
-	// GsStackReserve is the address space each data stack reserves by
-	// default (GS_STACK_RESERVE): 2 GB, of which the OS supplies pages only
-	// as the stack's top reaches them.
-	GsStackReserve int64 = 2 << 30
-	// GsStackGap is the PROT_NONE guard gap behind each reservation by
-	// default (GS_STACK_GAP), so that a stack growing past its region
-	// faults at once instead of writing over whatever lies beyond it.
-	GsStackGap int64 = 1 << 20
+// ---------------------------------------------------------------------------
+// Blocks of data stacks (docs/implementation.md §6.2, DESIGN.md §2.2).
 
-	// The smallest reservation a refusal halves down to (GS_REGION_MIN).
-	gsRegionMin int64 = 1 << 20
-	// The largest reservation there is (goose_spec.md §10.4): what lets the
-	// compiler take every size, count and index to fit in 48 bits.
-	gsReserveMax int64 = 1 << 48
-	// MADV_NOHUGEPAGE on every Linux port Go has; syscall defines the name
-	// only on Linux, and this file builds for macOS too.
-	gsMadvNoHugePage = 15
-)
-
-// Goose, and so its runtime, assumes a 64-bit host, where an int holds
-// every size a data stack can reach: elsewhere this is a negative length.
-var _ [unsafe.Sizeof(uintptr(0)) - 8]byte
-
-// GsSlice is a Goose slice, T[:] (docs/implementation.md §6.1): Len
-// elements at Data, which may point into a data stack, into Go memory its
-// owner keeps alive, or nowhere at all for an empty slice (nil).
-type GsSlice struct {
-	Data unsafe.Pointer
-	Len  int64
-}
-
-// GsRhdr is the header of a resizable value, T[] or T[>..] (§6.1): Len
-// elements from Base, which sit on top of the header's data stack, so
-// that pushing an element writes it at the stack's top, moves the top past
-// it and counts it. The base never moves.
-type GsRhdr struct {
-	Base unsafe.Pointer
-	Len  int64
-}
-
-// GsRref is a fat reference to a resizable value (§6.1, C's gs_rref): its
-// header, and the index in the GsStackBlock of the data stack its elements
-// top, so that a callee can grow the value it was handed.
-type GsRref struct {
-	Hdr *GsRhdr
-	Stk int64
-}
-
-// GsPref is a reference to a reusable[] pool (§6.1, C's gs_pref): the
-// element array as a GsRref, and the freelist's header and data stack,
-// which goose_spans.go keeps.
-type GsPref struct {
-	Hdr     *GsRhdr
-	Stk     int64
-	FreeHdr *GsRhdr
-	FreeStk int64
-}
-
-// GsSliceFromBytes is b as a GsSlice of its bytes, without a copy. The
-// slice keeps b's array alive only while the slice itself is where the
-// collector sees it (not on a data stack).
-func GsSliceFromBytes(b []byte) GsSlice {
-	return GsSlice{Data: unsafe.Pointer(unsafe.SliceData(b)), Len: int64(len(b))}
-}
-
-// GsSliceFromString is s as a GsSlice of its bytes, without a copy. The
-// bytes are s's own, which nothing may write.
-func GsSliceFromString(s string) GsSlice {
-	return GsSlice{Data: unsafe.Pointer(unsafe.StringData(s)), Len: int64(len(s))}
-}
-
-// GsSliceToBytes is the bytes of s as a Go slice, without a copy: valid as
-// long as the memory s points at is (a data stack's only until its top is
-// rewound below them).
-func GsSliceToBytes(s GsSlice) []byte {
-	return unsafe.Slice((*byte)(s.Data), s.Len)
-}
-
-// GsSliceToString is the bytes of s as a Go string, without a copy: valid,
-// and unchanging, only as long as the bytes s points at are left alone.
-func GsSliceToString(s GsSlice) string {
-	return unsafe.String((*byte)(s.Data), s.Len)
-}
-
-// GsSliceFromSlice is the elements of xs as a GsSlice, without a copy. T
-// must be laid out as the Goose element type is.
-func GsSliceFromSlice[T any](xs []T) GsSlice {
-	return GsSlice{Data: unsafe.Pointer(unsafe.SliceData(xs)), Len: int64(len(xs))}
-}
-
-// GsSliceToSlice is the elements of s as a Go slice of T, without a copy.
-// T must be laid out as the Goose element type is.
-func GsSliceToSlice[T any](s GsSlice) []T {
-	return unsafe.Slice((*T)(s.Data), s.Len)
-}
-
-// PtrFromAddr is the pointer an address held as an integer stands for: a
-// data stack address that a value on a stack keeps as a uintptr, so that
-// no Go pointer hides in memory the collector does not scan. It is for
-// addresses inside data stack regions (or other memory outside the Go
-// heap) only: the collector cannot know a Go object an integer points at.
-func PtrFromAddr(addr uintptr) unsafe.Pointer {
-	return unsafe.Add(nil, addr)
-}
-
-// GsStackBlock holds the data stacks of one thread program: a Goose
-// program, a worker, or one call into exported Goose code (DESIGN.md
-// §2.2). The generated code takes it, with gs_sp, as its leading
-// parameters, and addresses its own stacks as gs_sp + k.
-//
-// A block belongs to one goroutine at a time. Pointers into its stacks are
-// valid until it is reset or closed, and only while the block itself stays
-// reachable: a block that is dropped without Close is closed by the
-// collector, which cannot see the pointers into it.
+// GsStackBlock holds the data stacks of one thread program: each stack is a
+// region of reserved address space, Stks[gs_sp+k] its current top. A
+// function that uses data stacks, or calls one that does, takes the block
+// and its first stack index as its leading parameters (gs, gs_sp).
 type GsStackBlock struct {
-	// Stks holds the top of each data stack, indexed by gs_sp + k.
-	Stks []unsafe.Pointer
-	// Base holds where each stack's region begins: its top when empty.
-	Base []unsafe.Pointer
-	// Cap holds how many bytes each stack holds before its guard gap.
-	Cap []int64
-	// Frame is the top of the block's fixed-frame stack (DESIGN.md §3.6):
-	// the address-taken fixed-size locals of the functions running, each
-	// function's frame above its caller's, taken as it starts and given
-	// back as it returns. FrameBase and FrameEnd bound its region. Outside
-	// the Go heap, the locals never move, so a value's bytes may hold their
-	// addresses where the collector does not look.
-	Frame, FrameBase, FrameEnd unsafe.Pointer
-	// Gl is the program instance the block runs (goose_spec.md §11.2), in
-	// a program with workers: its globals, which the generated code lays
-	// out. Main's is a static one; a worker's, and an exported entry
-	// point's caller's, is in memory of the block's own (NewInstance),
-	// outside the Go heap as the stacks are. nil where the block has none.
-	Gl unsafe.Pointer
-
-	reserve int64    // usable bytes asked of each new region
-	gap     int64    // guard bytes behind each region
-	regions [][]byte // each region's mapping, guard gap included
-	frame   []byte   // the fixed-frame stack's mapping
-	inst    []byte   // the block's own program instance's mapping
-	worker  int64    // the worker running on the block, its id plus one; 0 for none
+	Stks []unsafe.Pointer // Current stack tops, indexed by gs_sp + k.
+	Base []unsafe.Pointer // Where each stack's region starts.
+	Cap  []int64          // Each region's usable bytes, its guard gap not included.
+	// The fixed-frame stack: the address-taken fixed-size locals of the
+	// functions running, each function's frame above its caller's, taken as
+	// it starts and given back at its every return, as a native stack's
+	// frame is. Outside the Go heap, they never move, so the bytes of a
+	// value may hold their addresses where the collector does not look.
+	Frame     unsafe.Pointer
+	FrameBase unsafe.Pointer
+	FrameEnd  unsafe.Pointer
+	// The program instance the block runs (§11.2), in a program with
+	// workers: its globals, which the generated code lays out (gsGlobals).
+	// Main's is a static one; a worker's, and an export's caller's, is in
+	// memory of the block's own (inst), outside the Go heap, as the data
+	// stacks are. nil where the block has none yet.
+	Gl      unsafe.Pointer
+	inst    []byte
+	worker  int64 // The worker running on the block, its id plus one; 0 for none.
+	frame   []byte
+	regions [][]byte
+	reserve int64 // The usable bytes asked of each new region, in whole pages.
+	gap     int64 // The guard gap behind each region.
 }
 
-// GsFrameReserve is the address space a block's fixed-frame stack
-// reserves, whatever its data stacks reserve: C keeps those locals on its
-// native stack.
-const GsFrameReserve = 1 << 30
-
-// NewStackBlock reserves a block of numStacks data stacks, each a region
-// of reserve bytes (rounded down to whole pages, and halved where the
-// platform refuses that much address space) followed by a guard gap of
-// gap bytes that faults on any access.
+// GsProgram is a program's place in the runtime: the configuration it was
+// compiled with (--stack-reserve, GS_STACK_RESERVE, GS_STACK_GAP,
+// --frame-reserve), which the blocks it makes have; the pool of blocks the
+// entry points of its export fns run on; its address space budget and the
+// cap that puts on its workers (gs_rt_start); and whether it is a library,
+// which never exits the process: its host's. A file the compiler writes
+// declares its program's, gsProg, so that the programs of a process each
+// have their own, however many packages share this one.
 //
-// The block's stacks are released by Close, or by the collector once the
-// block is unreachable.
+//goose:internal
+type GsProgram struct {
+	StackReserve int64 // The usable bytes of each data stack's region.
+	StackGap     int64 // The guard gap behind each region.
+	FrameReserve int64 // The address space of each block's fixed-frame stack.
+	Library      bool  // A library: nothing it runs exits the process.
+
+	pool          sync.Pool // The blocks AcquireStackBlock hands out.
+	budget        uint64    // GS_STACK_BUDGET, the address space for regions.
+	mainRegions   int64     // The most regions the main program holds.
+	workerRegions int64     // The most regions any one worker holds.
+	threadCap     int64     // The workers the budget holds beside main; 0 for no cap.
+}
+
+// NewStackBlock reserves numStacks data stacks of reserve usable bytes each
+// (in whole pages, and halved where the platform refuses that much address
+// space), with gap bytes of PROT_NONE guard behind each one, and a
+// fixed-frame stack of the sizes the program was compiled with. The block
+// lasts until Close releases it.
 func NewStackBlock(numStacks int, reserve, gap int64) *GsStackBlock {
-	if numStacks < 0 {
-		GsPanic("negative data stack count")
-	}
-	if gap < 0 {
-		GsPanic("negative data stack guard gap")
-	}
-	if reserve > gsReserveMax {
-		GsPanic("GS_STACK_RESERVE exceeds the 2^48 limit (goose_spec.md 10.4)")
-	}
-	// The gap starts on a page, or the guard could not be protected.
-	reserve -= reserve % gsPageSize
-	if reserve <= 0 {
-		GsPanic("the data stack reservation (GS_STACK_RESERVE) is less than a page")
-	}
-	gs := &GsStackBlock{
-		Stks:    make([]unsafe.Pointer, 0, numStacks),
-		Base:    make([]unsafe.Pointer, 0, numStacks),
-		Cap:     make([]int64, 0, numStacks),
-		reserve: reserve,
-		gap:     gap,
-		regions: make([][]byte, 0, numStacks),
-	}
-	runtime.SetFinalizer(gs, (*GsStackBlock).Close)
-	gs.EnsureStacks(numStacks)
-	gs.EnsureFrame()
+	return gsProg.NewStackBlock(numStacks, reserve, gap)
+}
+
+// AcquireStackBlock is a block of at least numStacks empty data stacks, of
+// the sizes the program was compiled with, from a pool of them: once the
+// pool holds one, it allocates and reserves nothing. Hand it back with
+// ReleaseStackBlock; until then it is the caller's alone.
+func AcquireStackBlock(numStacks int) *GsStackBlock {
+	return gsProg.AcquireStackBlock(numStacks)
+}
+
+// ReleaseStackBlock rewinds gs, a block AcquireStackBlock gave, and gives it
+// back to the pool: nothing may use what its stacks hold afterwards.
+func ReleaseStackBlock(gs *GsStackBlock) { gsProg.ReleaseStackBlock(gs) }
+
+// NewStackBlock is a block of the program's (the package NewStackBlock's).
+// It is registered, so that a data stack of it that overflows is reported
+// as the thread program's whose it is (gsOverflow, gsFault).
+func (p *GsProgram) NewStackBlock(numStacks int, reserve, gap int64) *GsStackBlock {
+	gsBlocksMu.Lock()
+	defer gsBlocksMu.Unlock()
+	gs := gsNewBlock(numStacks, reserve, gap, p.FrameReserve)
+	gsBlocks = append(gsBlocks, gs)
 	return gs
 }
 
-// EnsureFrame reserves the block's fixed-frame stack where it has none
-// (the zero block, or a closed one), halving the reservation where the
-// platform refuses that much address space. The frame starts empty.
-func (gs *GsStackBlock) EnsureFrame() {
-	if gs.frame != nil {
+// AcquireStackBlock is a block from the program's pool (the package
+// AcquireStackBlock's), which the collector may drop from the pool: one it
+// drops is closed.
+func (p *GsProgram) AcquireStackBlock(numStacks int) *GsStackBlock {
+	if gs, _ := p.pool.Get().(*GsStackBlock); gs != nil {
+		gs.EnsureStacks(numStacks)
+		return gs
+	}
+	gsBlocksMu.Lock()
+	defer gsBlocksMu.Unlock()
+	gs := gsNewBlock(numStacks, p.StackReserve, p.StackGap, p.FrameReserve)
+	runtime.SetFinalizer(gs, (*GsStackBlock).Close)
+	return gs
+}
+
+// ReleaseStackBlock rewinds gs and gives it back to the program's pool.
+func (p *GsProgram) ReleaseStackBlock(gs *GsStackBlock) {
+	if gs == nil {
 		return
 	}
-	n := int64(GsFrameReserve)
+	gs.Reset()
+	p.pool.Put(gs)
+}
+
+// gsNewBlock makes a block, with gsBlocksMu held: numStacks regions, and a
+// fixed-frame stack of frame bytes.
+func gsNewBlock(numStacks int, reserve, gap, frame int64) *GsStackBlock {
+	page := int64(syscall.Getpagesize())
+	switch {
+	case numStacks < 0:
+		GsPanic("negative data stack count")
+	case gap < 0:
+		GsPanic("negative data stack guard gap")
+	case reserve > gsReserveMax:
+		GsPanic("GS_STACK_RESERVE exceeds the 2^48 limit (goose_spec.md 10.4)")
+	case reserve < page:
+		GsPanic("the data stack reservation (GS_STACK_RESERVE) is less than a page")
+	}
+	gs := &GsStackBlock{reserve: reserve - reserve%page, gap: gap}
+	gs.ensureStacks(numStacks)
+	gs.reserveFrame(frame)
+	return gs
+}
+
+// reserveFrame maps the fixed-frame stack, n bytes of address space,
+// halving the reservation where the platform refuses one.
+func (gs *GsStackBlock) reserveFrame(n int64) {
 	for {
-		mem, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
-			syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+		r, err := gsMap(n)
 		if err == nil {
-			gs.frame = mem
-			gs.FrameBase = unsafe.Pointer(unsafe.SliceData(mem))
+			gs.frame = r
+			gs.FrameBase = unsafe.Pointer(unsafe.SliceData(r))
 			gs.Frame = gs.FrameBase
 			gs.FrameEnd = unsafe.Add(gs.FrameBase, n)
 			return
@@ -246,79 +202,79 @@ func (gs *GsStackBlock) EnsureFrame() {
 	}
 }
 
-// GsFrameOverflow reports a function's frame that does not fit what is
-// left of the fixed-frame stack, as C reports its native stack's overflow.
+// GsFrameOverflow is a function's frame that does not fit what is left of
+// the fixed-frame stack, which C reports as its native stack's overflow.
 func GsFrameOverflow() { GsPanic("native call stack overflow") }
 
-// EnsureStacks gives the block at least n data stacks, reserving regions
-// for the ones it lacks: each new stack is empty. A block's stack count
-// only ever grows, until Close.
-//
-// The zero GsStackBlock has no stacks, and gets regions of the default
-// sizes here; nothing closes it but Close.
+// EnsureStacks reserves stacks until the block has at least n.
 func (gs *GsStackBlock) EnsureStacks(n int) {
-	if gs.reserve == 0 {
-		gs.reserve = GsStackReserve - GsStackReserve%gsPageSize
-		gs.gap = GsStackGap
+	if len(gs.Stks) >= n {
+		return
 	}
+	gsBlocksMu.Lock()
+	defer gsBlocksMu.Unlock()
+	gs.ensureStacks(n)
+}
+
+func (gs *GsStackBlock) ensureStacks(n int) {
 	for len(gs.Stks) < n {
-		mem, usable := gsReserveRegion(gs.reserve, gs.gap)
-		base := unsafe.Pointer(unsafe.SliceData(mem))
-		gs.regions = append(gs.regions, mem)
-		gs.Base = append(gs.Base, base)
-		gs.Stks = append(gs.Stks, base)
+		r, usable := gsReserveRegion(gs.reserve, gs.gap)
+		p := unsafe.Pointer(unsafe.SliceData(r))
+		gs.regions = append(gs.regions, r)
+		gs.Stks = append(gs.Stks, p)
+		gs.Base = append(gs.Base, p)
 		gs.Cap = append(gs.Cap, usable)
+		gsRegions[uintptr(p)+uintptr(usable)] = gsRegion{uintptr(p), int64(len(r)), usable, gs.reserve}
 	}
 }
 
-// Reset empties every stack of the block at once, rewinding each top to
-// its base. The memory stays reserved, and the pages the stacks reached
-// stay with the process, ready for the next use.
-//
-// A program instance of the block's own goes with them: the next exported
+// Reset rewinds every stack of the block to empty, its fixed-frame stack's
+// too. A program instance of the block's own (Gl) goes with them: the next
 // entry point to run on the block copies the program's globals in again.
 func (gs *GsStackBlock) Reset() {
-	for i := range gs.Stks {
-		gs.Stks[i] = gs.Base[i]
-	}
+	copy(gs.Stks, gs.Base)
 	gs.Frame = gs.FrameBase
 	if gs.inst != nil {
 		gs.Gl = nil
 	}
 }
 
-// Close releases every region of the block, which is then empty again:
-// nothing may use a pointer into its stacks any more. Closing a closed
-// block does nothing.
+// Close releases the block's regions: nothing may use what its stacks held
+// afterwards. Closing a closed block does nothing, and a closed block can
+// be given stacks again (EnsureStacks).
 func (gs *GsStackBlock) Close() error {
-	var err error
-	for i := len(gs.regions) - 1; i >= 0; i-- {
-		if e := syscall.Munmap(gs.regions[i]); e != nil && err == nil {
-			err = e
+	gsBlocksMu.Lock()
+	for i, b := range gsBlocks {
+		if b == gs {
+			gsBlocks = append(gsBlocks[:i], gsBlocks[i+1:]...)
+			break
 		}
-		// No stale pointer is left to address space the Go heap may reuse.
-		gs.regions[i] = nil
-		gs.Stks[i] = nil
-		gs.Base[i] = nil
 	}
-	gs.regions = gs.regions[:0]
-	gs.Stks = gs.Stks[:0]
-	gs.Base = gs.Base[:0]
-	gs.Cap = gs.Cap[:0]
-	if gs.frame != nil {
-		if e := syscall.Munmap(gs.frame); e != nil && err == nil {
-			err = e
+	for k := range gs.regions {
+		delete(gsRegions, uintptr(gs.Base[k])+uintptr(gs.Cap[k]))
+	}
+	gsBlocksMu.Unlock()
+	var first error
+	for _, r := range gs.regions {
+		if err := syscall.Munmap(r); err != nil && first == nil {
+			first = err
 		}
-		gs.frame = nil
-		gs.Frame, gs.FrameBase, gs.FrameEnd = nil, nil, nil
+	}
+	if gs.frame != nil {
+		if err := syscall.Munmap(gs.frame); err != nil && first == nil {
+			first = err
+		}
 	}
 	if gs.inst != nil {
-		if e := syscall.Munmap(gs.inst); e != nil && err == nil {
-			err = e
+		if err := syscall.Munmap(gs.inst); err != nil && first == nil {
+			first = err
 		}
-		gs.inst, gs.Gl = nil, nil
+		gs.Gl = nil
 	}
-	return err
+	gs.regions, gs.Stks, gs.Base, gs.Cap = nil, nil, nil, nil
+	gs.frame, gs.Frame, gs.FrameBase, gs.FrameEnd = nil, nil, nil, nil
+	gs.inst = nil
+	return first
 }
 
 // gsMapPrivate maps n bytes of zeroed memory outside the Go heap, at least
@@ -326,27 +282,28 @@ func (gs *GsStackBlock) Close() error {
 // image: what points into them never moves, and the collector frees none
 // of it.
 func gsMapPrivate(n int64) []byte {
-	n = (n + gsPageSize - 1) / gsPageSize * gsPageSize
+	page := int64(syscall.Getpagesize())
+	n = (n + page - 1) / page * page
 	if n == 0 {
-		n = gsPageSize
+		n = page
 	}
-	mem, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+	m, err := gsMap(n)
 	if err != nil {
 		GsPanic("out of memory copying globals")
 	}
-	return mem
+	return m
 }
 
 // NewInstance gives the block a program instance of its own, size zeroed
-// bytes at Gl, where it has none; the memory is the block's until Close.
+// bytes at Gl, where it has none (an export's entry point fills it); the
+// memory is the block's until Close.
 func (gs *GsStackBlock) NewInstance(size uintptr) {
 	if gs.Gl != nil {
 		return
 	}
 	if gs.inst == nil || uintptr(len(gs.inst)) < size {
 		if gs.inst != nil {
-			syscall.Munmap(gs.inst)
+			_ = syscall.Munmap(gs.inst)
 		}
 		gs.inst = gsMapPrivate(int64(size))
 	} else {
@@ -355,9 +312,22 @@ func (gs *GsStackBlock) NewInstance(size uintptr) {
 	gs.Gl = unsafe.Pointer(unsafe.SliceData(gs.inst))
 }
 
-// owns says whether p points into memory of the block's own: a data stack's
+// gsWho names the thread program a block runs, as the runtime's reports
+// do: main's, or a worker's by its id.
+func (gs *GsStackBlock) gsWho() string {
+	if gs == nil || gs.worker == 0 {
+		return "main"
+	}
+	return "worker " + strconv.FormatInt(gs.worker-1, 10)
+}
+
+// End is where stack k's region ends, which a line print renders at the
+// stack's top does not write past (GsPutStr).
+func (gs *GsStackBlock) End(k int64) unsafe.Pointer { return unsafe.Add(gs.Base[k], gs.Cap[k]) }
+
+// Owns says whether p points into memory of the block's own: a data stack's
 // region, its fixed-frame stack, its program instance.
-func (gs *GsStackBlock) owns(p unsafe.Pointer) bool {
+func (gs *GsStackBlock) Owns(p unsafe.Pointer) bool {
 	in := func(r []byte) bool {
 		return r != nil && uintptr(p)-uintptr(unsafe.Pointer(unsafe.SliceData(r))) < uintptr(len(r))
 	}
@@ -369,47 +339,53 @@ func (gs *GsStackBlock) owns(p unsafe.Pointer) bool {
 	return in(gs.frame) || in(gs.inst)
 }
 
-// The blocks exported entry points share: per-P caches that the collector
-// may empty, which then closes the blocks it drops.
-var gsStackBlockPool sync.Pool
+// ---------------------------------------------------------------------------
+// Regions: address space mapped outside the Go heap.
 
-// AcquireStackBlock takes a block of at least numStacks empty data stacks
-// from a process-wide pool, which allocates and reserves nothing once the
-// pool holds a block with that many stacks. It is how an exported entry
-// point runs its Goose code, giving the block back with ReleaseStackBlock
-// as it returns.
-func AcquireStackBlock(numStacks int) *GsStackBlock {
-	if gs, _ := gsStackBlockPool.Get().(*GsStackBlock); gs != nil {
-		gs.EnsureStacks(numStacks)
-		return gs
-	}
-	return NewStackBlock(numStacks, GsStackReserve, GsStackGap)
+// How many times the runtime has mapped memory (gsMap, gsMapRegion): a
+// library's package maps none until the first call of an entry point
+// starts it (issue #18).
+var gsMaps atomic.Int64
+
+// gsMap maps n bytes of zeroed memory outside the Go heap, for a fixed-frame
+// stack or a program instance: address space only, which the OS commits
+// page by page as it is touched.
+func gsMap(n int64) ([]byte, error) {
+	gsMaps.Add(1)
+	return syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
 }
 
-// ReleaseStackBlock rewinds a block's stacks and gives it to the pool
-// AcquireStackBlock takes from. Nothing may use a pointer into its stacks
-// afterwards.
-func ReleaseStackBlock(gs *GsStackBlock) {
-	if gs == nil {
-		return
-	}
-	gs.Reset()
-	gsStackBlockPool.Put(gs)
-}
-
-// The unit memory is mapped and protected in.
-var gsPageSize = int64(syscall.Getpagesize())
+const (
+	// The smallest a region gets before a refusal is fatal (GS_REGION_MIN).
+	gsRegionMin = 1 << 20
+	// The largest reservation there is (goose_spec.md §10.4): what lets the
+	// compiler take every size, count and index to fit in 48 bits.
+	gsReserveMax = 1 << 48
+	// MADV_NOHUGEPAGE on every Linux port Go has; syscall defines the name
+	// only on Linux, and this file builds for macOS too.
+	gsMadvNoHugePage = 15
+)
 
 // Once the platform has refused a region, the usable size every region
 // starts from: halved at each refusal, it only ever settles downward, as
 // gs_reserve_region's gs_region_usable does. Zero before any refusal.
 var gsRegionCap atomic.Int64
 
-// gsReserveRegion maps a fresh region of usable bytes followed by a guard
-// gap of gap bytes, returning the mapping and its usable size, which is
-// smaller where the platform refused the size asked for.
-func gsReserveRegion(usable, gap int64) ([]byte, int64) {
-	return gsReserveWith(usable, gap, gsMapRegion)
+// gsUsable is the usable size a new region of reserve bytes gets: reserve
+// in whole pages, or less where the platform has refused regions.
+func gsUsable(reserve int64) int64 {
+	usable := reserve - reserve%int64(syscall.Getpagesize())
+	if c := gsRegionCap.Load(); c > 0 && c < usable {
+		usable = c
+	}
+	return usable
+}
+
+// gsReserveRegion maps one region: address space only, committed by the OS
+// page by page as the stack grows into it, with the guard gap at its end.
+func gsReserveRegion(reserve, gap int64) ([]byte, int64) {
+	return gsReserveWith(reserve, gap, gsMapRegion)
 }
 
 // gsReserveWith is gsReserveRegion, mapping through mapRegion. Where the
@@ -417,22 +393,21 @@ func gsReserveRegion(usable, gap int64) ([]byte, int64) {
 // strict overcommit accounting exhausted), every region from then on is
 // half as large, in whole pages, down to gsRegionMin. A smaller region is
 // always safe: the checks the compiler leaves out assume no more than
-// GsStackReserve bytes in a stack, and the gap behind a smaller region
+// GS_STACK_RESERVE bytes in a stack, and the gap behind a smaller region
 // stops growth that much sooner.
-func gsReserveWith(usable, gap int64, mapRegion func(usable, gap int64) ([]byte, error)) ([]byte, int64) {
-	if c := gsRegionCap.Load(); c > 0 && c < usable {
-		usable = c
-	}
+func gsReserveWith(reserve, gap int64, mapRegion func(usable, gap int64) ([]byte, error)) ([]byte, int64) {
+	page := int64(syscall.Getpagesize())
+	usable := gsUsable(reserve)
 	for {
-		mem, err := mapRegion(usable, gap)
+		r, err := mapRegion(usable, gap)
 		if err == nil {
-			return mem, usable
+			return r, usable
 		}
 		if usable <= gsRegionMin {
 			GsPanic("cannot reserve data stack address space")
 		}
 		usable /= 2
-		usable -= usable % gsPageSize
+		usable -= usable % page
 		for c := gsRegionCap.Load(); c == 0 || c > usable; c = gsRegionCap.Load() {
 			if gsRegionCap.CompareAndSwap(c, usable) {
 				break
@@ -446,26 +421,183 @@ func gsReserveWith(usable, gap int64, mapRegion func(usable, gap int64) ([]byte,
 // touch. MAP_NORESERVE keeps the reservation out of the commit charge
 // where the platform's overcommit accounting allows it.
 func gsMapRegion(usable, gap int64) ([]byte, error) {
-	mem, err := syscall.Mmap(-1, 0, int(usable+gap), syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+	r, err := gsMap(usable + gap)
 	if err != nil {
 		return nil, err
 	}
 	if gap > 0 {
-		if err := syscall.Mprotect(mem[usable:], syscall.PROT_NONE); err != nil {
-			syscall.Munmap(mem)
+		if err := syscall.Mprotect(r[usable:], syscall.PROT_NONE); err != nil {
+			_ = syscall.Munmap(r)
 			GsPanic("cannot protect data stack guard gap")
 		}
 	}
 	// Most stacks hold a few bytes, for which a transparent huge page at
-	// the start would commit 2 MB.
+	// the start would commit 2 MB, as the C runtime's regions keep them out.
 	if runtime.GOOS == "linux" {
-		n := usable
-		if n > 2<<20 {
-			n = 2 << 20
-		}
-		syscall.Syscall(syscall.SYS_MADVISE, uintptr(unsafe.Pointer(unsafe.SliceData(mem))),
-			uintptr(n), gsMadvNoHugePage)
+		_ = syscall.Madvise(r[:min(usable, 2<<20)], gsMadvNoHugePage)
 	}
-	return mem, nil
+	return r, nil
+}
+
+// ---------------------------------------------------------------------------
+// Overflow: a data stack that grows past its region.
+
+// The blocks NewStackBlock has made, which a report of an overflow names
+// the thread program of, and every region there is, by where it ends, its
+// pooled blocks' included, which the collector may close: its address, the
+// bytes mapped, its usable ones and the reservation asked for. Exported
+// entry points make blocks on whatever goroutines call them, so what
+// reserves a region, or reads these, holds gsBlocksMu.
+var (
+	gsBlocksMu sync.Mutex
+	gsBlocks   []*GsStackBlock
+	gsRegions  = map[uintptr]gsRegion{}
+)
+
+type gsRegion struct {
+	base            uintptr
+	size            int64
+	usable, reserve int64
+}
+
+// gsRegionWho names the thread program whose region ends at end, as a
+// report of its overflow does: that of the block NewStackBlock made it for,
+// or main's.
+func gsRegionWho(end uintptr) string {
+	for _, b := range gsBlocks {
+		for k := range b.Cap {
+			if uintptr(b.End(int64(k))) == end {
+				return b.gsWho()
+			}
+		}
+	}
+	return "main"
+}
+
+// gsOverflow is the C runtime's report of a data stack that grows past its
+// region (gs_overflow_text), raised before a write would cross end, where
+// the region ends, naming the thread program whose stacks they are.
+func gsOverflow(end unsafe.Pointer) {
+	gsBlocksMu.Lock()
+	r := gsRegions[uintptr(end)]
+	who := gsRegionWho(uintptr(end))
+	gsBlocksMu.Unlock()
+	panic(&GsError{Msg: gsOverflowText(r.usable, r.reserve, who)})
+}
+
+func gsOverflowText(usable, reserve int64, who string) string {
+	reserve -= reserve % int64(syscall.Getpagesize())
+	msg := "data stack overflow: a value on " + who + "'s data stacks grew past the " + gsSize(usable) +
+		" reserved for it"
+	if usable < reserve {
+		msg += " (halved from " + gsSize(reserve) + " when the platform ran out of address space)"
+	}
+	return msg + "; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, up to 256 TB"
+}
+
+// gsFault is the error of a fault at addr, where it lies in the guard gap
+// of a region: a data stack grown past its region with no check on the
+// way, as a push grows it (gs_fault_handler). nil for any other address.
+func gsFault(addr uintptr) *GsError {
+	gsBlocksMu.Lock()
+	defer gsBlocksMu.Unlock()
+	for end, r := range gsRegions {
+		if addr-r.base < uintptr(r.size) {
+			return &GsError{Msg: gsOverflowText(r.usable, r.reserve, gsRegionWho(end))}
+		}
+	}
+	return nil
+}
+
+// GsAbortOf is what a goroutine running Goose code recovered, r, as the
+// runtime reports it: a fault in a guard gap, which the goroutine's panic
+// on fault (debug.SetPanicOnFault) made a panic, as the *GsError of the
+// overflow (gsFault), and anything else as it is.
+//
+//goose:internal
+func GsAbortOf(r any) any {
+	if f, ok := r.(interface{ Addr() uintptr }); ok {
+		if e := gsFault(f.Addr()); e != nil {
+			return e
+		}
+	}
+	return r
+}
+
+// gsSize is a size as the C runtime writes one (gs_size): a whole number of
+// the largest of bytes, KB, MB, GB and TB that has one.
+func gsSize(n int64) string {
+	units := [...]string{" bytes", " KB", " MB", " GB", " TB"}
+	u := 0
+	for u < 4 && n != 0 && n%1024 == 0 {
+		n /= 1024
+		u++
+	}
+	return strconv.FormatInt(n, 10) + units[u]
+}
+
+// ---------------------------------------------------------------------------
+// A program's start and end.
+
+// Start is the start of the runtime for the program, as main's thread
+// program begins (gs_rt_start): its address space budget for regions
+// (GS_STACK_BUDGET), the most regions its main program and any one worker
+// hold, as the compiler counted them, and the cap that puts on its
+// workers, each at the most regions one can take, at least one: what
+// hardware_threads() reports at most. Workers that hold no regions leave
+// the cap off.
+func (p *GsProgram) Start(budget uint64, mainregions, workerregions int64) {
+	p.budget, p.mainRegions, p.workerRegions = budget, mainregions, workerregions
+	p.threadCap = 0
+	if workerregions <= 0 {
+		return
+	}
+	page := int64(syscall.Getpagesize())
+	per := uint64(p.StackReserve-p.StackReserve%page) + uint64(p.StackGap)
+	total := uint64(0)
+	if per != 0 {
+		total = budget / per
+	}
+	spare := int64(math.MaxInt64)
+	if total <= math.MaxInt64 {
+		spare = int64(total)
+	}
+	spare -= mainregions
+	if spare > workerregions {
+		p.threadCap = spare / workerregions
+	} else {
+		p.threadCap = 1
+	}
+}
+
+// StackStats is the report a program compiled with GS_STACK_STATS gives on
+// stderr as each thread program ends (gs_stack_stats): its indexed data
+// stacks, the regions of its block, what each reserves, and the budget.
+func (p *GsProgram) StackStats(gs *GsStackBlock, stacks int64) {
+	usable := gsUsable(p.StackReserve)
+	per := uint64(usable + gs.gap)
+	n := uint64(0)
+	if per > 0 {
+		n = p.budget / per
+	}
+	workers := "no workers"
+	if p.workerRegions > 0 {
+		workers = "a worker " + strconv.FormatInt(p.workerRegions, 10) + ", thread cap " +
+			strconv.FormatInt(p.threadCap, 10)
+	}
+	os.Stderr.WriteString("goose stack stats: " + gs.gsWho() + ": " + strconv.FormatInt(stacks, 10) +
+		" data stacks, " + strconv.Itoa(len(gs.regions)) + " regions (reserving " + gsSize(usable) +
+		" each); budget " + gsSize(int64(min(p.budget, math.MaxInt64))) + " for " +
+		strconv.FormatUint(n, 10) + ", main program " + strconv.FormatInt(p.mainRegions, 10) + ", " +
+		workers + "\n")
+}
+
+// Exit is exit(code): the process ends at once, with that status, from
+// whichever thread program calls it (gs_exit). A library's leaves the
+// process to its host: it panics with a *GsError naming the status.
+func (p *GsProgram) Exit(code int64) {
+	if p.Library {
+		panic(&GsError{Msg: "exit(" + strconv.FormatInt(code, 10) + ")"})
+	}
+	gsEnd(int(code), "")
 }
