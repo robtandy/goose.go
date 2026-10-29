@@ -1340,24 +1340,34 @@ class Runner:
         check("--go-package", code == 0 and "\npackage geese\n" in text, o + e)
         code, o, e = self.goose("--target=go", "--library", "-o", gofile, hello)
         text = gofile.read_text(encoding="utf-8") if gofile.exists() else ""
+        # A library has no init: the first call of an entry point starts it
+        # (issue #18).
         check("--library", code == 0 and "\npackage goose\n" in text and
-              "\nfunc main()" not in text and "\nfunc init()" in text, o + e)
+              "\nfunc main()" not in text and "\nfunc init()" not in text and
+              "\nfunc gsLibStart() {" in text and "\n\tgsLibrary      = true\n" in text, o + e)
         if code == 0:
             vc, vo, ve = self.gotool("vet", gofile.name)
             check("--library vets", vc == 0 and not (vo + ve).strip(), vo + ve)
             diff = self.gofmt_clean(gofile)
             check("--library is laid out as gofmt lays it out", diff is None, diff or "")
-        # A Go program that imports a library: the package's init
-        # initializes the globals, and the library's fn main() never runs.
+        # A Go program that imports a library: importing it runs nothing, the
+        # first call of an entry point initializes the globals, once, the
+        # library's fn main() never runs, and its exit() ends no process but
+        # panics with a *GsError the host recovers (issue #18).
         host = self.work / "cli-host"
         shutil.rmtree(host, ignore_errors=True)
         (host / "goose").mkdir(parents=True)
         libsrc = self.work / "cli-library.goose"
         tc.write_text(libsrc, 'fn noisy() -> i64 {\n    print("library global initialized");\n    7\n}\n'
                               'let answer = noisy();\n'
+                              'export fn get_answer() -> i64 { answer }\n'
+                              'export fn quit(code: i64) { exit(code); }\n'
                               'fn main() {\n    print("library main ran: ", answer);\n    exit(3);\n}\n')
-        tc.write_text(host / "main.go", 'package main\n\nimport (\n\t"fmt"\n\n\t_ "gooshost/goose"\n)\n\n'
-                                        'func main() { fmt.Println("host main ran") }\n')
+        tc.write_text(host / "main.go", 'package main\n\nimport (\n\t"fmt"\n\n\t"gooshost/goose"\n)\n\n'
+                                        'func main() {\n\tfmt.Println("host main ran")\n'
+                                        '\tfmt.Println(goose.GetAnswer(), goose.GetAnswer())\n'
+                                        '\tdefer func() { fmt.Println("recovered", recover()) }()\n'
+                                        '\tgoose.Quit(3)\n}\n')
         code, o, e = self.goose("--target=go", "--library", "-o", host / "goose" / "goose.go", libsrc)
         detail = o + e
         ok = False
@@ -1368,9 +1378,55 @@ class Runner:
             if r.returncode == 0:
                 r = subprocess.run([self.go, "run", "."], cwd=host, env=go_env(), capture_output=True)
             detail = f"exit {r.returncode}\n{tc.decode(r.stdout)}{tc.decode(r.stderr)}"
-            ok = r.returncode == 0 and \
-                tc.decode(r.stdout) == "library global initialized\nhost main ran\n"
-        check("a Go program imports a --library package, whose init runs no fn main", ok, detail)
+            ok = r.returncode == 0 and tc.decode(r.stdout) == \
+                "host main ran\nlibrary global initialized\n7 7\nrecovered goose runtime error: exit(3)\n"
+        check("a Go program imports a --library package, which starts at its first call and runs no fn main",
+              ok, detail)
+        # Nor does a worker's abort: no host can recover a panic on the
+        # worker's goroutine, which the runtime started, so the process ends
+        # with Go's report of the abort's panic, as for any goroutine's.
+        whost = self.work / "cli-worker-host"
+        shutil.rmtree(whost, ignore_errors=True)
+        (whost / "goose").mkdir(parents=True)
+        libsrc = self.work / "cli-worker-library.goose"
+        tc.write_text(libsrc, 'thread_fn fail(x: i64) { assert(x < 0); }\n'
+                              'export fn run() -> i64 {\n    thread_wait(thread_spawn(fail, 1));\n    1\n}\n')
+        tc.write_text(whost / "main.go", 'package main\n\nimport "goosworker/goose"\n\nfunc main() { goose.Run() }\n')
+        code, o, e = self.goose("--target=go", "--library", "-o", whost / "goose" / "goose.go", libsrc)
+        detail = o + e
+        ok = False
+        if code == 0:
+            r = subprocess.run([self.go, "mod", "init", "goosworker"], cwd=whost, env=go_env(),
+                               capture_output=True)
+            if r.returncode == 0:
+                r = subprocess.run([self.go, "build", "-o", "host" + tc.EXE_SUFFIX, "."], cwd=whost, env=go_env(),
+                                   capture_output=True)
+            if r.returncode == 0:
+                r = subprocess.run([str(whost / ("host" + tc.EXE_SUFFIX))], cwd=whost, capture_output=True)
+            err = tc.decode(r.stderr)
+            detail = f"exit {r.returncode}\n{tc.decode(r.stdout)}{err}"
+            ok = r.returncode == 2 and not r.stdout and \
+                err.startswith("panic: goose runtime error: assert failed (") and "\ngoroutine " in err
+        check("a worker's abort in a --library package is a panic, not an exit", ok, detail)
+        # The fixed-frame stack's reservation (issue #18): a program's 1 GB, a
+        # library's 64 MB, or --frame-reserve's, which Go alone has.
+        for flags, want in (([], 1 << 30), (["--library"], 64 << 20), (["--frame-reserve", "2M"], 2 << 20),
+                            (["--library", "--frame-reserve", "1G"], 1 << 30)):
+            code, o, e = self.goose("--target=go", *flags, "-o", gofile, hello)
+            text = gofile.read_text(encoding="utf-8") if gofile.exists() else ""
+            check(f"--target=go {' '.join(flags)} reserves {want} bytes of fixed-frame stack".replace("  ", " "),
+                  code == 0 and f"\n\tgsFrameReserve = {want}\n" in text, o + e)
+        for flags, why in ((["--target=go", "--frame-reserve", "32K"], "--frame-reserve takes a size"),
+                           (["--target=go", "--frame-reserve", "lots"], "--frame-reserve takes a size"),
+                           (["--frame-reserve", "1M"], "are for --target=go")):
+            code, o, e = self.goose(*flags, "-o", self.work / "cli-frame.c", hello)
+            check(f"{' '.join(flags)} is refused", code == 1 and why in e, f"exit {code}\n{o}{e}")
+        # Frames that outgrow it are the overflow C reports of its native
+        # stack: a recursion holding 6 KB in each frame, at 64 KB.
+        code, o, e = self.goose("run", "--target=go", "--frame-reserve", "64K", progs / "large_cycle_locals.goose")
+        check("--frame-reserve 64K: frames past it are a native call stack overflow",
+              code == 1 and not o and e == "goose runtime error: native call stack overflow\n",
+              f"exit {code}\n{o}{e}")
         # The runtime's configuration in the forms C reads a -D in: the Go is
         # sized by the value itself, and both reports give it. One the
         # compiler cannot read stops a Go compile, which no C compiler reads.
