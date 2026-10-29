@@ -104,6 +104,7 @@ struct GoOptions {
     bool debug = false;        // --debug, or -DGS_DEBUG=1.
     bool stackstats = false;   // -DGS_STACK_STATS=1: report the stacks taken as main ends.
     CodeGen::StackConfig stacks { 0, 0, 0, 0 };   // As main.cpp's StackConfigOf reads them.
+    uint64_t framereserve = 0;  // --frame-reserve; 0 for the default (CodeGenGo::FrameReserve).
     // The --include files, Go source spliced into the file (codegen_go_export.h):
     // the name its //line directive gives each, and its text.
     struct Include {
@@ -1071,6 +1072,15 @@ struct CodeGenGo {
     vector<string> gstkorder;
     void InitGlobalStack(VarDef *d);
     void EmitProgram();
+    // The address space each block's fixed-frame stack reserves
+    // (gsFrameReserve, DESIGN.md §3.6): --frame-reserve's, or a program's 1 GB,
+    // the most Go grows a goroutine's stack to, or a library's 64 MB, where a
+    // host may hold a block for every goroutine calling it: its calls' frames
+    // hold some of the locals C keeps on its host's native stack, of 8 MB by
+    // default on Linux.
+    uint64_t FrameReserve() const {
+        return opts.framereserve ? opts.framereserve : opts.library ? 64ull << 20 : 1ull << 30;
+    }
     string Source(const string &srcname);
 
     CodeGenGo(Ast &_ast, const GoOptions &o) : ast(_ast), opts(o) {

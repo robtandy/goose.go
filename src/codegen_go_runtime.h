@@ -49,9 +49,9 @@ type GsStackBlock struct {
 	gap     int64
 }
 
-// The fixed-frame stack's reservation: address space only, as the data
-// stacks' is, whatever their own (C's frames are on its native stack).
-const gsFrameReserve = 1 << 30
+// The fixed-frame stack's reservation is gsFrameReserve, a configuration
+// constant (--frame-reserve): address space only, as the data stacks' is,
+// whatever their own (C's frames are on its native stack).
 
 // How many times the runtime has mapped memory (gsMap): a library's package
 // maps none until the first call of an entry point starts it (issue #18).

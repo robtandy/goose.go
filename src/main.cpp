@@ -689,6 +689,10 @@ R"(  --stats               Print what the compile did: the declarations parsed,
                         for a library).
   --library             With --target=go, a package with no func main, for
                         a Go program to use: fn main() is optional.
+  --frame-reserve size  With --target=go, the address space each block of
+                        data stacks reserves for its fixed-frame stack, from
+                        64K, with a K, M, G or T suffix (default 1G, or 64M
+                        for a library).
 )";
 
 constexpr const char *DEBUGOPTION =
@@ -1380,6 +1384,7 @@ int Main(int argc, char **argv) {
     // The backend (--target): "c", "go", or "" for the one -o's name implies.
     string target, gopackage;
     auto golibrary = false;
+    uint64_t goframereserve = 0;
     // The inlining at its highest. The C compiler optimizes whatever the
     // level, unless --debug (Builder::CFlags).
     auto optlevel = 2;
@@ -1514,6 +1519,17 @@ int Main(int argc, char **argv) {
             }
         }
         else if (arg == "--library") golibrary = true;
+        else if (arg == "--frame-reserve" && i + 1 < argc) {
+            // As --stack-reserve's: the runtime halves a reservation the
+            // platform refuses, down to 1 MB.
+            if (!ParseSize(argv[++i], goframereserve) || goframereserve < (64ull << 10) ||
+                goframereserve > (1ull << 48)) {
+                fprintf(stderr, "--frame-reserve takes a size from 64 KB to 256 TB, with an optional K, M, G "
+                                "or T suffix: %s\n",
+                        argv[i]);
+                return 1;
+            }
+        }
         else if (arg == "--update") package_update = true;
         else if (arg == "--offline") package_nofetch = true;
         else if (arg == "--dump-docs") dumpdocs = true;
@@ -1598,8 +1614,8 @@ int Main(int argc, char **argv) {
     auto gotarget = target == "go" ||
                     (target.empty() && verb != "build" && outname.size() > 3 &&
                      outname.compare(outname.size() - 3, 3, ".go") == 0);
-    if (!gotarget && (!gopackage.empty() || golibrary)) {
-        fprintf(stderr, "--go-package and --library are for --target=go\n");
+    if (!gotarget && (!gopackage.empty() || golibrary || goframereserve)) {
+        fprintf(stderr, "--go-package, --library and --frame-reserve are for --target=go\n");
         return 1;
     }
     if (gotarget && !headername.empty()) {
@@ -1797,6 +1813,7 @@ int Main(int argc, char **argv) {
                 (name == "GS_DEBUG" ? go.debug : go.stackstats) = v != 0;
             }
             go.stacks = stackcfg;
+            go.framereserve = goframereserve;
             // Named relative to the Go, as the C names its headers, where -o
             // writes it, and absolute where a build or a run does, in its
             // build directory: Go reads a //line directive's relative name

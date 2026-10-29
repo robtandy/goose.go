@@ -1120,10 +1120,11 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "package ", opts.package, "\n\n"
                    "import (\n", imps, ")\n\n"
                    "// The runtime configuration the program was compiled with (--stack-reserve,\n"
-                   "// -D GS_STACK_RESERVE, -D GS_STACK_GAP), and whether it is a library\n"
-                   "// (--library), which never exits the process: its host's.\n"
+                   "// -D GS_STACK_RESERVE, -D GS_STACK_GAP, --frame-reserve), and whether it is a\n"
+                   "// library (--library), which never exits the process: its host's.\n"
                    "const (\n\tgsStackReserve = ", opts.stacks.reserve,
                    "\n\tgsStackGap     = ", opts.stacks.gap,
+                   "\n\tgsFrameReserve = ", FrameReserve(),
                    "\n\tgsLibrary      = ", opts.library ? "true" : "false", "\n)\n\n");
     for (auto part : go_runtime_prologue) s += part;
     if (usesos) {
