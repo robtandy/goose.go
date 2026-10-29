@@ -933,9 +933,11 @@ inline void CodeGenGo::InitGlobalStack(VarDef *d) {
 
 // The program's entry: once every function is emitted, the counts are
 // final, and main reserves the main program's data stacks, initializes the
-// globals and runs fn main(). A library has no main: its package's init
-// initializes the globals, and only those. The Go program that imports it
-// runs instead of its fn main(), if it has one.
+// globals and runs fn main(). A library has no main, and no init: the first
+// call of an export fn's entry point starts it (gsLibStart, issue #18),
+// which initializes the globals, and only those, on the package's block,
+// so that importing the package does nothing. The Go program that imports
+// it runs instead of its fn main(), if it has one.
 inline void CodeGenGo::EmitProgram() {
     BoundStacksOf(*this);
     auto mainstacks = ProgramStacksOf(*this, MainRootsOf(*this));
@@ -976,12 +978,44 @@ inline void CodeGenGo::EmitProgram() {
     // the export fns' entry points copy their globals from.
     string inst;
     if (workers) inst = "\tgs.Gl = unsafe.Pointer(&gsGlobalsMain)\n\tgsMainBlock = gs\n";
-    Append(code, opts.library ? "func init() {\n" : "func main() {\n",
-           "\tdefer GsExitOnAbort()\n"
-           "\tdebug.SetPanicOnFault(true)\n"
-           "\tgsRtStart(", opts.stacks.budget, ", ", mainstacks + globalregions, ", ", workerregions, ")\n"
-           "\tgs := NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n",
-           inst, "\tgsInitGlobals(gs)\n", call, stats, "}\n");
+    auto start = cat("\tgsRtStart(", opts.stacks.budget, ", ", mainstacks + globalregions, ", ", workerregions, ")\n"
+                     "\tgs := NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n",
+                     inst, "\tgsInitGlobals(gs)\n");
+    if (!opts.library) {
+        Append(code, "func main() {\n"
+                     "\tdefer GsExitOnAbort()\n"
+                     "\tdebug.SetPanicOnFault(true)\n",
+               start, call, stats, "}\n");
+    } else {
+        // The host owns the process, its goroutines' fault handling and its
+        // memory: the start runs on the goroutine of the call that makes it,
+        // turns panic on fault on for itself only, and never exits the
+        // process. A start that panics leaves what it panicked with for every
+        // call.
+        Append(code, "// The library's start (issue #18), which the first call of an export fn's\n"
+                     "// entry point makes (gsLibStart), once, rather than the package's init: the\n"
+                     "// runtime, the package's block and the globals. Importing the package maps\n"
+                     "// no memory, sets no goroutine's fault handling and runs no initializer.\n"
+                     "// Where the start panics, an abort of an initializer's included, it exits\n"
+                     "// no process: that call and every later one panic with what it did, a\n"
+                     "// *GsError for an abort.\n"
+                     "var gsLib struct {\n\tonce sync.Once\n\tok   uint32 // 1 once the start has completed, read atomically.\n"
+                     "\tfail any    // What it panicked with where it did not.\n}\n\n"
+                     "// gsLibStart makes sure the library has started: once it has, an atomic\n"
+                     "// load, which keeps the smallest entry points within what Go inlines.\n"
+                     "func gsLibStart() {\n\tif atomic.LoadUint32(&gsLib.ok) == 0 {\n\t\tgsLibStartSlow()\n\t}\n}\n\n"
+                     "// gsLibStartSlow starts the library where no call has yet, or waits for\n"
+                     "// the call that is, and panics as the start did where that failed.\n"
+                     "func gsLibStartSlow() {\n\tgsLib.once.Do(gsLibInit)\n\tif atomic.LoadUint32(&gsLib.ok) == 0 {\n"
+                     "\t\tpanic(gsLib.fail)\n\t}\n}\n\n"
+                     "// gsLibInit is the start, on the goroutine of the call making it, whose\n"
+                     "// panic on fault it turns on for the start only.\n"
+                     "func gsLibInit() {\n"
+                     "\tdefer func() {\n\t\tif atomic.LoadUint32(&gsLib.ok) == 0 {\n"
+                     "\t\t\tgsLib.fail = gsAbortOf(recover())\n\t\t\tpanic(gsLib.fail)\n\t\t}\n\t}()\n"
+                     "\tdefer debug.SetPanicOnFault(debug.SetPanicOnFault(true))\n",
+               start, "\tatomic.StoreUint32(&gsLib.ok, 1)\n}\n");
+    }
     // Every body is emitted, and the counts are final: the export fns' entry
     // points can say what they hand on.
     ComputeGsNeeds();
@@ -1068,7 +1102,8 @@ inline string CodeGenGo::Source(const string &srcname) {
             if (ip == path && in == nm) return;
         imports.push_back({ nm, path });
     };
-    for (auto p : { "math", "os", "runtime", "runtime/debug", "strconv", "sync", "syscall", "unsafe" }) add("", p);
+    for (auto p : { "math", "os", "runtime", "runtime/debug", "strconv", "sync", "sync/atomic", "syscall", "unsafe" })
+        add("", p);
     if (usesbits) add("", "math/bits");
     if (usesos)
         for (auto p : { "bytes", "io", "path/filepath", "strings", "time" }) add("", p);
@@ -1085,9 +1120,11 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "package ", opts.package, "\n\n"
                    "import (\n", imps, ")\n\n"
                    "// The runtime configuration the program was compiled with (--stack-reserve,\n"
-                   "// -D GS_STACK_RESERVE, -D GS_STACK_GAP).\n"
+                   "// -D GS_STACK_RESERVE, -D GS_STACK_GAP), and whether it is a library\n"
+                   "// (--library), which never exits the process: its host's.\n"
                    "const (\n\tgsStackReserve = ", opts.stacks.reserve,
-                   "\n\tgsStackGap     = ", opts.stacks.gap, "\n)\n\n");
+                   "\n\tgsStackGap     = ", opts.stacks.gap,
+                   "\n\tgsLibrary      = ", opts.library ? "true" : "false", "\n)\n\n");
     for (auto part : go_runtime_prologue) s += part;
     if (usesos) {
         Append(s, "\n// os.resource_dir's directory where it is not the executable's: the entry\n"

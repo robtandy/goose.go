@@ -53,6 +53,19 @@ type GsStackBlock struct {
 // stacks' is, whatever their own (C's frames are on its native stack).
 const gsFrameReserve = 1 << 30
 
+// How many times the runtime has mapped memory (gsMap): a library's package
+// maps none until the first call of an entry point starts it (issue #18).
+var gsMaps atomic.Int64
+
+// gsMap maps n bytes of zeroed memory outside the Go heap, for a region, a
+// fixed-frame stack or a program instance: address space only, which the
+// OS commits page by page as it is touched.
+func gsMap(n int64) ([]byte, error) {
+	gsMaps.Add(1)
+	return syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+}
+
 // The smallest a region gets before a refusal is fatal, and the usable size
 // new regions currently get: it halves, in whole pages, each time the
 // platform refuses one (gs_reserve_region).
@@ -125,8 +138,7 @@ func ReleaseStackBlock(gs *GsStackBlock) {
 func (gs *GsStackBlock) reserveFrame() {
 	n := int64(gsFrameReserve)
 	for {
-		r, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
-			syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+		r, err := gsMap(n)
 		if err == nil {
 			gs.frame = r
 			gs.FrameBase = unsafe.Pointer(unsafe.SliceData(r))
@@ -221,8 +233,7 @@ func gsMapPrivate(n int64) []byte {
 	if n == 0 {
 		n = page
 	}
-	m, err := syscall.Mmap(-1, 0, int(n), syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+	m, err := gsMap(n)
 	if err != nil {
 		GsPanic("out of memory copying globals")
 	}
@@ -288,21 +299,35 @@ func gsOverflowText(usable, reserve int64, who string) string {
 	return msg + "; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, up to 256 TB"
 }
 
-// gsFault is the report of a fault at addr, where it lies in a region's
-// guard gap: a data stack grown past its region with no check on the way,
-// as a push grows it (gs_fault_handler). "" for any other address.
-func gsFault(addr uintptr) string {
+// gsFault is the error of a fault at addr, where it lies in the guard gap
+// of a block's region (NewStackBlock): a data stack grown past its region
+// with no check on the way, as a push grows it (gs_fault_handler). nil for
+// any other address.
+func gsFault(addr uintptr) *GsError {
 	gsBlocksMu.Lock()
 	defer gsBlocksMu.Unlock()
 	for _, b := range gsBlocks {
 		for k, r := range b.regions {
 			base := uintptr(unsafe.Pointer(unsafe.SliceData(r)))
 			if addr-base < uintptr(len(r)) {
-				return "goose runtime error: " + gsOverflowText(b.Cap[k], b.reserve, b.gsWho())
+				return &GsError{Msg: gsOverflowText(b.Cap[k], b.reserve, b.gsWho())}
 			}
 		}
 	}
-	return ""
+	return nil
+}
+
+// gsAbortOf is what a goroutine running Goose code recovered, r, as the
+// runtime reports it: a fault in a guard gap, which the goroutine's panic
+// on fault (debug.SetPanicOnFault) made a panic, as the *GsError of the
+// overflow (gsFault), and anything else as it is.
+func gsAbortOf(r any) any {
+	if f, ok := r.(interface{ Addr() uintptr }); ok {
+		if e := gsFault(f.Addr()); e != nil {
+			return e
+		}
+	}
+	return r
 }
 
 // gsSize is a size as the C runtime writes one (gs_size): a whole number of
@@ -385,8 +410,7 @@ func gsReserveRegion(reserve, gap int64) ([]byte, int64) {
 		usable = gsRegionUsable
 	}
 	for {
-		r, err := syscall.Mmap(-1, 0, int(usable+gap), syscall.PROT_READ|syscall.PROT_WRITE,
-			syscall.MAP_ANON|syscall.MAP_PRIVATE|syscall.MAP_NORESERVE)
+		r, err := gsMap(usable + gap)
 		if err == nil {
 			if gap > 0 {
 				if err := syscall.Mprotect(r[usable:], syscall.PROT_NONE); err != nil {
@@ -408,7 +432,9 @@ func gsReserveRegion(reserve, gap int64) ([]byte, int64) {
 // ---------------------------------------------------------------------------
 // Aborts (§9.3). A failed check panics with a *GsError, which the program's
 // main recovers (GsExitOnAbort): the message on stderr, as the C runtime
-// words it, and exit status 1.
+// words it, and exit status 1. A library never exits the process, which is
+// its host's (gsLibrary): there an abort, and exit(), stay the *GsError's
+// panic, which the caller of an export fn's entry point may recover.
 
 // The error ids of GsAbort, numbered as the C runtime's GS_E_* are.
 const (
@@ -485,14 +511,13 @@ func GsExitOnAbort() {
 
 // gsEndOnPanic ends the process for what a thread program's goroutine
 // recovered, as GsExitOnAbort has it; a panic of no runtime error goes on.
+// A library's goes on as the runtime error's *GsError (gsAbortOf): on a
+// worker's goroutine, which the runtime started, no host recovers it, and
+// it ends the process as any goroutine's unrecovered panic does.
 func gsEndOnPanic(r any) {
-	if e, ok := r.(*GsError); ok {
+	r = gsAbortOf(r)
+	if e, ok := r.(*GsError); ok && !gsLibrary {
 		gsEnd(1, e.Error()+"\n")
-	}
-	if f, ok := r.(interface{ Addr() uintptr }); ok {
-		if msg := gsFault(f.Addr()); msg != "" {
-			gsEnd(1, msg+"\n")
-		}
 	}
 	panic(r)
 }
@@ -505,7 +530,8 @@ var gsEnding struct {
 	on bool
 }
 
-// gsEnd ends the process with code, msg on stderr first.
+// gsEnd ends the process with code, msg on stderr first: a program's, never
+// a library's (gsLibrary).
 func gsEnd(code int, msg string) {
 	gsEnding.Lock()
 	if gsEnding.on {
@@ -541,8 +567,14 @@ func GsAbortSlice(msg GsSlice, file string, line int) {
 }
 
 // GsExit is exit(code): the process ends at once, with that status, from
-// whichever thread program calls it (gs_exit).
-func GsExit(code int64) { gsEnd(int(code), "") }
+// whichever thread program calls it (gs_exit). A library's leaves the
+// process to its host: it panics with a *GsError naming the status.
+func GsExit(code int64) {
+	if gsLibrary {
+		panic(&GsError{Msg: "exit(" + strconv.FormatInt(code, 10) + ")"})
+	}
+	gsEnd(int(code), "")
+}
 
 // GsUnreachable is what a function panics with where control cannot get to
 // the end of it, which the checker found: a compiler bug if it does.
