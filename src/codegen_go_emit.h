@@ -1049,6 +1049,135 @@ inline void CodeGenGo::ResolveGsArgs() {
     fill(eqcode);
 }
 
+// --go-build's expression in go/build/constraint's syntax -- tags (letters,
+// digits, _ and .) under !, && and ||, and parentheses -- into canon as
+// gofmt writes a //go:build line, which parenthesizes an && inside an ||
+// and an || inside an && (constraint.Expr's String); false, with why,
+// where it is not one.
+static bool GoBuildConstraint(string_view text, string &canon, string &why) {
+    struct Parser {
+        string_view s;
+        size_t i = 0;
+        string_view tok;
+        bool istag = false;
+        string err;
+        int size = 0;
+        struct Expr {
+            char op;   // t a tag, ! not, & and, | or
+            string_view tag;
+            int x, y;
+        };
+        vector<Expr> e;
+        int Fail(string m) {
+            if (err.empty()) err = std::move(m);
+            tok = {};
+            istag = false;
+            return -1;
+        }
+        int New(char op, int x, int y, string_view tag = {}) {
+            if (!err.empty()) return -1;
+            e.push_back({ op, tag, x, y });
+            return (int)e.size() - 1;
+        }
+        void Lex() {
+            istag = false;
+            while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+            if (i >= s.size()) {
+                tok = {};
+                return;
+            }
+            auto c = s[i];
+            if (c == '(' || c == ')' || c == '!') {
+                tok = s.substr(i++, 1);
+                return;
+            }
+            if (c == '&' || c == '|') {
+                if (i + 1 >= s.size() || s[i + 1] != c) {
+                    Fail(cat("invalid syntax at ", string(1, c)));
+                    return;
+                }
+                tok = s.substr(i, 2);
+                i += 2;
+                return;
+            }
+            auto b = i;
+            while (i < s.size() && (isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '.' ||
+                                    (unsigned char)s[i] >= 0x80))
+                i++;
+            if (i == b) {
+                Fail((unsigned char)c < 32 ? string("invalid syntax at a control character")
+                                           : cat("invalid syntax at ", string(1, c)));
+                return;
+            }
+            tok = s.substr(b, i - b);
+            istag = true;
+        }
+        int Or() {
+            auto x = And();
+            while (err.empty() && tok == "||") x = New('|', x, And());
+            return x;
+        }
+        int And() {
+            auto x = Not();
+            while (err.empty() && tok == "&&") x = New('&', x, Not());
+            return x;
+        }
+        int Not() {
+            if (++size > 1000) return Fail("build expression too large");
+            Lex();
+            if (!err.empty()) return -1;
+            if (tok == "!") {
+                Lex();
+                if (tok == "!") return Fail("double negation not allowed");
+                auto x = Atom();
+                return New('!', x, -1);
+            }
+            return Atom();
+        }
+        int Atom() {
+            if (!err.empty()) return -1;
+            if (tok == "(") {
+                auto x = Or();
+                if (err == "unexpected end of expression") err = "missing close paren";
+                if (!err.empty()) return -1;
+                if (tok != ")") return Fail("missing close paren");
+                Lex();
+                return x;
+            }
+            if (!istag) return Fail(tok.empty() ? string("unexpected end of expression") : cat("unexpected token ", tok));
+            auto t = tok;
+            Lex();
+            return New('t', -1, -1, t);
+        }
+        string Text(int x) const {
+            auto &n = e[x];
+            auto arg = [&](int k, char paren) {
+                auto a = Text(k);
+                return e[k].op == paren ? cat("(", a, ")") : a;
+            };
+            switch (n.op) {
+                case 't': return string(n.tag);
+                case '!': {
+                    auto a = Text(n.x);
+                    return cat("!", e[n.x].op == '&' || e[n.x].op == '|' ? cat("(", a, ")") : a);
+                }
+                case '&': return cat(arg(n.x, '|'), " && ", arg(n.y, '|'));
+                default: return cat(arg(n.x, '&'), " || ", arg(n.y, '&'));
+            }
+        }
+    };
+    Parser p;
+    p.s = text;
+    auto x = p.Or();
+    if (p.err.empty() && !p.tok.empty()) p.Fail(cat("unexpected token ", p.tok));
+    if (!p.err.empty()) {
+        why = p.err;
+        return false;
+    }
+    canon = p.Text(x);
+    return true;
+}
+
 // An --include file's Go as the generated file holds it, its package clause
 // and imports gone (GoSplitInclude): each run of lines between blank ones
 // under a //line directive naming the file and the run's first line, which
@@ -1177,9 +1306,10 @@ static string GoIncludeLines(const string &name, const string &body) {
     return out;
 }
 
-// The whole file: a header Go tools know generated code by, the package,
-// the imports, the runtime configuration and the runtime, then the program,
-// laid out as gofmt lays it out (GoFormat), and the --include files.
+// The whole file: a build constraint where --go-build gives one, a header
+// Go tools know generated code by, the package, the imports, the runtime
+// configuration and the runtime, then the program, laid out as gofmt lays
+// it out (GoFormat), and the --include files.
 inline string CodeGenGo::Source(const string &srcname) {
     // Go source is UTF-8 throughout, comments included: the file's name as
     // printable ASCII.
@@ -1209,7 +1339,8 @@ inline string CodeGenGo::Source(const string &srcname) {
     });
     string imps;
     for (auto &[n, p] : imports) Append(imps, "\t", n, n.empty() ? "" : " ", GoStr(p), "\n");
-    string s = cat("// Code generated by the Goose compiler from ", name, ". DO NOT EDIT.\n"
+    string s = cat(opts.build.empty() ? "" : cat("//go:build ", opts.build, "\n\n"),
+                   "// Code generated by the Goose compiler from ", name, ". DO NOT EDIT.\n"
                    "//\n"
                    "// Names from the program carry a _g suffix, which keeps them clear of Go's\n"
                    "// keywords and of the runtime's gs and Gs names; a namespaced name ns::x is\n"

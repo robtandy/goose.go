@@ -105,6 +105,7 @@ static bool GoSplitInclude(const string &text, vector<pair<string, string>> &imp
 // What the driver hands the Go backend.
 struct GoOptions {
     string package = "main";   // --go-package.
+    string build;              // --go-build: the //go:build expression, as gofmt writes it.
     bool library = false;      // A package without func main (--library).
     bool debug = false;        // --debug, or -DGS_DEBUG=1.
     bool stackstats = false;   // -DGS_STACK_STATS=1: report the stacks taken as main ends.
