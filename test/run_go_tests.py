@@ -700,6 +700,7 @@ class Runner:
         default_exe = REPO / "build" / f"goose{tc.EXE_SUFFIX}"
         self.exe = tc.find_goose(args.exe or (str(default_exe) if default_exe.exists() else None))
         self.go = os.environ.get("GOOSE_GO") or shutil.which("go")
+        self.gofmt = None
         self.verbose = args.verbose
         self.bless = args.bless
         self.work = Path(args.workdir).resolve() if args.workdir else \
@@ -730,6 +731,26 @@ class Runner:
         r = subprocess.run([self.go] + [str(a) for a in args], cwd=self.work, env=go_env(),
                            capture_output=True)
         return r.returncode, tc.decode(r.stdout), tc.decode(r.stderr)
+
+    def find_gofmt(self):
+        """gofmt, of the go tool's own toolchain (GOROOT/bin), else on PATH."""
+        code, o, _ = self.gotool("env", "GOROOT")
+        if code == 0 and o.strip():
+            p = Path(o.strip()) / "bin" / f"gofmt{tc.EXE_SUFFIX}"
+            if p.exists():
+                return str(p)
+        return shutil.which("gofmt")
+
+    def gofmt_clean(self, gofile):
+        """None where `gofmt -l` finds nothing to change in gofile (issue
+        #20), else what `gofmt -d` would change, its first lines."""
+        r = subprocess.run([self.gofmt, "-l", str(gofile)], capture_output=True)
+        listed = tc.decode(r.stdout).strip()
+        if r.returncode == 0 and not listed:
+            return None
+        d = subprocess.run([self.gofmt, "-d", str(gofile)], capture_output=True)
+        text = tc.decode(d.stdout) + tc.decode(d.stderr) + tc.decode(r.stderr)
+        return "\n".join(text.splitlines()[:40])
 
     # --- reporting -----------------------------------------------------------
 
@@ -779,6 +800,10 @@ class Runner:
         code, o, e = self.gotool("vet", gofile.name)
         if code != 0 or (o + e).strip():
             out.append(("fail", f"go vet {name}", o + e))
+            return None
+        diff = self.gofmt_clean(gofile)
+        if diff is not None:
+            out.append(("fail", f"gofmt -l {name}", diff))
             return None
         code, o, e = self.gotool("build", "-o", exe.name, gofile.name)
         if code != 0:
@@ -1268,6 +1293,11 @@ class Runner:
             if code != 0:
                 out.append(("fail", f"{label}: goose --target=go", o + e))
                 continue
+            diff = self.gofmt_clean(mod / f"{name}.go")
+            if diff is not None:
+                out.append(("fail", f"{label}: gofmt -l", diff))
+                continue
+            out.append(("ok", f"{label}: gofmt -l", None))
             for t in tests:
                 shutil.copy(t, mod / t.name)
             r = subprocess.run([self.go, "mod", "init", f"goosetest/{name}"], cwd=mod, env=go_env(),
@@ -1315,6 +1345,8 @@ class Runner:
         if code == 0:
             vc, vo, ve = self.gotool("vet", gofile.name)
             check("--library vets", vc == 0 and not (vo + ve).strip(), vo + ve)
+            diff = self.gofmt_clean(gofile)
+            check("--library is laid out as gofmt lays it out", diff is None, diff or "")
         # A Go program that imports a library: the package's init
         # initializes the globals, and the library's fn main() never runs.
         host = self.work / "cli-host"
@@ -1365,7 +1397,11 @@ class Runner:
         # export fns and no main make a library, with each export's Go entry
         # points (issue #5).
         libsrc = self.work / "cli-exports.goose"
-        tc.write_text(libsrc, 'export fn twice(x: i64) -> i64 { x * 2 }\n'
+        # A doc comment of lines go/doc/comment would lay out otherwise -- an
+        # indented one, which it makes code, a blank one, a directive -- is
+        # its text, as gofmt leaves it (issue #20).
+        tc.write_text(libsrc, '// Twice x.\n//\n//     an indented line\n//no space after the slashes\n'
+                              '//go:noinline\nexport fn twice(x: i64) -> i64 { x * 2 }\n'
                               'export "parse_count" fn count(s: const u8[:]) -> i64 { s.len }\n')
         code, o, e = self.goose("--target=go", "-o", gofile, libsrc)
         text = gofile.read_text(encoding="utf-8") if gofile.exists() else ""
@@ -1377,6 +1413,8 @@ class Runner:
         if code == 0:
             vc, vo, ve = self.gotool("vet", gofile.name)
             check("the export library vets", vc == 0 and not (vo + ve).strip(), vo + ve)
+            diff = self.gofmt_clean(gofile)
+            check("the export library is laid out as gofmt lays it out", diff is None, diff or "")
         # --include with --target=go is Go: a file whose extern fn the
         # program calls, its imports merged, its errors named in its own
         # lines (//line).
@@ -1398,19 +1436,109 @@ class Runner:
               f"exit {code}\n{o}{e}")
         code, o, e = self.goose("--target=go", "--include", helper, "-o", incdir / "out.go", incsrc)
         text = (incdir / "out.go").read_text(encoding="utf-8") if (incdir / "out.go").exists() else ""
-        check("--include's //line names the file", code == 0 and "\n//line helper.go:1\n" in text and
-              "//go:build" not in text, o + e)
+        # Each run of the file's lines under a //line directive naming it and
+        # the run's line (issue #20), its imports among the file's own.
+        check("--include's //line directives name the file and each run's line",
+              code == 0 and "\n//line helper.go:10\nfunc shout(" in text and
+              "\n//line helper.go:14\nfunc goHalf(" in text and "//go:build" not in text and
+              '\n\t"os"\n\t"path/filepath"\n' not in text and '\n\t"os"\n\t"runtime"\n' in text and
+              '\n\t"strconv"\n\t"strings"\n\t"sync"\n' in text, o + e)
+        if code == 0:
+            diff = self.gofmt_clean(incdir / "out.go")
+            check("a file with an --include is laid out as gofmt lays it out", diff is None, diff or "")
         bad = incdir / "bad.go"
-        tc.write_text(bad, 'package main\n\nfunc shout(gs *GsStackBlock, s GsSlice, out GsRref) {\n'
+        tc.write_text(bad, 'package main\n\n// shout is wrong, on line 7, past a blank line.\n'
+                           'func shout(gs *GsStackBlock, s GsSlice, out GsRref) {\n\t_ = gs\n\n'
                            '\tvar n int = "not an int"\n\t_ = n\n}\n\nfunc goHalf(x int64) int64 { return x }\n')
         code, o, e = self.goose("run", "--target=go", "--include", bad, incsrc)
-        check("an --include file's Go error names its line", code != 0 and "bad.go:4" in o + e,
+        check("an --include file's Go error names its line", code != 0 and "bad.go:7:" in o + e,
               f"exit {code}\n{o}{e}")
+        # What runtime.Caller reports in an --include file's Go, and a panic's
+        # frames there, name the file's own lines, past the blank lines gofmt
+        # collapses and the comments it lays out.
+        wsrc = incdir / "where.goose"
+        tc.write_text(wsrc, 'extern fn where_am_i() -> i64 = "goWhere";\n'
+                            'extern fn boom(x: i64) -> i64 = "goBoom";\n\n'
+                            'fn main() {\n    print(where_am_i());\n    print(boom(1));\n}\n')
+        where = incdir / "where.go"
+        tc.write_text(where, '//go:build ignore\n\n'
+                             '// The --include file of a check of positions: runtime.Caller and a panic\n'
+                             '// name its own lines.\n'
+                             'package main\n\nimport (\n\t"runtime"\n\t"strings"\n)\n\n\n\n'
+                             '// goWhere reports the line it asks runtime.Caller about, 19.\n'
+                             'func goWhere() int64 {\n\tn := int64(0)\n\n\n'
+                             '\t_, file, line, _ := runtime.Caller(0)\n'
+                             '\tif !strings.HasSuffix(file, "where.go") {\n\t\treturn n - 1\n\t}\n'
+                             '\treturn n + int64(line)\n}\n\n'
+                             '/* goBoom panics on line 30. */\n'
+                             'func goBoom(x int64) int64 {\n\tif x > 0 {\n\n'
+                             '\t\tpanic("boom from the include")\n\t}\n\treturn x\n}\n')
+        code, o, e = self.goose("run", "--target=go", "--include", where, wsrc)
+        check("runtime.Caller and a panic in an --include file name its lines",
+              code == 2 and o == "19\n" and "panic: boom from the include" in e and
+              re.search(r"/where\.go:30\b", e) is not None,
+              f"exit {code}\n{o}{e}")
+        code, o, e = self.goose("--target=go", "--include", where, "-o", incdir / "where-out.go", wsrc)
+        if code == 0:
+            diff = self.gofmt_clean(incdir / "where-out.go")
+            check("an --include file's doc comments and runs are laid out as gofmt lays them out",
+                  diff is None, diff or "")
+        else:
+            check("goose --target=go --include where.go", False, o + e)
         code, o, e = self.goose("--target=go", "--include", incdir / "shout.h", incsrc)
         check("--target=go refuses an --include that is not Go",
               code == 1 and "an --include file is Go source" in e, f"exit {code}\n{o}{e}")
         code, o, e = self.goose("--go-package", "geese", "-o", self.work / "cli.c", hello)
         check("--go-package needs --target=go", code == 1, o + e)
+        # --go-build: the file starts with the build constraint, which go
+        # build, building the file's package, honors (issue #20).
+        bdir = self.work / "cli-gobuild"
+        shutil.rmtree(bdir, ignore_errors=True)
+        bdir.mkdir(parents=True)
+        bfile = bdir / "main.go"
+        code, o, e = self.goose("--target=go", "--go-build", "goose_x", "-o", bfile, hello)
+        text = bfile.read_text(encoding="utf-8") if bfile.exists() else ""
+        check("--go-build goose_x starts the file with //go:build goose_x",
+              code == 0 and text.startswith("//go:build goose_x\n\n// Code generated by the Goose compiler"),
+              o + e)
+        if code == 0:
+            diff = self.gofmt_clean(bfile)
+            check("--go-build's file is laid out as gofmt lays it out", diff is None, diff or "")
+            r = subprocess.run([self.go, "mod", "init", "goosebuild"], cwd=bdir, env=go_env(),
+                               capture_output=True)
+            check("go mod init for --go-build", r.returncode == 0, tc.decode(r.stderr))
+            r = subprocess.run([self.go, "build", "-o", "untagged", "."], cwd=bdir, env=go_env(),
+                               capture_output=True)
+            check("go build skips a --go-build goose_x file without -tags goose_x",
+                  r.returncode != 0 and "build constraints exclude all Go files" in tc.decode(r.stderr),
+                  f"exit {r.returncode}\n{tc.decode(r.stdout)}{tc.decode(r.stderr)}")
+            r = subprocess.run([self.go, "build", "-tags", "goose_x", "-o", "tagged", "."], cwd=bdir,
+                               env=go_env(), capture_output=True)
+            detail = f"exit {r.returncode}\n{tc.decode(r.stdout)}{tc.decode(r.stderr)}"
+            ok = r.returncode == 0
+            if ok:
+                rc, ro, re_ = tc.run_capture([bdir / f"tagged{tc.EXE_SUFFIX}"])
+                ok = rc == 0 and "hello, world" in ro
+                detail = f"exit {rc}\n{ro}{re_}"
+            check("go build -tags goose_x builds a --go-build goose_x file", ok, detail)
+        # The expression as gofmt writes a //go:build line; one that is none
+        # is refused, and so is --go-build where no Go file of its own is
+        # written.
+        code, o, e = self.goose("--target=go", "--go-build", "  linux&&amd64 ||!goose_x", "-o", bfile, hello)
+        text = bfile.read_text(encoding="utf-8") if bfile.exists() else ""
+        check("--go-build writes its expression as gofmt does",
+              code == 0 and text.startswith("//go:build (linux && amd64) || !goose_x\n\n") and
+              self.gofmt_clean(bfile) is None, o + e)
+        for bad_expr, why in (("goose_x &&", "unexpected end of expression"), ("!!goose_x", "double negation"),
+                              ("goose_x\npackage", "invalid syntax"), ("(a || b", "missing close paren")):
+            code, o, e = self.goose("--target=go", "--go-build", bad_expr, "-o", bfile, hello)
+            check(f"--go-build refuses {bad_expr!r}",
+                  code == 1 and "--go-build takes a build constraint" in e and why in e, f"exit {code}\n{o}{e}")
+        code, o, e = self.goose("--go-build", "goose_x", "-o", self.work / "cli.c", hello)
+        check("--go-build needs --target=go", code == 1 and "are for --target=go" in e, o + e)
+        code, o, e = self.goose("run", "--target=go", "--go-build", "goose_x", hello)
+        check("goose run refuses --go-build", code == 1 and "--go-build constrains the Go that -o writes" in e,
+              f"exit {code}\n{o}{e}")
         # goose run --target=go: the program's streams and exit code.
         code, o, e = self.goose("run", "--target=go", exitprog)
         check("goose run --target=go", code == 7 and o == "start\nexiting with 7\n" and not e,
@@ -1477,6 +1605,10 @@ def main():
     r = Runner(args)
     if not r.go:
         print("FAIL: no Go toolchain: put `go` on PATH, or set GOOSE_GO")
+        return 2
+    r.gofmt = r.find_gofmt()
+    if not r.gofmt:
+        print("FAIL: no gofmt beside the Go toolchain, which checks the layout of every file")
         return 2
     _, gover, _ = r.gotool("version")
     print(f"goose: {r.exe}")
