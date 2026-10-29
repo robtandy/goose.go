@@ -20,7 +20,9 @@
 //   values, which they view in place: a u8[:] as a []byte, a const u8[:] as
 //   a string or a []byte, any other T[:] as a []T, a T& as a *T, a scalar
 //   or a fixed-size value as its Go type. A const u8[:] result is a []byte
-//   viewing what the slice does.
+//   viewing what the slice does. In a library, either starts the package at
+//   its first call (gsLibStart). A call on a block turns panic on fault on
+//   for itself only, on its caller's goroutine.
 // * An --include file is Go source: its package clause and build
 //   constraints are dropped, its imports join the generated file's, and the
 //   rest follows the program, under a //line directive naming the file.
@@ -436,6 +438,13 @@ inline void CodeGenGo::EmitExports() {
             Append(doc, l.rfind("//", 0) == 0 ? l : cat("// ", l), "\n");
         }
         if (!doc.empty()) doc = cat("//\n", doc);
+        // A library starts at the first call of either entry point
+        // (gsLibStart, EmitProgram), the pool's before it takes a block. A
+        // call on a block turns panic on fault on for itself only, so that a
+        // fault in a guard gap is a panic on the caller's goroutine, and gives
+        // the caller's setting back as it returns or panics (issue #18).
+        auto start = opts.library ? string("\tgsLibStart()\n") : string();
+        auto faults = takesgs ? string("\tdefer debug.SetPanicOnFault(debug.SetPanicOnFault(true))\n") : string();
         auto stackstext = cat(stacks, stacks == 1 ? " data stack" : " data stacks");
         Append(xcode, "// ", with, " runs ", where, "\n",
                !takesgs ? string("// with no data stacks: it leaves gs alone.\n")
@@ -444,7 +453,7 @@ inline void CodeGenGo::EmitExports() {
                         : string("// on gs, whose fixed-frame stack it gives back as it found it.\n"),
                inst ? "// It runs on gs's program instance, whose globals stay gs's across calls: a copy of\n"
                       "// the package's, made where gs has none (gsEnter).\n" : "",
-               doc, "func ", with, tps, "(", join(params, "gs *GsStackBlock"), ")", retsig, " {\n");
+               doc, "func ", with, tps, "(", join(params, "gs *GsStackBlock"), ")", retsig, " {\n", start, faults);
         if (stacks) Append(xcode, "\tgs.EnsureStacks(", stacks, ")\n");
         else if (!takesgs) xcode += "\t_ = gs\n";
         if (inst) Append(xcode, "\tif gs.Gl == nil {\n\t\t", enterall, "(gs)\n\t}\n");
@@ -454,7 +463,7 @@ inline void CodeGenGo::EmitExports() {
                         : string("// on a block of data stacks from the runtime's pool (AcquireStackBlock), which\n"
                                  "// it gives back as it returns.\n"),
                inst ? "// It runs on a program instance of its own, copied from the package's for the call.\n" : "",
-               doc, "func ", name, tps, "(", join(params, ""), ")", retsig, " {\n");
+               doc, "func ", name, tps, "(", join(params, ""), ")", retsig, " {\n", start);
         if (!takesgs) {
             // Nothing of the block's is used: the function is called itself.
             Append(xcode, "\t", ret(cat(si.name, "(", join(args, ""), ")")), "\n}\n\n");
