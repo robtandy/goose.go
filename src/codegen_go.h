@@ -1,8 +1,11 @@
 // Goose compiler — Go code generation (--target=go). Consumes the same
 // checked, optimized, bounds-checked specializations the C backend does
 // (codegen.h) and emits one Go source file that builds with nothing but the
-// Go standard library: the runtime prologue (codegen_go_runtime.h), then the
-// program.
+// Go standard library: the part of the runtime (runtime/go, which the build
+// embeds: codegen_go_runtime.h) that the program uses, then the program --
+// or with --go-runtime=import, the program alone, importing the runtime's
+// package, and with --go-runtime-file, the runtime in a file of the
+// package's own (DESIGN.md §3.8).
 //
 // Representation (DESIGN.md §3):
 // * Scalars are Go's own types: i8..i64 int8..int64, u8..u64 uint8..uint64,
@@ -102,11 +105,26 @@ struct GoDst {
 static bool GoSplitInclude(const string &text, vector<pair<string, string>> &imports, string &body,
                            string &why);
 
+// Where the runtime a file uses comes from (--go-runtime, codegen_go_runtime.h):
+// the part of it the program uses, written into the file (embed); all of it
+// (full); or the runtime's package, which the file imports (import).
+enum GoRuntimeMode { GO_RT_EMBED, GO_RT_FULL, GO_RT_IMPORT };
+
 // What the driver hands the Go backend.
 struct GoOptions {
     string package = "main";   // --go-package.
     string build;              // --go-build: the //go:build expression, as gofmt writes it.
     bool library = false;      // A package without func main (--library).
+    GoRuntimeMode runtime = GO_RT_EMBED;   // --go-runtime.
+    bool unexported = false;   // --go-unexported: the package exports the entry points alone.
+    bool nowithstack = false;  // --go-no-withstack: no NameWithStack entry points.
+    // --go-runtime-file: the file of the package's runtime, which several
+    // programs of the package share, as the program's file names it; what
+    // it holds where it exists already (runtimeold); and the name of the
+    // program's file, which the program's own names carry in a package of
+    // several (tag, x_tag_g).
+    string runtimefile, runtimeold, tag;
+    bool runtimeexists = false;
     bool debug = false;        // --debug, or -DGS_DEBUG=1.
     bool stackstats = false;   // -DGS_STACK_STATS=1: report the stacks taken as main ends.
     CodeGen::StackConfig stacks { 0, 0, 0, 0 };   // As main.cpp's StackConfigOf reads them.
@@ -128,7 +146,7 @@ struct CodeGenGo {
     bool debug = false;
 
     // Output sections, which Source() assembles after the header and the
-    // runtime prologue.
+    // runtime.
     string filedecls;   // The source file names the aborts report.
     string tdecls;      // The named types of fixed-size values.
     string gdecls;      // Package-level globals.
@@ -1087,7 +1105,26 @@ struct CodeGenGo {
     uint64_t FrameReserve() const {
         return opts.framereserve ? opts.framereserve : opts.library ? 64ull << 20 : 1ull << 30;
     }
+    // Where gsInitGlobals is in `code`, and whether it does nothing: a
+    // library whose globals need no initializing and that spawns no workers
+    // has nothing to start (libstart false, issue #19), and its entry
+    // points call the functions directly.
+    size_t initat = 0, initlen = 0;
+    bool initempty = false, libstart = false;
+    // The export fns' Go entry points, and the names of the types their
+    // signatures name, which a host names too: --go-unexported keeps both
+    // exported. Whether an entry point is a NameWithStack one taking the
+    // block, which a host then makes (AcquireStackBlock).
+    set<string> entrynames, sigtypes;
+    bool hostblocks = false;
+    // The block type a NameWithStack entry point takes, as the file names it.
+    string BlockTypeName() const {
+        return opts.unexported && opts.runtime != GO_RT_IMPORT ? "StackBlock" : "GsStackBlock";
+    }
     string Source(const string &srcname);
+    // With --go-runtime-file, the text of the package's runtime file, which
+    // Source() writes as it writes the program's file.
+    string runtimefiletext;
 
     CodeGenGo(Ast &_ast, const GoOptions &o) : ast(_ast), opts(o) {
         debug = opts.debug;

@@ -15,8 +15,8 @@
 //   (GsBldAppend). Its result is a scalar's or a fixed-size value's.
 // * An export fn has two Go entry points: NameWithStack(gs, ...), which runs
 //   it on the data stacks of a block the caller holds, and Name(...), which
-//   runs it on a block from the runtime's pool (AcquireStackBlock), rewound
-//   and given back as it returns (ReleaseStackBlock). Both take Go's own
+//   runs it on a block from its program's pool (gsProg.AcquireStackBlock),
+//   rewound and given back as it returns. Both take Go's own
 //   values, which they view in place: a u8[:] as a []byte, a const u8[:] as
 //   a string or a []byte, any other T[:] as a []T, a T& as a *T, a scalar
 //   or a fixed-size value as its Go type. A const u8[:] result is a []byte
@@ -49,9 +49,11 @@ static bool GoReservedWord(string_view n) {
 }
 
 // Whether a Go name is free for the program's foreign functions: a Go
-// identifier, no keyword or predeclared name, none of the runtime's (which
-// start with gs or Gs, or are NewStackBlock and the pool's two), and none
-// the generated code gives the program's own (which end in _g and digits).
+// identifier, no keyword or predeclared name, none of the runtime's in any
+// of the forms a file gives them (which start with gs or Gs, or are
+// NewStackBlock and the pool's two, exported or not, or the StackBlock of
+// --go-unexported), and none the generated code gives the program's own
+// (which end in _g and digits).
 static bool GoForeignNameOk(string_view n, string &why) {
     auto ident = !n.empty() && (isalpha((unsigned char)n[0]) || n[0] == '_') &&
                  all_of(n.begin(), n.end(), [](char c) { return isalnum((unsigned char)c) || c == '_'; });
@@ -67,7 +69,7 @@ static bool GoForeignNameOk(string_view n, string &why) {
         why = cat("the Go name ", n, " starts as the Go runtime's names do (gs, Gs)");
         return false;
     }
-    if (n == "NewStackBlock" || n == "AcquireStackBlock" || n == "ReleaseStackBlock") {
+    if (GoRuntimeName(n)) {
         why = cat("the Go name ", n, " is the Go runtime's");
         return false;
     }
@@ -237,6 +239,9 @@ inline bool CodeGenGo::GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a,
     if (GoOsFn(name)) {
         usesos = true;
         auto list = ExternTakesGs(sp) ? string("gs") : string();
+        // os.resource_dir's answer where it is not the executable's
+        // directory, which goose run gives (gsJitResourceDir).
+        if (name == "gs_os_resource_dir") list += ", gsJitResourceDir";
         for (auto &v : a) Append(list, list.empty() ? "" : ", ", v);
         x = cat(GoExportName(name), "(", list, ")");
         return true;
@@ -310,6 +315,21 @@ static string GoExportParam(string_view name, set<string> &taken) {
     return s;
 }
 
+// The names of the types the Go type gt names (its identifiers): a host
+// names them too.
+static void GoTypeNames(const string &gt, set<string> &names) {
+    for (size_t i = 0; i < gt.size();) {
+        if (!(isalpha((unsigned char)gt[i]) || gt[i] == '_')) {
+            i++;
+            continue;
+        }
+        auto j = i;
+        while (j < gt.size() && (isalnum((unsigned char)gt[j]) || gt[j] == '_')) j++;
+        names.insert(gt.substr(i, j - i));
+        i = j;
+    }
+}
+
 // The Go entry points of the program's export fns (DESIGN.md §3.5), into
 // xcode, once the program's data stack counts are known and which
 // functions take the block: the export fn's own count is what its
@@ -335,6 +355,11 @@ inline void CodeGenGo::EmitExports() {
         for (auto &n : { name, with })
             if (!names.insert(n).second)
                 Fail(ln, cat("export fn ", sf->name, ": another export fn's Go entry point is ", n, " too"));
+        entrynames.insert(name);
+        // --go-no-withstack writes no NameWithStack: Name runs on a block
+        // through a function of the program's own, gsWithStack_Name.
+        if (opts.nowithstack) with = cat("gsWithStack_", name);
+        else entrynames.insert(with);
         // What its calls reach, its own body included. In a program with
         // workers a call runs on an instance of its block's own, whose
         // globals' stacks are the block's (codegen_go_threads.h).
@@ -360,7 +385,7 @@ inline void CodeGenGo::EmitExports() {
             string gt, arg;
             if (pt->kind == TY_SLICE && IsU8(pt->sub) && pt->cq) {
                 auto tp = cat("T", tparams.size());
-                tparams.push_back(cat(tp, " GsBytes"));
+                tparams.push_back(cat(tp, " ~string | ~[]byte"));
                 gt = tp;
                 arg = cat("GsBytesOf(", pn, ")");
             } else if (pt->kind == TY_SLICE) {
@@ -369,7 +394,7 @@ inline void CodeGenGo::EmitExports() {
             } else if (IsPlainRef(pt) && !pt->ref->optional && IsFix(pt->ref->sub)) {
                 auto st = GoT(pt->ref->sub, ln);
                 gt = cat("*", st);
-                arg = RefFromAddr(pt, cat("gsEscape(unsafe.Pointer(", pn, "))"));
+                arg = RefFromAddr(pt, cat("GsEscape(unsafe.Pointer(", pn, "))"));
             } else if (IsFix(pt) && pt->kind != TY_REF) {
                 gt = GoT(pt, ln);
                 arg = pn;
@@ -377,6 +402,7 @@ inline void CodeGenGo::EmitExports() {
                 Fail(ln, cat("internal: export fn ", sf->name, " takes ", TypeText(pt)));
             }
             params.push_back(cat(pn, " ", gt));
+            GoTypeNames(gt, sigtypes);
             fwd.push_back(pn);
             args.push_back(arg);
         }
@@ -396,6 +422,7 @@ inline void CodeGenGo::EmitExports() {
             } else {
                 Fail(ln, cat("internal: export fn ", sf->name, " returns ", TypeText(t)));
             }
+            GoTypeNames(rt, sigtypes);
         }
         auto ret = [&](const string &x) {
             if (rt.empty()) return x;
@@ -456,25 +483,35 @@ inline void CodeGenGo::EmitExports() {
         // call on a block turns panic on fault on for itself only, so that a
         // fault in a guard gap is a panic on the caller's goroutine, and gives
         // the caller's setting back as it returns or panics (issue #18).
-        auto start = opts.library ? string("\tgsLibStart()\n") : string();
+        auto start = libstart ? string("\tgsLibStart()\n") : string();
         auto faults = takesgs ? string("\tdefer debug.SetPanicOnFault(debug.SetPanicOnFault(true))\n") : string();
         auto stackstext = cat(stacks, stacks == 1 ? " data stack" : " data stacks");
-        Append(xcode, "// ", with, " runs ", where, "\n",
-               !takesgs ? string("// with no data stacks: it leaves gs alone.\n")
-               : stacks ? cat("// on the ", stackstext, " of gs it takes, which it makes sure gs has, and gives\n"
-                              "// ", stacks == 1 ? "it" : "them", " back as it found ", stacks == 1 ? "it" : "them", ".\n")
-                        : string("// on gs, whose fixed-frame stack it gives back as it found it.\n"),
-               inst ? "// It runs on gs's program instance, whose globals stay gs's across calls: a copy of\n"
-                      "// the package's, made where gs has none (gsEnter).\n" : "",
-               doc, "func ", with, tps, "(", join(params, "gs *GsStackBlock"), ")", retsig, " {\n", start, faults);
-        if (stacks) Append(xcode, "\tgs.EnsureStacks(", stacks, ")\n");
-        else if (!takesgs) xcode += "\t_ = gs\n";
-        if (inst) Append(xcode, "\tif gs.Gl == nil {\n\t\t", enterall, "(gs)\n\t}\n");
-        Append(xcode, "\t", ret(call), "\n}\n\n");
+        if (!opts.nowithstack) {
+            Append(xcode, "// ", with, " runs ", where, "\n",
+                   !takesgs ? string("// with no data stacks: it leaves gs alone.\n")
+                   : stacks ? cat("// on the ", stackstext, " of gs it takes, which it makes sure gs has, and gives\n"
+                                  "// ", stacks == 1 ? "it" : "them", " back as it found ", stacks == 1 ? "it" : "them", ".\n")
+                            : string("// on gs, whose fixed-frame stack it gives back as it found it.\n"),
+                   inst ? "// It runs on gs's program instance, whose globals stay gs's across calls: a copy of\n"
+                          "// the package's, made where gs has none (gsEnter).\n" : "",
+                   doc, "func ", with, tps, "(", join(params, cat("gs *", BlockTypeName())), ")", retsig, " {\n",
+                   start, faults);
+            hostblocks = hostblocks || takesgs;
+        } else if (takesgs) {
+            // Name's body on its block, with no start of its own: Name has made it.
+            Append(xcode, "// ", with, " runs ", where, "\n// on gs, for ", name, ", which --go-no-withstack writes alone.\n",
+                   "func ", with, tps, "(", join(params, "gs *GsStackBlock"), ")", retsig, " {\n", faults);
+        }
+        if (!opts.nowithstack || takesgs) {
+            if (stacks) Append(xcode, "\tgs.EnsureStacks(", stacks, ")\n");
+            else if (!takesgs) xcode += "\t_ = gs\n";
+            if (inst) Append(xcode, "\tif gs.Gl == nil {\n\t\t", enterall, "(gs)\n\t}\n");
+            Append(xcode, "\t", ret(call), "\n}\n\n");
+        }
         Append(xcode, "// ", name, " runs ", where, "\n",
                !takesgs ? string("// with no data stacks.\n")
-                        : string("// on a block of data stacks from the runtime's pool (AcquireStackBlock), which\n"
-                                 "// it gives back as it returns.\n"),
+                        : string("// on a block of data stacks from its program's pool, which it gives back as it\n"
+                                 "// returns.\n"),
                inst ? "// It runs on a program instance of its own, copied from the package's for the call.\n" : "",
                doc, "func ", name, tps, "(", join(params, ""), ")", retsig, " {\n", start);
         if (!takesgs) {
@@ -482,17 +519,17 @@ inline void CodeGenGo::EmitExports() {
             Append(xcode, "\t", ret(cat(si.name, "(", join(args, ""), ")")), "\n}\n\n");
             continue;
         }
-        Append(xcode, "\tgs := AcquireStackBlock(", stacks, ")\n");
+        Append(xcode, "\tgs := gsProg.AcquireStackBlock(", stacks, ")\n");
         if (inst) Append(xcode, "\t", enter, "(gs)\n");
         auto fcall = cat(with, "(", join(fwd, "gs"), ")");
         if (rt.empty()) {
-            Append(xcode, "\t", fcall, "\n\tReleaseStackBlock(gs)\n}\n\n");
+            Append(xcode, "\t", fcall, "\n\tgsProg.ReleaseStackBlock(gs)\n}\n\n");
         } else {
             // A slice of the call's instance's globals is gone with it: it
             // crosses as a copy.
             auto keep = inst && rt[0] == '[';
             Append(xcode, "\tgs_r := ", fcall, "\n", keep ? "\tgs_r = GsKeep(gs, gs_r)\n" : "",
-                   "\tReleaseStackBlock(gs)\n\treturn gs_r\n}\n\n");
+                   "\tgsProg.ReleaseStackBlock(gs)\n\treturn gs_r\n}\n\n");
         }
     }
 }

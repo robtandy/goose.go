@@ -697,6 +697,19 @@ R"(  --stats               Print what the compile did: the declarations parsed,
                         data stacks reserves for its fixed-frame stack, from
                         64K, with a K, M, G or T suffix (default 1G, or 64M
                         for a library).
+  --go-runtime mode     With --target=go, the runtime the Go file uses: embed
+                        (the default) writes the part of it the program uses
+                        into the file, full all of it, and import none: the
+                        file imports github.com/robtandy/goose.go/runtime/go.
+  --go-runtime-file f.go  With --target=go, the runtime goes to f.go, beside
+                        the -o file, which the programs compiled into one
+                        package share; each one's own names carry its file's
+                        name.
+  --go-unexported       With --target=go, the runtime's names unexported
+                        (gsSlice, gsStackBlock), and the program's, so that
+                        the package exports the export fns' entry points.
+  --go-no-withstack     With --target=go, no NameWithStack entry points: an
+                        export fn is Name alone.
 )";
 
 constexpr const char *DEBUGOPTION =
@@ -1389,6 +1402,11 @@ int Main(int argc, char **argv) {
     string target, gopackage, gobuild;
     auto golibrary = false;
     uint64_t goframereserve = 0;
+    // Where the Go's runtime comes from (--go-runtime), its names
+    // (--go-unexported), the entry points (--go-no-withstack), and a file of
+    // the package's runtime that its programs share (--go-runtime-file).
+    string goruntime, goruntimefile;
+    auto gounexported = false, gonowithstack = false;
     // The inlining at its highest. The C compiler optimizes whatever the
     // level, unless --debug (Builder::CFlags).
     auto optlevel = 2;
@@ -1532,6 +1550,39 @@ int Main(int argc, char **argv) {
             }
         }
         else if (arg == "--library") golibrary = true;
+        else if ((arg == "--go-runtime" && i + 1 < argc) || arg.rfind("--go-runtime=", 0) == 0) {
+            goruntime = arg == "--go-runtime" ? argv[++i] : arg.substr(13);
+            if (goruntime != "embed" && goruntime != "import" && goruntime != "full") {
+                fprintf(stderr, "--go-runtime takes embed, import or full, not %s\n", goruntime.c_str());
+                return 1;
+            }
+        }
+        else if ((arg == "--go-runtime-file" && i + 1 < argc) || arg.rfind("--go-runtime-file=", 0) == 0) {
+            goruntimefile = arg == "--go-runtime-file" ? argv[++i] : arg.substr(18);
+            if (goruntimefile.size() < 4 || goruntimefile.compare(goruntimefile.size() - 3, 3, ".go") != 0 ||
+                (goruntimefile.size() > 8 && goruntimefile.compare(goruntimefile.size() - 8, 8, "_test.go") == 0)) {
+                fprintf(stderr, "--go-runtime-file takes a Go source file, file.go, which no _test.go is: %s\n",
+                        goruntimefile.c_str());
+                return 1;
+            }
+        }
+        else if (arg == "--go-unexported") gounexported = true;
+        else if (arg == "--go-no-withstack") gonowithstack = true;
+        else if (arg == "--emit-go-runtime" && i + 1 < argc) {
+            // Hidden: the Go runtime this compiler embeds, its files as they
+            // were when it was built (runtime/go), into a directory.
+            string dir = argv[++i];
+            for (auto &f : go_runtime_files) {
+                string text;
+                for (int k = 0; k < f.nparts; k++) text += f.parts[k];
+                auto path = cat(dir, "/", f.name);
+                if (!WriteFileMakingDirs(path, text)) {
+                    fprintf(stderr, "cannot write output file: %s\n", path.c_str());
+                    return 1;
+                }
+            }
+            return 0;
+        }
         else if (arg == "--frame-reserve" && i + 1 < argc) {
             // As --stack-reserve's: the runtime halves a reservation the
             // platform refuses, down to 1 MB.
@@ -1631,6 +1682,11 @@ int Main(int argc, char **argv) {
         fprintf(stderr, "--go-package, --go-build, --library and --frame-reserve are for --target=go\n");
         return 1;
     }
+    if (!gotarget && (!goruntime.empty() || !goruntimefile.empty() || gounexported || gonowithstack)) {
+        fprintf(stderr, "--go-runtime, --go-runtime-file, --go-unexported and --go-no-withstack are for "
+                        "--target=go\n");
+        return 1;
+    }
     if (gotarget && !headername.empty()) {
         fprintf(stderr, "--header writes a C host's header, and --target=go writes no C\n");
         return 1;
@@ -1660,6 +1716,18 @@ int Main(int argc, char **argv) {
     if ((gorun || (gotarget && verb == "build")) && !gobuild.empty()) {
         fprintf(stderr, "--go-build constrains the Go that -o writes, for a go build of its own: goose %s "
                         "builds the executable itself\n", verb == "build" ? "build" : "run");
+        return 1;
+    }
+    // goose run and goose build build one file, by itself, with nothing but
+    // the Go standard library: the runtime is in it.
+    if ((gorun || (gotarget && verb == "build")) && (goruntime == "import" || !goruntimefile.empty())) {
+        fprintf(stderr, "goose %s builds the program's Go file by itself, which holds its runtime: "
+                        "--go-runtime=import and --go-runtime-file are for the Go that -o writes\n",
+                verb == "build" ? "build" : "run");
+        return 1;
+    }
+    if (!goruntimefile.empty() && multitest) {
+        fprintf(stderr, "--go-runtime-file is the runtime of one program's package at a time, not of --multi-test's\n");
         return 1;
     }
     if (!headername.empty() && (jit || multitest)) {
@@ -1833,6 +1901,31 @@ int Main(int argc, char **argv) {
             }
             go.stacks = stackcfg;
             go.framereserve = goframereserve;
+            go.runtime = goruntime == "import" ? GO_RT_IMPORT : goruntime == "full" ? GO_RT_FULL : GO_RT_EMBED;
+            go.unexported = gounexported;
+            go.nowithstack = gonowithstack;
+            // The package's runtime file: beside the program's, in its
+            // package, which its name in the program's header is relative
+            // to; and what it holds where it is there already.
+            if (!goruntimefile.empty()) {
+                if (outfile.empty())
+                    throw CompileError { "--go-runtime-file is the runtime of the Go that -o writes: name the "
+                                         "program's file with -o" };
+                if (AbsolutePath(DirOf(goruntimefile)) != AbsolutePath(DirOf(outfile)))
+                    throw CompileError { cat("--go-runtime-file ", goruntimefile, " is in another directory than ",
+                                             outfile, ": a Go package's files are in one directory") };
+                if (AbsolutePath(goruntimefile) == AbsolutePath(outfile))
+                    throw CompileError { "--go-runtime-file names the program's own file" };
+                go.runtimefile = goruntimefile.substr(goruntimefile.find_last_of("/\\") + 1);
+                go.runtimeexists = FileExists(goruntimefile);
+                if (go.runtimeexists && !LoadFile(goruntimefile, go.runtimeold))
+                    throw CompileError { cat("cannot read --go-runtime-file ", goruntimefile) };
+                // The program's own names carry its file's name, letters and
+                // digits.
+                for (auto c : PathStem(outfile))
+                    if (isalnum((unsigned char)c)) go.tag += c;
+                if (go.tag.empty()) go.tag = "prog";
+            }
             // Named relative to the Go, as the C names its headers, where -o
             // writes it, and absolute where a build or a run does, in its
             // build directory: Go reads a //line directive's relative name
@@ -1858,6 +1951,12 @@ int Main(int argc, char **argv) {
                 if (!WriteFileMakingDirs(outfile, out))
                     throw CompileError { cat("cannot write output file: ", outfile) };
                 if (stats) fprintf(msgs, "wrote %s (%d bytes)\n", outfile.c_str(), (int)out.size());
+                if (!goruntimefile.empty()) {
+                    if (!WriteFileMakingDirs(goruntimefile, cg.runtimefiletext))
+                        throw CompileError { cat("cannot write output file: ", goruntimefile) };
+                    if (stats)
+                        fprintf(msgs, "wrote %s (%d bytes)\n", goruntimefile.c_str(), (int)cg.runtimefiletext.size());
+                }
                 gowrote = true;
             }
             return 0;

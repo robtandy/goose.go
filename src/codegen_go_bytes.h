@@ -634,7 +634,7 @@ inline string CodeGenGo::VerifyFn(TypeExpr *elem) {
         auto fixed = IsFix(elem);
         auto rel = HasRelRefAny(elem);
         Append(b, "\tvar q, cnt int64\n\t_ = bm\n\tfor q < n {\n");
-        if (!fixed && rel) Append(b, "\t\tgsBmSet(bm, q)\n");
+        if (!fixed && rel) Append(b, "\t\tGsBmSet(bm, q)\n");
         EmitVerifyWalk(b, elem, elem, "q", fixed && rel, tmp, 2);
         Append(b, "\t\tcnt++\n\t}\n\tif q != n {\n\t\treturn -1\n\t}\n");
         if (!fixed && rel) {
@@ -677,7 +677,7 @@ inline void CodeGenGo::EmitVerifyLink(string &b, TypeExpr *rt, TypeExpr *elem, c
         Append(b, I, "\tif ", v, "%", std::max<int64_t>(FixedSize(elem), 1), " != 0 {\n", I,
                "\t\treturn -1\n", I, "\t}\n");
     else
-        Append(b, I, "\tif !gsBmGet(bm, ", v, ") {\n", I, "\t\treturn -1\n", I, "\t}\n");
+        Append(b, I, "\tif !GsBmGet(bm, ", v, ") {\n", I, "\t\treturn -1\n", I, "\t}\n");
     if (variant)
         Append(b, I, "\tif n-", v, " < ", skip, " || *(*", IntGoT(ts), ")(unsafe.Add(p, ", v, ")) != ", vi,
                " {\n", I, "\t\treturn -1\n", I, "\t}\n");
@@ -737,7 +737,7 @@ inline void CodeGenGo::EmitVerifyWalk(string &b, TypeExpr *t, TypeExpr *elem, co
             if (t->ix) Unsupported(t->line, cat("serializing the index type ", TypeText(t)));
             // A varint field: only its length matters to the walk.
             auto k = cat("k", tmp++);
-            Append(b, I, "if _, ", k, " := gsUlebCheck(p, ", q, ", n); ", k, " == 0 {\n", I,
+            Append(b, I, "if _, ", k, " := GsUlebCheck(p, ", q, ", n); ", k, " == 0 {\n", I,
                    "\treturn -1\n", I, "} else {\n", I, "\t", q, " += ", k, "\n", I, "}\n");
             return;
         }
@@ -748,8 +748,8 @@ inline void CodeGenGo::EmitVerifyWalk(string &b, TypeExpr *t, TypeExpr *elem, co
             auto v = cat("o", tmp++);
             Append(b, I, "{\n");
             if (w == IS_VARINT) {
-                if (links) Append(b, I, "\t", v, ", ", v, "k := gsZigCheck(p, ", q, ", n)\n");
-                else Append(b, I, "\t_, ", v, "k := gsUlebCheck(p, ", q, ", n)\n");
+                if (links) Append(b, I, "\t", v, ", ", v, "k := GsZigCheck(p, ", q, ", n)\n");
+                else Append(b, I, "\t_, ", v, "k := GsUlebCheck(p, ", q, ", n)\n");
                 Append(b, I, "\tif ", v, "k == 0 {\n", I, "\t\treturn -1\n", I, "\t}\n");
             } else {
                 Append(b, I, "\tif n-", q, " < ", IntSize(w), " {\n", I, "\t\treturn -1\n", I, "\t}\n");
@@ -779,7 +779,7 @@ inline void CodeGenGo::EmitVerifyWalk(string &b, TypeExpr *t, TypeExpr *elem, co
                     auto v = cat("c", tmp++);
                     Append(b, I, "{\n", I, "\tvar ", v, " int64\n");
                     if (ls == IS_VARINT) {
-                        Append(b, I, "\t", v, "u, ", v, "k := gsUlebCheck(p, ", q, ", n)\n", I, "\tif ", v,
+                        Append(b, I, "\t", v, "u, ", v, "k := GsUlebCheck(p, ", q, ", n)\n", I, "\tif ", v,
                                "k == 0 || ", v, "u > uint64(math.MaxInt64) {\n", I, "\t\treturn -1\n", I,
                                "\t}\n", I, "\t", v, " = int64(", v, "u)\n", I, "\t", q, " += ", v, "k\n");
                     } else {
@@ -954,7 +954,7 @@ inline void CodeGenGo::CloseRzDest(RzDest &rd, const string &count) {
 }
 
 inline void CodeGenGo::EmitLeCheck(Line ln) {
-    L("if !gsIsLE() {");
+    L("if !GsIsLE() {");
     ind++;
     L("GsAbort(GsEEndian, ", LocArgs(ln), ")");
     ind--;
@@ -968,7 +968,7 @@ inline vector<string> CodeGenGo::EmitBytesOf(Call *c, vector<Node *> &an, Line l
     string src, sz;
     PayloadOf(an[0], src, sz);
     auto s = T();
-    Decl(s, "GsSlice", cat("GsSlice{", src, ", ", sz, "}"));
+    Decl(s, "GsSlice", cat("GsSlice{Data: ", src, ", Len: ", sz, "}"));
     return { s };
 }
 
@@ -1015,7 +1015,7 @@ inline vector<string> CodeGenGo::EmitFromBytes(Call *c, vector<Node *> &an, cons
     Decl(pay, "unsafe.Pointer", cat(sl, ".Data"));
     Decl(pn, "int64", "0");
     Decl(ok, "bool", "false");
-    L(uv, ", ", kv, " := gsUlebCheck(", sl, ".Data, 0, ", sl, ".Len)", DECLMARK, uv, ",", kv);
+    L(uv, ", ", kv, " := GsUlebCheck(", sl, ".Data, 0, ", sl, ".Len)", DECLMARK, uv, ",", kv);
     L("if ", kv, " != 0 && ", uv, " <= uint64(math.MaxInt64) && int64(", uv, ") == ", sl, ".Len-", kv, " {");
     ind++;
     L(pay, " = unsafe.Add(", pay, ", ", kv, ")");

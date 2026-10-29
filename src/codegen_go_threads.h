@@ -8,7 +8,7 @@
 //
 // * A worker is a goroutine running its thread program on a GsStackBlock of
 //   its own, its own data stacks, fixed-frame stack and program instance
-//   (GsThreadSpawn). thread_spawn packs the arguments contiguously on a
+//   (gsProg.ThreadSpawn). thread_spawn packs the arguments contiguously on a
 //   scratch stack, then each global the worker's program uses as [int64
 //   size][image], as C's does; the runtime copies the packet into memory
 //   of the worker's own, and the worker's thunk (gsTmain_<worker>) unpacks
@@ -249,13 +249,13 @@ inline void CodeGenGo::EmitGlobalRecv(VarDef *d, const string &img, const string
             auto cnt = T(), eb = T(), fln = T();
             Decl(cnt, "int64", cat("*(*int64)(", img, ")"));
             Decl(eb, "int64", cat(cnt, "*", esz));
-            L(gn, " = GsRhdr{", Top(k), ", ", cnt, "}");
+            L(gn, " = GsRhdr{Base: ", Top(k), ", Len: ", cnt, "}");
             L("copy(unsafe.Slice((*byte)(", Top(k), "), ", eb, "), unsafe.Slice((*byte)(unsafe.Add(", img, ", 8)), ",
               eb, "))");
             Bump(k, eb);
             L(p.second, " = ", k2);
             Decl(fln, "int64", cat("*(*int64)(unsafe.Add(", img, ", 8+", eb, "))"));
-            L(p.first, " = GsRhdr{", Top(k2), ", ", fln, "}");
+            L(p.first, " = GsRhdr{Base: ", Top(k2), ", Len: ", fln, "}");
             CopyElemBytes(Top(k2), cat("unsafe.Add(", img, ", 16+", eb, ")"), fln, flsz);
             Bump(k2, cat(fln, "*", flsz));
             return;
@@ -327,14 +327,14 @@ inline string CodeGenGo::EmitThreadSpawn(Call *c, vector<Node *> &an) {
     for (auto d : ThreadGlobals(sp)) EmitGlobalImage(d, stk, c->line);
     if (Unreached()) return "0";
     auto id = T();
-    Decl(id, "int64", cat("GsThreadSpawn(", thunk, ", ", thunk, "_stacks, unsafe.Sizeof(gsGlobals{}), ", base,
+    Decl(id, "int64", cat("gsProg.ThreadSpawn(", thunk, ", ", thunk, "_stacks, unsafe.Sizeof(gsGlobals{}), ", base,
                           ", int64(uintptr(", Top(stk), ") - uintptr(", base, ")), ",
                           c->builtin == B_THREAD_SPAWN_CONTAINED ? "true" : "false", ")"));
     return id;
 }
 
 // The worker's entry (CodeGen::EmitThreadThunk), run by its goroutine on the
-// block GsThreadSpawn made: `stacks` data stacks for its thread program,
+// block gsProg.ThreadSpawn made: `stacks` data stacks for its thread program,
 // then the dedicated ones its thunk fills, those of its resizable arguments
 // and of its globals. The arguments unpacked from the packet at p, a
 // resizable one onto its stack, the globals into the block's instance, then
@@ -415,7 +415,7 @@ inline void CodeGenGo::EmitThreadThunk(FnSpec *sp, int64_t stacks) {
     for (auto &a : args) Append(list, list.empty() ? "" : ", ", a);
     L(ki.name, "(", list, ")");
     // Under GS_STACK_STATS a worker reports its stacks as its program ends.
-    if (opts.stackstats) L("gsStackStats(gs, ", stacks, ")");
+    if (opts.stackstats) L("gsProg.StackStats(gs, ", stacks, ")");
     PopSc();
     L(FRAMEEND);
     auto fb = FinishBody(body, true);

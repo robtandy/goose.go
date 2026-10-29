@@ -228,14 +228,14 @@ inline GoDst CodeGenGo::DeclStackLocal(VarDef *d, bool forlocal) {
         if (own) SaveBase(forlocal, stk, cat(FoTailHdr(t, name), ".Base"));
         return GoDst { GD_STACK, stk, t, name };
     }
-    Decl(name, "GsRhdr", cat("GsRhdr{", Top(stk), ", 0}"));
+    Decl(name, "GsRhdr", cat("GsRhdr{Base: ", Top(stk), "}"));
     if (own) SaveBase(forlocal, stk, cat(name, ".Base"));
     if (d->reusable) {
         // Its freelist: free slot indices, or a slice pool's tree of spans,
         // on a stack of their own.
         auto flstk = AllocStk(forlocal);
         auto fln = Unique2(cat(name, "_fl"));
-        Decl(fln, "GsRhdr", cat("GsRhdr{", Top(flstk), ", 0}"));
+        Decl(fln, "GsRhdr", cat("GsRhdr{Base: ", Top(flstk), "}"));
         SaveBase(forlocal, flstk, cat(fln, ".Base"));
         vpool[d] = { fln, flstk };
     }
@@ -263,7 +263,7 @@ inline string CodeGenGo::RzTemp(TypeExpr *t, string &stk) {
         Decl(h, RzGoT(t, t->line));
         SaveBase(false, stk, cat(FoTailHdr(t, h), ".Base"));
     } else {
-        Decl(h, "GsRhdr", cat("GsRhdr{", Top(stk), ", 0}"));
+        Decl(h, "GsRhdr", cat("GsRhdr{Base: ", Top(stk), "}"));
         SaveBase(false, stk, cat(h, ".Base"));
     }
     return h;
@@ -357,7 +357,7 @@ inline string CodeGenGo::RefOfRz(const GoLoc &l, Line ln) {
     else
         addr = cat("&", h);
     if (IsFrameObj(l.t)) addr = cat("(*GsRhdr)(unsafe.Pointer(", addr, "))");
-    return cat("GsRref{", addr, ", ", l.stk, "}");
+    return cat("GsRref{Hdr: ", addr, ", Stk: ", l.stk, "}");
 }
 
 // A GsPref value from a &pool expression or another pool reference, or from
@@ -384,8 +384,8 @@ inline string CodeGenGo::GenPrefVal(Node *n) {
                     return h.substr(2, h.size() - 3);
                 return cat("&", h);
             };
-            Decl(t, "GsPref", cat("GsPref{", addr(l.hdr), ", ", l.stk, ", ", addr(l.fl), ", ",
-                                  l.flstk, "}"));
+            Decl(t, "GsPref", cat("GsPref{Hdr: ", addr(l.hdr), ", Stk: ", l.stk, ", FreeHdr: ", addr(l.fl),
+                                  ", FreeStk: ", l.flstk, "}"));
             return t;
         }
         auto l = GenLoc(u->child);
@@ -1283,10 +1283,10 @@ inline void CodeGenGo::EmitFormatInto(GoLoc l, Node *a, Line ln, Call *c) {
         return;
     }
     auto buf = T(), start = T(), cur = T(), n = T();
-    Decl(buf, "[gsFmtMax]byte");
+    Decl(buf, "[GsFmtMax]byte");
     Decl(start, "unsafe.Pointer", cat("unsafe.Pointer(&", buf, ")"));
     Decl(cur, "unsafe.Pointer", start);
-    RenderInto(cur, cat("unsafe.Add(", start, ", gsFmtMax)"), a, c);
+    RenderInto(cur, cat("unsafe.Add(", start, ", GsFmtMax)"), a, c);
     if (Unreached()) return;
     Decl(n, "int64", cat("int64(uintptr(", cur, ") - uintptr(", start, "))"));
     AppendBytes(l, start, n, ln);
@@ -1762,7 +1762,7 @@ inline vector<string> CodeGenGo::EmitSlicePool(Call *c, vector<Node *> &an, Line
         LS("}");
     }
     auto r = T();
-    Decl(r, "GsSlice", cat("GsSlice{", ElemAddr(v, i), ", ", n, "}"));
+    Decl(r, "GsSlice", cat("GsSlice{Data: ", ElemAddr(v, i), ", Len: ", n, "}"));
     return { r };
 }
 

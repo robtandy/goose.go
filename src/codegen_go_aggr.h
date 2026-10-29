@@ -960,7 +960,7 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
         EmitUserFormat(cur, l, sp, ln);
         return;
     }
-    auto lit = [&](const string &s) { L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(s), ")"); };
+    auto lit = [&](const string &s) { L(cur, " = GsPutStr(", cur, ", ", end, ", ", GoStr(s), ")"); };
     auto nominal = t->kind == TY_STRUCT || t->kind == TY_VARIANT || t->kind == TY_ENUM;
     auto overloads = rctx && !rctx->fmtspecs.empty();
     // An overload rendering one part of a value may rebind a reference on
@@ -991,7 +991,7 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
                     arg = PtrOf(l);
                 } else if (IsResz(t)) {
                     if (l.lenlv.empty()) Fail(ln, "internal: a resizable value rendered without its count");
-                    arg = cat("GsRhdr{", l.addr, ", ", l.lenlv, "}");
+                    arg = cat("GsRhdr{Base: ", l.addr, ", Len: ", l.lenlv, "}");
                 } else {
                     arg = IsBytesT(t) ? l.addr : PtrOf(l);
                 }
@@ -1037,8 +1037,8 @@ inline void CodeGenGo::RenderLoc(const string &cur, const string &end, GoLoc l, 
             Decl(d, "unsafe.Pointer", v.data);
             Decl(n, "int64", v.fixed >= 0 ? cat(v.fixed) : v.len);
             if (IsU8(elem)) {
-                if (nested) L(cur, " = gsPutQuoted(", cur, ", ", end, ", ", d, ", ", n, ")");
-                else L(cur, " = gsPutBytes(", cur, ", ", end, ", unsafe.Slice((*byte)(", d, "), ", n, "))");
+                if (nested) L(cur, " = GsPutQuoted(", cur, ", ", end, ", ", d, ", ", n, ")");
+                else L(cur, " = GsPutBytes(", cur, ", ", end, ", unsafe.Slice((*byte)(", d, "), ", n, "))");
                 break;
             }
             lit("[");
@@ -1130,7 +1130,7 @@ inline void CodeGenGo::RenderVariant(const string &cur, const string &end, const
     auto ei = EIVar(t);
     auto vi = ei->en->VariantIndex(t->var->variant);
     auto &v = ei->en->variants[vi];
-    auto lit = [&](const string &s) { L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(s), ")"); };
+    auto lit = [&](const string &s) { L(cur, " = GsPutStr(", cur, ", ", end, ", ", GoStr(s), ")"); };
     if (v.fields.empty()) {
         lit(cat(ei->en->name, ".", v.name));
         return;
@@ -1150,14 +1150,14 @@ inline void CodeGenGo::RenderScalar(const string &cur, const string &end, const 
                                     TypeExpr *t, Line ln) {
     switch (t->kind) {
         case TY_INT:
-            if (t->intstorage == IS_U64) L(cur, " = gsFmtU64(", cur, ", ", end, ", ", x, ")");
-            else L(cur, " = gsFmtI64(", cur, ", ", end, ", ", Coerce(x, t, ast.inttypes[IS_I64], ln), ")");
+            if (t->intstorage == IS_U64) L(cur, " = GsFmtU64(", cur, ", ", end, ", ", x, ")");
+            else L(cur, " = GsFmtI64(", cur, ", ", end, ", ", Coerce(x, t, ast.inttypes[IS_I64], ln), ")");
             return;
         case TY_FLT:
-            L(cur, " = gsFmt", t->fltstorage == FS_F32 ? "F32" : "F64", "(", cur, ", ", end, ", ", x, ")");
+            L(cur, " = GsFmt", t->fltstorage == FS_F32 ? "F32" : "F64", "(", cur, ", ", end, ", ", x, ")");
             return;
         default:
-            L(cur, " = gsFmtBool(", cur, ", ", end, ", ", x, ")");
+            L(cur, " = GsFmtBool(", cur, ", ", end, ", ", x, ")");
             return;
     }
 }
