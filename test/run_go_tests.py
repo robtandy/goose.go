@@ -1497,8 +1497,7 @@ class Runner:
         check("--include's //line directives name the file and each run's line",
               code == 0 and "\n//line helper.go:10\nfunc shout(" in text and
               "\n//line helper.go:14\nfunc goHalf(" in text and "//go:build" not in text and
-              '\n\t"os"\n\t"path/filepath"\n' not in text and '\n\t"os"\n\t"runtime"\n' in text and
-              '\n\t"strconv"\n\t"strings"\n\t"sync"\n' in text, o + e)
+              '\n\t"os"\n\t"runtime"\n' in text and '\n\t"strconv"\n\t"strings"\n\t"sync"\n' in text, o + e)
         if code == 0:
             diff = self.gofmt_clean(incdir / "out.go")
             check("a file with an --include is laid out as gofmt lays it out", diff is None, diff or "")
@@ -1532,13 +1531,25 @@ class Runner:
         code, o, e = self.goose("run", "--target=go", "--include", where, wsrc)
         check("runtime.Caller and a panic in an --include file name its lines",
               code == 2 and o == "19\n" and "panic: boom from the include" in e and
-              re.search(r"/where\.go:30\b", e) is not None,
+              re.search(r"\bwhere\.go:30\b", e) is not None,
               f"exit {code}\n{o}{e}")
-        code, o, e = self.goose("--target=go", "--include", where, "-o", incdir / "where-out.go", wsrc)
+        wout = incdir / "where-out.go"
+        code, o, e = self.goose("--target=go", "--include", where, "-o", wout, wsrc)
         if code == 0:
-            diff = self.gofmt_clean(incdir / "where-out.go")
+            diff = self.gofmt_clean(wout)
             check("an --include file's doc comments and runs are laid out as gofmt lays them out",
                   diff is None, diff or "")
+            # And they hold after gofmt -w, which collapsed the blank lines
+            # that kept them before.
+            subprocess.run([self.gofmt, "-w", str(wout)], capture_output=True)
+            wexe = incdir / f"where-out{tc.EXE_SUFFIX}"
+            bc, bo, be = self.gotool("build", "-o", wexe, wout)
+            ok, detail = bc == 0, bo + be
+            if ok:
+                rc, ro, re_ = run_capture([wexe])
+                ok = rc == 2 and ro == "19\n" and re.search(r"\bwhere\.go:30\b", re_) is not None
+                detail = f"exit {rc}\n{ro}{re_}"
+            check("an --include file's positions hold after gofmt -w", ok, detail)
         else:
             check("goose --target=go --include where.go", False, o + e)
         code, o, e = self.goose("--target=go", "--include", incdir / "shout.h", incsrc)

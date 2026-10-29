@@ -688,9 +688,9 @@ R"(  --stats               Print what the compile did: the declarations parsed,
                         --target=c, --target=go). -o out.go picks Go too.
   --go-package name     The package of the Go file (default main, or goose
                         for a library).
-  --go-build expr       Start the Go file with the build constraint
-                        //go:build expr, as in --go-build 'goose_x && !windows':
-                        go build then builds it with -tags goose_x only.
+  --go-build expr       With --target=go, start the Go file with the build
+                        constraint //go:build expr: --go-build goose_x makes
+                        a file go build builds with -tags goose_x only.
   --library             With --target=go, a package with no func main, for
                         a Go program to use: fn main() is optional.
   --frame-reserve size  With --target=go, the address space each block of
