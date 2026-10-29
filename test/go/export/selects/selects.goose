@@ -101,6 +101,12 @@ export fn max_into(o: i64[:], xs: const i64[:]) {
     if o.len < xs.len { return; }
     for x, i in xs { o[i] = max(o[i], x); }
 }
+// Each pair's max into o, which reads neither.
+// asm: select, branches 3
+export fn max_pairs(o: i64[:], a: const i64[:], b: const i64[:]) {
+    if o.len < a.len || b.len < a.len { return; }
+    for x, i in a { o[i] = max(x, b[i]); }
+}
 // asm: select, branches 2
 export fn min_into(o: i32[:], xs: const i32[:]) {
     if o.len < xs.len { return; }
@@ -126,7 +132,10 @@ export fn sign_into(o: i64[:]) {
 // An if choosing between two values.
 // asm: select, branches 1
 export fn at_least_into(o: i64[:], t: i64) {
-    for k in o.len { o[k] = if o[k] < t { t } else { o[k] }; }
+    for k in o.len {
+        let x = o[k];
+        o[k] = if x < t { t } else { x };
+    }
 }
 
 // ---- one choice

@@ -180,6 +180,31 @@ func TestInPlace(t *testing.T) {
 				}
 			}
 		}
+		a, b := ints[int64](r, n), ints[int64](r, n)
+		pairs := make([]int64, len(a)+1)
+		pairs[len(a)] = 26
+		MaxPairs(pairs, a, b)
+		for i := range a {
+			if w := stdMax(a[i], b[i]); pairs[i] != w {
+				t.Errorf("MaxPairs: [%d] = %d, want %d", i, pairs[i], w)
+			}
+		}
+		if pairs[len(a)] != 26 {
+			t.Errorf("MaxPairs wrote past its pairs: %d", pairs[len(a)])
+		}
+		// Too few of o or of b: nothing is written.
+		one := []int64{7}
+		MaxPairs(one, a, b)
+		if one[0] != 7 {
+			t.Errorf("MaxPairs(shorter o) wrote %d", one[0])
+		}
+		before := append([]int64(nil), pairs...)
+		MaxPairs(pairs, a, b[:len(b)-1])
+		for i := range pairs {
+			if pairs[i] != before[i] {
+				t.Errorf("MaxPairs(shorter b) wrote [%d] = %d", i, pairs[i])
+			}
+		}
 		i32, o32 := ints[int32](r, n), ints[int32](r, n)
 		want32 := make([]int32, len(o32))
 		for i := range o32 {
@@ -368,7 +393,7 @@ func TestSelectsZeroAllocs(t *testing.T) {
 
 // A choice that is a select takes as long whichever way it goes: on random
 // data, where a branch would mispredict half the time, as on sorted data,
-// where it would not.
+// where it would not. No benchmark's data changes from one pass to the next.
 
 const benchN = 4096
 
@@ -387,16 +412,17 @@ func benchData(sorted bool) ([]int64, []int64) {
 	return a, b
 }
 
-func benchMaxInto(b *testing.B, sorted bool) {
-	xs, o := benchData(sorted)
+func benchMaxPairs(b *testing.B, sorted bool) {
+	x, y := benchData(sorted)
+	o := make([]int64, benchN)
 	b.SetBytes(benchN * 8)
 	for i := 0; i < b.N; i++ {
-		MaxInto(o, xs)
+		MaxPairs(o, x, y)
 	}
 }
 
-func BenchmarkMaxIntoRandom(b *testing.B) { benchMaxInto(b, false) }
-func BenchmarkMaxIntoSorted(b *testing.B) { benchMaxInto(b, true) }
+func BenchmarkMaxPairsRandom(b *testing.B) { benchMaxPairs(b, false) }
+func BenchmarkMaxPairsSorted(b *testing.B) { benchMaxPairs(b, true) }
 
 func benchClampSum(b *testing.B, sorted bool) {
 	xs, _ := benchData(sorted)
@@ -409,12 +435,14 @@ func benchClampSum(b *testing.B, sorted bool) {
 func BenchmarkClampSumRandom(b *testing.B) { benchClampSum(b, false) }
 func BenchmarkClampSumSorted(b *testing.B) { benchClampSum(b, true) }
 
+// The pixels are clamped in place, so each pass clamps a fresh copy.
 func BenchmarkClampU8Random(b *testing.B) {
-	px := make([]byte, benchN)
-	rand.New(rand.NewSource(2)).Read(px)
+	orig, px := make([]byte, benchN), make([]byte, benchN)
+	rand.New(rand.NewSource(2)).Read(orig)
 	b.SetBytes(benchN)
 	for i := 0; i < b.N; i++ {
-		ClampU8(px, 16, 235)
+		copy(px, orig)
+		ClampU8(px, 64, 192)
 	}
 }
 
