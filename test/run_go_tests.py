@@ -120,6 +120,20 @@ names a file of the standard library by its place in it, stdlib/std.goose,
 where an abort there names it, and C by its whole path: every C run's
 stderr is compared with the Go's so named (go_file_names).
 
+Prebuilt compilers (issue #29, the section release): scripts/release.py
+packages the compiler under test as a release holds it, an archive of it,
+the standard library and the licenses that is the same bytes each time,
+and SHA256SUMS; cmd/goose, the wrapper `go run
+github.com/robtandy/goose.go/cmd/goose@<version>` runs, passes go vet and
+its own tests; and run so, from a module proxy of the suite's, with
+nothing but Go on PATH, the wrapper downloads the release of its version
+from a local server, once, checks it against SHA256SUMS, keeps it and runs
+it: `go generate` with it writes the file the compiler under test writes,
+byte for byte, and so does every sample (Runner.release). With
+--release-dist dist/<version>, the release it runs is the one there, as
+scripts/release.py build made it, whose Go must be that of the compiler
+under test, built here at the same version.
+
 --sweep also runs the C suite's own programs (test/<category>/*.goose) of
 its other categories through both backends as the test/stdlib/ fixtures
 run: at both levels, with --debug where they ask for it, vetted, built with
@@ -145,20 +159,27 @@ backend's runs instead of comparing with it.
 
   python3 test/run_go_tests.py [--exe build/goose] [-j N] [--sweep] [--fuzz N]
                                [--fuzz-flow N] [--fuzz-values N] [--bless] [-v]
-                               [name...]
+                               [--release-dist dist/<version>] [name...]
 """
 
 import argparse
 import concurrent.futures
 import contextlib
+import functools
+import hashlib
+import http.server
+import importlib.util
+import json
 import os
 import random
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
+import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -208,6 +229,79 @@ KERNEL_MAX_LINES = 450
 # The line Go's tools know generated code by (go help generate), which a
 # generated file's header keeps as it was (issue #21).
 GO_GENERATED = re.compile(r"^// Code generated .* DO NOT EDIT\.$")
+
+# Prebuilt compilers (issue #29): the script that lays out a release of the
+# compiler, and the module of cmd/goose, the wrapper `go run` runs, which
+# downloads one and runs it. The suite serves the wrapper from a module
+# proxy of its own at WRAPPER_TEST_VERSION, and the compiler under test as
+# the release of that name (Runner.release).
+RELEASE_SCRIPT = REPO / "scripts" / "release.py"
+WRAPPER = REPO / "cmd" / "goose"
+WRAPPER_MODULE = "github.com/robtandy/goose.go/cmd/goose"
+WRAPPER_TEST_VERSION = "v0.0.0-test"
+# The platforms there are prebuilt compilers for (GOOS, GOARCH), and
+# TinyCC's license files, which a release holds, as the one of what goose
+# is linked from that has its own.
+RELEASE_PLATFORMS = {("linux", "amd64"), ("linux", "arm64"), ("darwin", "arm64")}
+RELEASE_LICENSES = {"licenses/tinycc/COPYING": UPSTREAM / "third_party" / "tinycc" / "COPYING",
+                    "licenses/tinycc/RELICENSING": UPSTREAM / "third_party" / "tinycc" / "RELICENSING"}
+# The README's library, which `go generate` compiles with the wrapper, and
+# a test of its entry points.
+STATS_GOOSE = """\
+import std;
+
+// The number of words in text: runs of bytes that are not spaces.
+export fn count_words(text: const u8[:]) -> i64 {
+    var n = 0;
+    var inword = false;
+    for c in text {
+        let space = c == ' ' || c == '\\n' || c == '\\t';
+        if !space && !inword { n += 1; }
+        inword = !space;
+    }
+    return n;
+}
+
+// The median of xs, sorted in a copy on a data stack: xs is left as it is.
+export fn median(xs: i64[:]) -> i64 {
+    guard xs.len > 0 else { return 0; }
+    var s: i64[>..] = [];
+    for x in xs { s.push(x); }
+    sort(s);
+    return s[s.len / 2];
+}
+"""
+STATS_TEST = """\
+package stats
+
+import "testing"
+
+func TestStats(t *testing.T) {
+	if n := CountWords("the quick brown fox"); n != 4 {
+		t.Errorf("CountWords = %d, want 4", n)
+	}
+	xs := []int64{9, 1, 7, 3, 5}
+	if m := Median(xs); m != 5 || xs[0] != 9 {
+		t.Errorf("Median = %d, xs = %v, want 5 and xs as it was", m, xs)
+	}
+}
+"""
+
+
+def release_script():
+    """scripts/release.py as a module (issue #29), which the suite packages
+    releases of the compiler under test with (Runner.release)."""
+    spec = importlib.util.spec_from_file_location("goose_release", RELEASE_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def tar_contents(path):
+    """The members of a gzipped tar: {name: (TarInfo, bytes, or None for
+    what is not a file)}."""
+    with tarfile.open(path, "r:gz") as t:
+        return {m.name: (m, t.extractfile(m).read() if m.isfile() else None) for m in t.getmembers()}
 
 
 def go_runtime_revision():
@@ -1066,6 +1160,7 @@ class Runner:
         self.oks = 0
         self.skips = []
         self.known = []
+        self.release_dist = Path(args.release_dist).resolve() if args.release_dist else None
 
     # --- processes -----------------------------------------------------------
 
@@ -2384,6 +2479,273 @@ class Runner:
             for t in dirs:
                 shutil.rmtree(t, ignore_errors=True)
 
+    def release(self):
+        """Prebuilt compilers (issue #29). scripts/release.py packages the
+        compiler under test as a release holds it: one directory,
+        goose-<version>-<os>-<arch>/, of the compiler, the standard library
+        git tracks, the license and TinyCC's, in an archive that is the
+        same bytes when it is packaged again, beside SHA256SUMS, which lists
+        its checksum; a version the compiler does not report is refused.
+        cmd/goose, the wrapper `go run` runs, passes go vet, gofmt and its
+        own tests. Served from a module proxy of the suite's, as `go run
+        github.com/robtandy/goose.go/cmd/goose@<version>` fetches it, and run
+        with nothing but Go on PATH and a home of its own, the wrapper
+        downloads the release of its version (WRAPPER_TEST_VERSION, the
+        compiler under test) from a local server, once, checks it against
+        SHA256SUMS, keeps it in the user's cache directory and runs it:
+        `go generate` writes the library the compiler under test writes,
+        byte for byte, which vets, builds and passes its test, and `--check`
+        through the wrapper finds it up to date; installed, the wrapper
+        compiles every sample to the Go the compiler under test does.
+        GOOSE_RELEASE runs another release; one whose archive is not what
+        its SHA256SUMS says is refused and not kept; and one there is none
+        of is named, with where it was looked for. With --release-dist, the
+        release the wrapper runs is the one there, as scripts/release.py
+        build made it for this platform, which must be the compiler under
+        test's version: the Go it writes must be the compiler under test's,
+        byte for byte (issue #29's acceptance criterion)."""
+        out = []
+
+        def check(what, ok, detail=""):
+            out.append(("ok" if ok else "fail", f"release: {what}", None if ok else detail))
+
+        _, goos, _ = self.gotool("env", "GOOS")
+        _, goarch, _ = self.gotool("env", "GOARCH")
+        goos, goarch = goos.strip(), goarch.strip()
+        if (goos, goarch) not in RELEASE_PLATFORMS:
+            return [("skip", f"release: there are no prebuilt compilers for {goos}/{goarch}", None)]
+        plat = f"{goos}-{goarch}"
+        work = self.work / "release"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        code, o, e = self.goose("version")
+        m = re.match(r"goose (\S+) \(runtime [0-9a-f]{12}\)\n$", o)
+        if not m:
+            check("goose version", False, f"exit {code}\n{o}{e}")
+            return out
+        version, says = m[1], o
+
+        def package(*args):
+            r = subprocess.run([sys.executable, RELEASE_SCRIPT, "package", "--exe", self.exe, *args],
+                               capture_output=True)
+            return r.returncode, tc.decode(r.stdout) + tc.decode(r.stderr)
+
+        # The script's command line, on the compiler under test: the
+        # archive of the version it reports, and SHA256SUMS.
+        dist = work / "dist"
+        code, log = package("--dist", dist)
+        name = f"goose-{version}-{plat}.tar.gz"
+        archive, sums = dist / version / name, dist / version / "SHA256SUMS"
+        check(f"release.py package writes {version}/{name} and {version}/SHA256SUMS",
+              code == 0 and archive.is_file() and sums.is_file(), f"exit {code}\n{log}")
+        if not archive.is_file() or not sums.is_file():
+            return out
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        check("SHA256SUMS lists the archive's checksum, as sha256sum writes it",
+              sums.read_bytes() == f"{digest}  {name}\n".encode(), sums.read_text(encoding="utf-8"))
+        top = name[:-len(".tar.gz")]
+        want = {"goose": Path(self.exe).read_bytes(), "LICENSE": (REPO / "LICENSE").read_bytes()}
+        listed = subprocess.run(["git", "-C", UPSTREAM, "ls-files", "-z", "--", "stdlib"], capture_output=True)
+        for p in tc.decode(listed.stdout).split("\0"):
+            if p:
+                want[p] = (UPSTREAM / p).read_bytes()
+        for p, src in RELEASE_LICENSES.items():
+            want[p] = src.read_bytes()
+        try:
+            members = tar_contents(archive)
+        except (OSError, tarfile.TarError) as ex:
+            check("the archive is a gzipped tar", False, str(ex))
+            return out
+        got = {n[len(top) + 1:]: data for n, (_, data) in members.items() if n.startswith(f"{top}/") and data is not None}
+        files = [n for n, (_, data) in members.items() if data is not None]
+        check(f"the archive is {top}/: the compiler, the standard library git tracks, the license and TinyCC's",
+              "stdlib/std.goose" in want and len(got) == len(files) and got == want,
+              f"in one and not the other: {sorted(set(got) ^ set(want))}; differing: "
+              f"{sorted(k for k in set(got) & set(want) if got[k] != want[k])}; outside {top}/: "
+              f"{[n for n in files if not n.startswith(top + '/')]}")
+        modes = {n: (info.mode, info.uid, info.gid, info.isdir()) for n, (info, _) in members.items()}
+        check("its files are root's, the compiler executable, the rest read-only to others, and its directories listed",
+              all(uid == 0 and gid == 0 and mode == (0o755 if isdir or n == f"{top}/goose" else 0o644)
+                  for n, (mode, uid, gid, isdir) in modes.items()) and
+              modes.get(top, (0, 0, 0, False))[3] and modes.get(f"{top}/stdlib", (0, 0, 0, False))[3],
+              "\n".join(f"{n}: {oct(mode)} {uid}:{gid}{' dir' if isdir else ''}"
+                        for n, (mode, uid, gid, isdir) in sorted(modes.items())))
+        again = work / "dist-again"
+        code, log = package("--dist", again)
+        check("packaged again, the archive and SHA256SUMS are the same bytes",
+              code == 0 and (again / version / name).read_bytes() == archive.read_bytes() and
+              (again / version / "SHA256SUMS").read_bytes() == sums.read_bytes(), f"exit {code}\n{log}")
+        wrong = work / "dist-wrong"
+        code, log = package("--version", "v9.9.9", "--dist", wrong)
+        check("release.py package refuses a version the compiler does not report",
+              code != 0 and version in log and not wrong.exists(), f"exit {code}\n{log}")
+        # The wrapper's own tests.
+        for what, cmd in (("go vet", ["vet", "./..."]), ("go test", ["test", "-count=1", "./..."])):
+            r = subprocess.run([self.go, *cmd], cwd=WRAPPER, env=go_env(), capture_output=True)
+            text = tc.decode(r.stdout) + tc.decode(r.stderr)
+            check(f"cmd/goose: {what}", r.returncode == 0 and not (what == "go vet" and text.strip()), text)
+        r = subprocess.run([self.gofmt, "-l", WRAPPER], capture_output=True)
+        check("cmd/goose: gofmt -l", r.returncode == 0 and not r.stdout.strip(),
+              tc.decode(r.stdout) + tc.decode(r.stderr))
+        try:
+            rel = release_script()
+        except Exception as ex:
+            check("scripts/release.py loads as a module", False, repr(ex))
+            return out
+        check("release.py reads the compiler's platform from its header",
+              rel.binary_platform(self.exe) == f"{goos}/{goarch}", str(rel.binary_platform(self.exe)))
+        # The wrapper's module, at WRAPPER_TEST_VERSION in a proxy of the
+        # suite's, as the go command fetches a module; the compiler under
+        # test as the release of that name -- or, with --release-dist, the
+        # compiler of the release scripts/release.py built there, of the
+        # compiler under test's version, which is served as that version's
+        # too; and a release whose archive is not what its SHA256SUMS says,
+        # which no compiler need be in.
+        v, tampered = WRAPPER_TEST_VERSION, "v0.0.0-tampered"
+        proxy = work / "proxy"
+        at = proxy / WRAPPER_MODULE / "@v"
+        at.mkdir(parents=True)
+        tc.write_text(at / "list", f"{v}\n")
+        tc.write_text(at / f"{v}.info", json.dumps({"Version": v, "Time": "2026-01-01T00:00:00Z"}) + "\n")
+        shutil.copy(WRAPPER / "go.mod", at / f"{v}.mod")
+        with zipfile.ZipFile(at / f"{v}.zip", "w") as z:
+            for p in sorted(WRAPPER.rglob("*")):
+                if p.is_file():
+                    z.write(p, f"{WRAPPER_MODULE}@{v}/{p.relative_to(WRAPPER).as_posix()}")
+        if self.release_dist:
+            given, gsums = self.release_dist / name, self.release_dist / "SHA256SUMS"
+            listed = given.is_file() and gsums.is_file() and \
+                f"{hashlib.sha256(given.read_bytes()).hexdigest()}  {name}" in gsums.read_text().splitlines()
+            check(f"--release-dist {self.release_dist} holds {name}, which its SHA256SUMS lists", listed,
+                  "\n".join(p.name for p in self.release_dist.iterdir()) if self.release_dist.is_dir() else "no such directory")
+            if not listed:
+                return out
+            shutil.rmtree(dist / version)
+            shutil.copytree(self.release_dist, dist / version)
+            (dist / v).mkdir(parents=True)
+            shutil.copy(given, dist / v / f"goose-{v}-{plat}.tar.gz")
+            rel.write_sums(dist / v)
+        else:
+            rel.package(self.exe, f"{goos}/{goarch}", v, dist)
+        rel.package(RELEASE_SCRIPT, f"{goos}/{goarch}", tampered, dist)
+        bad = dist / tampered / f"goose-{tampered}-{plat}.tar.gz"
+        data = bytearray(bad.read_bytes())
+        data[len(data) // 2] ^= 0xFF
+        bad.write_bytes(bytes(data))
+        served, lock = [], threading.Lock()
+
+        class Releases(http.server.SimpleHTTPRequestHandler):
+            def log_request(self, code="-", size="-"):
+                with lock:
+                    served.append((self.path, int(code) if str(code).isdigit() else code))
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Releases, directory=str(dist)))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        # Nothing but Go: its directory alone on PATH, and a home of the
+        # wrapper's own, whose cache directory it keeps the release in.
+        _, goroot, _ = self.gotool("env", "GOROOT")
+        _, gocache, _ = self.gotool("env", "GOCACHE")
+        gobin = Path(goroot.strip()) / "bin"
+        go = str(gobin / f"go{tc.EXE_SUFFIX}")
+        home = work / "home"
+        home.mkdir()
+        env = {"PATH": str(gobin), "HOME": str(home), "GOPROXY": proxy.as_uri(), "GOSUMDB": "off",
+               "GOMODCACHE": str(work / "modcache"), "GOFLAGS": "-modcacherw", "GOTOOLCHAIN": "local",
+               "CGO_ENABLED": "0", "GOCACHE": gocache.strip(), "GOOSE_RELEASE_URL": url}
+        if os.environ.get("TMPDIR"):
+            env["TMPDIR"] = os.environ["TMPDIR"]
+        cache = home / ("Library/Caches" if goos == "darwin" else ".cache") / "goose.go"
+
+        def run(argv, cwd, **extra):
+            r = subprocess.run([str(a) for a in argv], cwd=cwd, env=dict(env, **extra), capture_output=True)
+            return r.returncode, tc.decode(r.stdout), tc.decode(r.stderr)
+
+        def downloads(release, archive_name):
+            return [(f"/{release}/SHA256SUMS", 200), (f"/{release}/{archive_name}", 200)]
+
+        try:
+            # go generate in a module of its own, beside the same files
+            # compiled by the compiler under test.
+            gen, local = work / "gen", work / "local"
+            for d in (gen, local):
+                d.mkdir()
+                tc.write_text(d / "stats.goose", STATS_GOOSE)
+            args = ["--target=go", "--library", "--go-package", "stats", "-o", "stats.go", "stats.goose"]
+            tc.write_text(gen / "go.mod", "module example.com/gen\n\ngo 1.21\n")
+            tc.write_text(gen / "gen.go", "// Package stats is stats.goose, compiled by a release of the compiler.\n"
+                                          f"package stats\n\n//go:generate go run {WRAPPER_MODULE}@{v} {' '.join(args)}\n")
+            tc.write_text(gen / "stats_test.go", STATS_TEST)
+            code, o, e = run([go, "generate", "./..."], gen)
+            check("go generate runs the release with nothing but Go on PATH",
+                  code == 0 and (gen / "stats.go").is_file(), f"exit {code}\n{o}{e}")
+            lcode, lo, le = run_capture([self.exe, *args], cwd=local)
+            a = (gen / "stats.go").read_bytes() if (gen / "stats.go").is_file() else b""
+            b = (local / "stats.go").read_bytes() if lcode == 0 else b""
+            check("go generate writes the file the compiler under test writes, byte for byte",
+                  a and a == b, f"first at {first_difference(tc.decode(a), tc.decode(b))}\n{lo}{le}")
+            check(f"the release is downloaded once, SHA256SUMS and then the archive, from {url}",
+                  served == downloads(v, f"goose-{v}-{plat}.tar.gz"), str(served))
+            kept = cache / v / plat
+            check("and kept in the user's cache directory",
+                  (kept / "goose").is_file() and (kept / "stdlib" / "std.goose").is_file(),
+                  "\n".join(str(p) for p in sorted(cache.rglob("*"))[:20]) if cache.exists() else f"no {cache}")
+            for what, cmd in (("vetted", ["vet", "./..."]), ("tested", ["test", "-count=1", "./..."])):
+                code, o, e = run([go, *cmd], gen)
+                check(f"the generated library is {what}", code == 0 and not (what == "vetted" and (o + e).strip()),
+                      f"exit {code}\n{o}{e}")
+            with lock:
+                served.clear()
+            code, o, e = run([go, "generate", "./..."], gen)
+            check("go generate again downloads nothing, and writes the same file",
+                  code == 0 and not served and (gen / "stats.go").read_bytes() == a, f"exit {code}\n{o}{e}\n{served}")
+            code, o, e = run([go, "run", f"{WRAPPER_MODULE}@{v}", "--check", *args], gen)
+            check("--check through the wrapper finds the file up to date", code == 0 and not o and not e,
+                  f"exit {code}\n{o}{e}")
+            # The wrapper installed, on every sample, beside the compiler
+            # under test.
+            bindir = work / "bin"
+            code, o, e = run([go, "install", f"{WRAPPER_MODULE}@{v}"], work, GOBIN=str(bindir))
+            wrapper = bindir / f"goose{tc.EXE_SUFFIX}"
+            check("go install of the wrapper", code == 0 and wrapper.is_file(), f"exit {code}\n{o}{e}")
+            samples = parity_samples()
+            dirs = [work / "samples-wrapper", work / "samples-local"]
+            for d in dirs:
+                d.mkdir()
+                for s in (UPSTREAM / "samples").glob("*.goose"):
+                    shutil.copy(s, d / s.name)
+            differ = []
+            for s in samples:
+                sargs = ["--target=go", "-o", f"{s.stem}.go", s.name]
+                ra = run([wrapper, *sargs], dirs[0])
+                rb = run_capture([self.exe, *sargs], cwd=dirs[1])
+                ga, gb = [(d / f"{s.stem}.go").read_bytes() if (d / f"{s.stem}.go").is_file() else None
+                          for d in dirs]
+                if ra != rb or ga != gb or ga is None:
+                    differ.append(f"{s.name}: exit {ra[0]} and {rb[0]}\n{ra[1]}{ra[2]}{rb[1]}{rb[2]}" +
+                                  (f"first at {first_difference(tc.decode(ga), tc.decode(gb))}" if ga and gb else ""))
+            check(f"the installed wrapper compiles {len(samples)} samples to the Go the compiler under test does, "
+                  "downloading nothing", samples and not differ and not served, "\n".join(differ[:6]) + f"\n{served}")
+            # Another release, named; one that is not what its SHA256SUMS
+            # says; and one there is none of.
+            code, o, e = run([wrapper, "version"], work, GOOSE_RELEASE=version)
+            check(f"GOOSE_RELEASE={version} runs that release, which says what the compiler under test says",
+                  code == 0 and o == says and served == downloads(version, name), f"exit {code}\n{o}{e}\n{served}")
+            code, o, e = run([wrapper, "version"], work, GOOSE_RELEASE=tampered)
+            check("an archive that is not what SHA256SUMS says is refused, and not kept",
+                  code != 0 and "SHA256SUMS" in e and not o and
+                  (not (cache / tampered).exists() or not any((cache / tampered).iterdir())), f"exit {code}\n{o}{e}")
+            code, o, e = run([wrapper, "version"], work, GOOSE_RELEASE="v9.9.9")
+            check("a release there is none of is named, with where it was looked for",
+                  code != 0 and f"{url}/v9.9.9/SHA256SUMS" in e and not o, f"exit {code}\n{o}{e}")
+        finally:
+            server.shutdown()
+            server.server_close()
+        return out
+
     def library_asm(self, src, tag, out):
         """The code Go makes of the library src: compiled with --target=go
         --library at -O2 and at -O0 into a module of its own, and by Go for
@@ -2931,6 +3293,10 @@ def main():
     ap.add_argument("--jit-reference", action="store_true",
                     help="run the C reference in the compiler's process (TinyCC)")
     ap.add_argument("--workdir", help="where the generated files go (default build/go-tests)")
+    ap.add_argument("--release-dist", metavar="DIR",
+                    help="the release section runs the compiler of the release in DIR, dist/<version>/ as "
+                         "scripts/release.py build writes it, of the compiler under test's version, in place "
+                         "of the compiler under test packaged")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("names", nargs="*",
                     help="run only these programs of test/go/programs and test/go/build_only")
@@ -2958,9 +3324,10 @@ def main():
     warnings = sorted((HERE / "go" / "warnings").glob("*.goose"))
     # The runtime's sections (issue #19): its package, a library of kernels,
     # one compiled with --go-unexported, and two programs in one package;
-    # and what makes a generated file reproducible (issue #21).
+    # what makes a generated file reproducible (issue #21); and the
+    # prebuilt compilers that `go run` runs (issue #29).
     runtime_sections = {"runtime": r.runtime_package, "kernels": r.kernels, "unexported": r.unexported_library,
-                        "shared": r.shared, "reproducible": r.reproducible}
+                        "shared": r.shared, "reproducible": r.reproducible, "release": r.release}
     if args.names:
         runtime_sections = {k: v for k, v in runtime_sections.items() if k in args.names}
         programs = [p for p in programs if p.stem in args.names]
@@ -2975,7 +3342,7 @@ def main():
             ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
                      "test/go/build_only, test/stdlib, test/threads, test/go/export, "
                      "test/go/bce_gaps, test/go/warnings or samples, and no section runtime, kernels, "
-                     "unexported, shared or reproducible")
+                     "unexported, shared, reproducible or release")
     if args.bless:
         # Their expected output is the C suite's (test/expected/), a
         # sample's its own, an export library's its Go tests, and a BCE
