@@ -101,10 +101,12 @@ export fn self_tagged(recs: const Record[:]) -> i64 { ... }
 ```
 
 A slice of slices is refused the same way ("nested references and slices do
-not cross"). Without the pad, a Goose struct would be 24 bytes where Go's is
-32, since a Goose slice is two words and a Go slice three. So the validation
-routine of the issue keeps its outer loop in Go and makes one export call
-per record for the inner loop over that record's flat `Tags`:
+not cross"), but for a Go `[]string`, a `const (const u8[:])[:]`, which
+`--target=go` has taken since issue #42 (DESIGN.md §3.5). Without the pad, a
+Goose struct would be 24 bytes where Go's is 32, since a Goose slice is two
+words and a Go slice three. So the validation routine of the issue keeps its
+outer loop in Go and makes one export call per record for the inner loop
+over that record's flat `Tags`:
 
 ```go
 // export fn has_tag(tags: const i64[:], id: i64) -> bool
