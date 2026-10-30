@@ -241,6 +241,31 @@ fn count(n: i64) -> i64 {
 
 Only where the body uses the reference as a value -- hands it to a call that is not inlined, stores or returns it, compares its identity -- is the local's address taken, and that local alone takes a slot in the frame. [`DESIGN.md` §3.6](DESIGN.md#36-the-fixed-frame-stack-gsframe) has the details.
 
+## Bounds checks in loops
+
+An index that bounds-check elimination cannot prove in range is checked as it is read, as C checks it: under `--target=go` with `GsIdx`, which Go inlines into an unsigned compare and a branch to a `panic`. Go knows a panic does not return, so a check costs a loop nothing more: what the loop keeps in registers stays there, and past the check Go knows the index is in range. No `assert(0 <= i && i < a.len)` is needed to keep the checks out of the loop's way:
+
+```goose
+// Three checks a step, of children BCE proves nothing of: no value of the
+// loop leaves its register for them.
+fn sift(v: i64[:], start: i64, n: i64) {
+    var i = start;
+    let x = v[i];
+    loop {
+        let l = 2 * i + 1;
+        if l >= n { break; }
+        var m = l;
+        if l + 1 < n && v[l] < v[l + 1] { m = l + 1; }
+        if v[m] <= x { break; }
+        v[i] = v[m];
+        i = m;
+    }
+    v[i] = x;
+}
+```
+
+[`DESIGN.md` §3.12](DESIGN.md#312-bounds-checks-issue-40) has the details.
+
 ## Testing
 
 ```bash
@@ -256,6 +281,7 @@ cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...
 - every sample in `samples/` but those using the C-only `gfx`, `ui`, `audio` and `physics` modules, run in a directory of their own with their arguments and stdin, against `samples/expected/`;
 - the `export fn` libraries of `test/go/export/`, whose Go tests call their entry points (with `testing.AllocsPerRun` checking that a call allocates nothing, and a `TestMain` checking that importing the package mapped nothing);
 - the code Go makes of the wide loads and stores of `test/go/export/wide/`, for arm64 and for amd64: one load or one store each, of the width its `// asm:` line names; and of the selects of `test/go/export/selects/`: a conditional select each, and no conditional branch but its loop's and its guard's;
+- the code Go makes of the bounds checks of `test/go/export/bounds/`, for arm64 and for amd64: no value spilled to the frame around a check, no check of Go's own past one, and every `GsIdx` and `GsSub` inlined;
 - the reproducers of the bounds-check elimination gaps of `test/go/bce_gaps/`, checked with `goose --check --bce-test`;
 - the frames of the export fns of `test/go/export/inline_refs/`, whose locals are handed to inlined functions by reference: as many slots on the fixed-frame stack as each one's `// frame:` line names, none at all for most;
 - the warnings the Go backend gives where the C backend does not yet, of a shift by a constant count outside its type's width (`test/go/warnings/`), each declared by a `// warning:` line as the C suite declares its own;
