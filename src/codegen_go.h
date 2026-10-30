@@ -481,9 +481,6 @@ struct CodeGenGo {
         Index *ix = nullptr;
         int64_t off = 0, shift = 0;
     };
-    // A wide load or store needs encoding/binary: one that is emitted, not
-    // one in code no path reaches, whose text is dropped (GenUnreached).
-    bool usesbinary = false;
     bool SamePure(Node *a, Node *b);
     bool WideIndex(Node *idx, Node *&base, int64_t &off);
     bool WideElem(Index *ix);
@@ -1054,7 +1051,6 @@ struct CodeGenGo {
     string StackArgs(FnSpec *sp, Line ln);
     string SpecCallX(Call *c, FnSpec *sp);
     string ExternCallX(Call *c, FnSpec *sp);
-    bool usesbits = false;   // A call needs math/bits (ExternCallX).
     vector<string> EmitSpecCall(Call *c, FnSpec *sp, const GoDst &d0, vector<GoDst> *alldst);
     bool NeedsReprefix(const GoDst &d, TypeExpr *rt);
     void EmitSlidePrefix(const string &base, IntStorage ls, const string &stk, const string &lenlv);

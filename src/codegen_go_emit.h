@@ -1402,6 +1402,14 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "var gsProg = GsProgram{StackReserve: gsStackReserve, StackGap: gsStackGap, FrameReserve: "
                    "gsFrameReserve", library ? ", Library: true" : "", "}\n\n");
     };
+    // The package's own, in its runtime file, which the runtime's block API
+    // makes blocks for (NewStackBlock, AcquireStackBlock), of the sizes the
+    // package's programs share: each program has one of its own too.
+    auto pkgprogdecl = string("// The package's place in the runtime, whose blocks the runtime's block API makes\n"
+                              "// (NewStackBlock, AcquireStackBlock), of the configuration its programs share; each\n"
+                              "// program has a place of its own too.\n"
+                              "var gsProg = GsProgram{StackReserve: gsStackReserve, StackGap: gsStackGap, FrameReserve: "
+                              "gsFrameReserve}\n\n");
     auto program = [&](bool withprog) {
         return cat("// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", withprog ? progdecl(opts.library) : "",
                    tdecls, inst, gdecls, gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code,
@@ -1597,16 +1605,15 @@ inline string CodeGenGo::Source(const string &srcname) {
     string runtime;
     if (!decls.empty())
         runtime = cat("// ---- runtime ----\n"
-                      "// The Goose runtime for Go (runtime/go, the package ", GO_RUNTIME_PATH, "):\n",
-                      full ? "// all of it (--go-runtime=full), which builds with nothing but the Go standard\n"
-                             "// library. "
-                      : shared ? "// the part of it the package's programs use, which builds with nothing but the Go\n"
-                                 "// standard library. "
-                               : "// the part of it the program uses, which builds with nothing but the Go standard\n"
-                                 "// library. ",
-                      "Its names start with gs or Gs, which no name from the program\n"
-                      "// does (those end in _g), and are the runtime's own: a file that holds it may\n"
-                      "// not declare them.\n\n",
+                      "// The Goose runtime for Go, the package ", GO_RUNTIME_PATH, "\n"
+                      "// (runtime/go): ",
+                      full ? "all of it (--go-runtime=full)"
+                      : shared ? "the part of it the package's programs use"
+                               : "the part of it the program uses",
+                      ", which builds with nothing\n"
+                      "// but the Go standard library. Its names start with gs or Gs, which no name\n"
+                      "// from the program does (those end in _g), and are the runtime's own: a file\n"
+                      "// that holds it may not declare them.\n\n",
                       GoRuntimeText(decls, rtcode, rtwords));
     // The alias's own names are the package's, which no rename touches.
     auto aliascode = rtcode, aliaswords = rtwords;
@@ -1614,7 +1621,7 @@ inline string CodeGenGo::Source(const string &srcname) {
         aliascode.erase(n);
         aliaswords.erase(n);
     }
-    string pkgsection = cat(config, pkgprog ? GoRenameIdents(progdecl(false), rtcode, {}, rtwords) : "",
+    string pkgsection = cat(config, pkgprog ? GoRenameIdents(pkgprogdecl, rtcode, {}, rtwords) : "",
                             alias ? GoRenameIdents(aliastext, aliascode, {}, aliaswords) : "", runtime);
     // The imports a text needs: the packages its Go names, and the runtime's
     // where it is imported.

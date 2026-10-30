@@ -937,6 +937,8 @@ Options:
   --unsafe-no-rf-check  Leave out the checks after calls that a `return ...
                         from` can pass through: unsound, for pricing them only.
   --gen-runtime-header  Regenerate src/runtime_inline.h from src/runtime/.
+  --emit-go-runtime dir Write the Go runtime this compiler embeds, the files of
+                        runtime/go it was built with, into dir.
 
 goose format --verify file.goose|dir... formats each file in memory and
 writes nothing: it checks the result as a format does, and that formatting

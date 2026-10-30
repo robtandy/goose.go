@@ -214,7 +214,6 @@ inline bool CodeGenGo::GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a,
     }
     // popcount, clz and ctz count 64 for zero, as Go's math/bits does.
     if (name == "gs_popcount" || name == "gs_clz" || name == "gs_ctz") {
-        usesbits = true;
         auto fn = name == "gs_popcount" ? "OnesCount64" : name == "gs_clz" ? "LeadingZeros64" : "TrailingZeros64";
         x = cat("int64(bits.", fn, "(", a[0], "))");
         return true;
