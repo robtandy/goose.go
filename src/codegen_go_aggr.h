@@ -1224,6 +1224,8 @@ inline CodeGenGo::FnState CodeGenGo::SaveFnState() {
     s.fnnextsuffix = std::move(fnnextsuffix);
     s.vnames = std::move(vnames);
     s.fvptr = std::move(fvptr);
+    s.refvars = std::move(refvars);
+    s.refplaces = std::move(refplaces);
     s.scopes = std::move(scopes);
     s.dead = dead;
     s.dry = dry;
@@ -1261,6 +1263,8 @@ inline CodeGenGo::FnState CodeGenGo::SaveFnState() {
     fnnextsuffix.clear();
     vnames.clear();
     fvptr.clear();
+    refvars.clear();
+    refplaces.clear();
     scopes.clear();
     rendering.clear();
     ind = 1;
@@ -1280,6 +1284,8 @@ inline void CodeGenGo::RestoreFnState(FnState &s) {
     fnnextsuffix = std::move(s.fnnextsuffix);
     vnames = std::move(s.vnames);
     fvptr = std::move(s.fvptr);
+    refvars = std::move(s.refvars);
+    refplaces = std::move(s.refplaces);
     scopes = std::move(s.scopes);
     dead = s.dead;
     dry = s.dry;

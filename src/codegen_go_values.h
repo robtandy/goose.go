@@ -315,7 +315,9 @@ inline string CodeGenGo::Snapshot(TypeExpr *t, const string &x) {
 
 inline string CodeGenGo::GenPure(Node *n) {
     auto x = GenX(n);
-    if (IsGoConst(x)) return x;
+    // A constant, or the address of a place an inlined body's parameter
+    // names, which nothing can change (BindRefPlace).
+    if (IsGoConst(x) || RefPlace(x, n->exprtype)) return x;
     return Snapshot(n->exprtype, x);
 }
 
@@ -379,6 +381,9 @@ inline string CodeGenGo::GoStr(string_view v) {
 // A variable as Go names it: a local, a global, or a free variable through
 // the pointer it arrived as.
 inline string CodeGenGo::VarRef(const VarDef *vd, Line ln) {
+    // An inlined body's reference parameter that names a place is the
+    // reference to it (BindRefPlace).
+    if (auto it = refvars.find(vd); it != refvars.end()) return it->second;
     if (auto it = vnames.find(vd); it != vnames.end())
         return fvptr.count(vd) ? cat("(*", it->second, ")") : it->second;
     if (auto it = gnames.find(vd); it != gnames.end()) return it->second;

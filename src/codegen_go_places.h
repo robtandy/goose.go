@@ -93,6 +93,7 @@ inline CodeGenGo::GoLoc CodeGenGo::AtRef(const string &x, TypeExpr *rt) {
     auto sub = rt->ref->sub;
     if (IsResz(sub)) return FatRefLoc(x, sub);
     if (IsBytesT(sub)) return BytesLoc(x, sub, GoLoc {});
+    if (auto p = RefPlace(x, rt)) return *p;
     return RefIsAddr(rt) ? AtAddr(x, sub) : AtTyped(x, sub);
 }
 
@@ -405,6 +406,10 @@ inline CodeGenGo::GoLoc CodeGenGo::IndexLoc(GoLoc l, Node *idxnode, Line ln, boo
 // Paths.
 
 inline CodeGenGo::GoLoc CodeGenGo::VarLoc(const VarDef *vd, Line ln) {
+    // An inlined body's reference parameter that names a place: the
+    // reference value it stands for, whose dereference is the place
+    // (BindRefPlace).
+    if (auto it = refvars.find(vd); it != refvars.end()) return AtVar(it->second, vd->type);
     if (vd->reusable && !vpool.count(vd) && !gpools.count(vd)) {
         // A captured pool arrives as a GsPref.
         auto l = FatRefLoc(VarRef(vd, ln), vd->type);
@@ -468,6 +473,12 @@ inline void CodeGenGo::DerefLoc(GoLoc &l) {
         l.viaref = viaref;
         return;
     }
+    // The address of a place an inlined body's parameter names: the place.
+    if (auto p = l.unal ? nullptr : RefPlace(l.lv, l.t)) {
+        l = *p;
+        l.viaref = l.viaref || viaref;
+        return;
+    }
     if (IsRelRef(l.t)) {
         auto p = T();
         Decl(p, "unsafe.Pointer", RelLoad(l));
@@ -495,6 +506,72 @@ inline string CodeGenGo::RelLoad(const GoLoc &slot) {
     }
     if (!slot.t->ref->optional) return cat("unsafe.Add(", AddrOf(slot), ", ", off, ")");
     return cat("GsRelLoad(", AddrOf(slot), ", ", off, ")");
+}
+
+// ------------------------------------------------------------------
+// By-reference parameters of inlined bodies (issue #24).
+
+// The place the reference value x names, where it is the value of an
+// inlined body's parameter that names the place (BindRefPlace) and rt, the
+// type x is dereferenced as, a plain reference to a value of the place's Go
+// type; null otherwise.
+inline const CodeGenGo::GoLoc *CodeGenGo::RefPlace(const string &x, TypeExpr *rt) {
+    if (refplaces.empty() || !rt || rt->kind != TY_REF || IsRelRef(rt)) return nullptr;
+    auto it = refplaces.find(x);
+    if (it == refplaces.end()) return nullptr;
+    auto sub = rt->ref->sub;
+    if (!IsFix(sub) || GoT(sub, Line {}) != GoT(it->second.t, Line {})) return nullptr;
+    return &it->second;
+}
+
+// An inlined call's reference parameter d, bound to its argument init
+// (GenInlineArgs, BindLocal). Where init is `&path`, as a by-reference
+// argument is, and the path a place of a Go local's own (GoLoc::golocal), d
+// names the place: nothing is declared, and only the place's bounds check,
+// where it has one, runs here, as the binding's would (PinLoc). A parameter
+// handed another that names a place (`x`, or `&x`, which is the reference x
+// holds, §3.8) names it too. Any other path is a Go variable holding its
+// address, as GenRefVal takes it. False, with nothing emitted, where d is no
+// plain reference to a fixed-size value, or one that a `var` may rebind or
+// a nested function reaches (which takes the address of the parameter
+// itself, FreeVarArg), or init is no path: BindLocal binds those as it binds
+// any local.
+inline bool CodeGenGo::BindRefPlace(VarDef *d, Node *init) {
+    auto t = d->type;
+    if (!init || !t || t->kind != TY_REF || IsRelRef(t) || t->ref->optional || d->isvar ||
+        d->captured || !IsFix(t->ref->sub) || IsLargeFixed(t->ref->sub))
+        return false;
+    if (auto id = Is<Ident>(init); id && id->vdef) {
+        auto it = refvars.find(id->vdef);
+        if (it == refvars.end() || !RefPlace(it->second, t)) return false;
+        auto rv = it->second;
+        refvars[d] = rv;
+        return true;
+    }
+    auto u = Is<Unary>(init);
+    if (!u || u->op != T_BITAND || !(Is<Ident>(u->child) || Is<Dot>(u->child) || Is<Index>(u->child)) ||
+        !u->exprtype || u->exprtype->kind != TY_REF)
+        return false;
+    // `&path` as GenX generates it (GenUnary, GenRefVal), up to the place.
+    auto ln = u->line;
+    if (ln.line > 0) curline = ln;
+    GoT(u->exprtype, ln);
+    auto l = GenLoc(u->child);
+    if (l.t->kind != TY_REF && l.golocal && !l.lv.empty() && !l.unal && !l.viaref && l.addr.empty() &&
+        l.ptr.empty() && l.stk.empty() && GoT(l.t, ln) == GoT(t->ref->sub, ln)) {
+        auto p = PinLoc(l);
+        auto rv = RefOfLoc(p);
+        refplaces[rv] = p;
+        refvars[d] = rv;
+        return true;
+    }
+    auto rv = RefValOf(l, ln);
+    if (l.t->kind == TY_REF && RefPlace(rv, t)) {
+        refvars[d] = rv;
+        return true;
+    }
+    Decl(LocalName(d), LocalT(t, d->line), Coerce(rv, u->exprtype, t, ln));
+    return true;
 }
 
 inline CodeGenGo::GoLoc CodeGenGo::GenLoc(Node *n) {
@@ -670,8 +747,10 @@ inline void CodeGenGo::CopyIntoLimited(const GoLoc &l, TypeExpr *et, Line ln, co
 
 // &lvalue (§3.8): the reference to it, or the reference a place holding one
 // holds (a relative one decoded).
-inline string CodeGenGo::GenRefVal(Node *child, Line ln) {
-    auto l = GenLoc(child);
+inline string CodeGenGo::GenRefVal(Node *child, Line ln) { return RefValOf(GenLoc(child), ln); }
+
+// The reference to the place l, or the one it holds.
+inline string CodeGenGo::RefValOf(const GoLoc &l, Line ln) {
     if (l.t->kind == TY_REF) return LoadLoc(l, l.t, ln);
     // A reference to a resizable value is its header's address and its
     // stack (C.2), one to a bytes value the value's address.
@@ -695,6 +774,7 @@ inline string CodeGenGo::CoerceVal(const string &x, TypeExpr *from, TypeExpr *to
         auto sub = from->ref->sub;
         if (IsResz(sub)) return LoadLoc(FatRefLoc(x, sub), to, ln);
         if (IsBytesT(sub)) return LoadLoc(BytesLoc(x, sub, GoLoc {}), to, ln);
+        if (auto p = RefPlace(x, from)) return LoadLoc(*p, to, ln);
         return LoadLoc(RefIsAddr(from) ? AtAddr(x, sub) : AtTyped(x, sub), to, ln);
     }
     if (TEq(from, to)) return x;
