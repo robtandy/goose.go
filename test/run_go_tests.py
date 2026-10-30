@@ -81,7 +81,13 @@ the code of the selects of test/go/export/selects/ (issue #26): each export
 fn an `// asm: select, branches m` line annotates must have a conditional
 select (CSEL and its kin on arm64, CMOV on amd64) and exactly m conditional
 branches, those of its loop and its guard, so that no choice it makes is a
-branch (Runner.select_asm).
+branch (Runner.select_asm). So is the code of the bounds checks of
+test/go/export/bounds/ (issue #40): each export fn an `// asm: no spills`
+line annotates must keep its values in registers across every check,
+moving none to a slot of its frame and back, and each one an `// asm: no
+index checks` line must leave Go none of its own bounds checks to make;
+and Go must inline every check, GsIdx and GsSub, into its caller
+(Runner.spill_asm).
 
 The reproducers of the gaps in the front end's bounds-check elimination
 that issue #26 found, test/go/bce_gaps/ (whose README.md writes them up),
@@ -1100,6 +1106,122 @@ def select_counts(arch, asm, fn):
         elif BRANCH_OPS[arch].match(op):
             found[1].append(f"{op} {args}")
     return found
+
+
+# --- the code Go makes of bounds checks (issue #40) ---------------------------
+
+# A named slot of a function's frame on Go's stack, which Go spills a value
+# to and restores it from: a local's or a temporary's (`pkg.i_g-56(SP)`,
+# `pkg..autotmp_3+8(SP)`), or an argument's in its caller's frame
+# (`pkg.v_g(FP)`). Not the address of one (`$pkg.a_g-128(SP)`), an element of
+# a Go array there (`pkg.a_g+8(SP)(AX*8)`), nor the frame's own words, which
+# have no name: the return address, the frame pointer, the arguments
+# morestack saves.
+SPILL_SLOT = re.compile(r"^[^$\s]\S*[A-Za-z_]\S*\((?:SP|FP)\)$")
+# The calls of Go's own bounds checks' failures: runtime.panicIndex and its
+# kin, runtime.panicBounds in later Go.
+INDEX_PANIC = re.compile(r"\bruntime\.panic(?:Index|Bounds)\w*\(SB\)")
+
+
+def spill_annotations(src):
+    """The export fns of src an `// asm: no spills` or `// asm: no index
+    checks` comment line above names: name -> "spills" or "index checks"."""
+    want, pending = {}, None
+    for line in src.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^// asm: no (spills|index checks)$", line)
+        if m:
+            pending = m[1]
+            continue
+        m = re.match(r'^export (?:"\w+" )?fn (\w+)\(', line)
+        if m and pending:
+            want[m[1]] = pending
+        if not line.startswith("//"):
+            pending = None
+    return want
+
+
+def asm_insns(asm, fn):
+    """The instructions of the function fn in the output of `go build
+    -gcflags=-S`, each its operation and its operands, or None where fn is
+    not there."""
+    found = None
+    for line in asm.splitlines():
+        m = re.match(r"^(\S+) STEXT", line)
+        if m:
+            if found is not None:
+                break
+            if m[1].endswith("." + fn):
+                found = []
+            continue
+        if found is None:
+            continue
+        parts = line.split("\t")
+        if not line.startswith("\t0x") or len(parts) < 3:
+            if line and not line.startswith("\t"):
+                break
+            continue
+        operands, depth, cur = [], 0, ""
+        for c in "\t".join(parts[3:]).strip():
+            depth += c in "(["
+            depth -= c in ")]"
+            if c == "," and not depth:
+                operands.append(cur.strip())
+                cur = ""
+            else:
+                cur += c
+        operands.append(cur.strip())
+        found.append((parts[2].strip(), [o for o in operands if o]))
+    return found
+
+
+def spill_moves(asm, fn):
+    """The instructions of the function fn in the output of `go build
+    -gcflags=-S` that move a value between a register and a named slot of
+    its frame (SPILL_SLOT), each as text, or None where fn is not there:
+    every spill and every restore, but an argument's spill to its slot in
+    its caller's frame, which no loop holds: Go places a spill no deeper in
+    loops than the value's definition, an argument's the entry."""
+    insns = asm_insns(asm, fn)
+    if insns is None:
+        return None
+    out = []
+    for op, operands in insns:
+        if op.startswith("LEA") or op in ("PCDATA", "FUNCDATA"):
+            continue
+        slots = [k for k, o in enumerate(operands) if SPILL_SLOT.match(o)]
+        if not slots or (slots == [len(operands) - 1] and len(operands) > 1 and operands[-1].endswith("(FP)")):
+            continue
+        out.append(f"{op} {', '.join(operands)}")
+    return out
+
+
+def index_panics(asm, fn):
+    """The calls of the function fn, in the output of `go build -gcflags=-S`,
+    to the failure of a bounds check of Go's own (INDEX_PANIC), or None
+    where fn is not there."""
+    insns = asm_insns(asm, fn)
+    if insns is None:
+        return None
+    return [f"{op} {', '.join(o)}" for op, o in insns if op == "CALL" and INDEX_PANIC.search(" ".join(o))]
+
+
+def not_inlined(gosrc, mout, names):
+    """The calls of the runtime functions names in the generated Go gosrc,
+    `line:col name` each, that the output of `go build -gcflags=-m` of its
+    package, mout, does not say Go inlines: Go places a call at its
+    parenthesis, or at the name. Their declarations and comments are no
+    calls."""
+    inlined = set(re.findall(r"^\./[\w.]+:(\d+:\d+): inlining call to (\w+)", mout, re.M))
+    out = []
+    for i, line in enumerate(gosrc.splitlines(), 1):
+        if line.lstrip().startswith("//"):
+            continue
+        for m in re.finditer(r"\b(\w+)\(", line):
+            if m[1] not in names or line[:m.start()].endswith("func "):
+                continue
+            if (f"{i}:{m.end()}", m[1]) not in inlined and (f"{i}:{m.start() + 1}", m[1]) not in inlined:
+                out.append(f"{i}:{m.end()} {m[1]}")
+    return out
 
 
 # --- the frames of locals handed to inlined bodies by reference (issue #24) ---
@@ -2831,6 +2953,45 @@ class Runner:
                             f"{len(sels)} select(s), {len(brs)} branch(es):\n" + "\n".join(sels + brs)))
         return out
 
+    def spill_asm(self):
+        """The code Go makes of the bounds checks of
+        test/go/export/bounds/bounds.goose (issue #40), at -O2 and at -O0, for
+        each of WIDE_ARCHES (Runner.library_asm): each export fn an `// asm:
+        no spills` line annotates must move no value between a register and
+        its frame (spill_moves), which a check whose failure Go took to
+        return made it do around the check, and each one an `// asm: no
+        index checks` line must make none of Go's own checks (index_panics),
+        which Go proves pass past GsIdx; and every call of GsIdx and GsSub
+        in the file must be one Go inlines (`go build -gcflags=-m`)."""
+        out = []
+        src = HERE / "go" / "export" / "bounds" / "bounds.goose"
+        want = spill_annotations(src)
+        if not want:
+            out.append(("fail", f"spill asm: no // asm: line in {src.name}", None))
+            return out
+        levels = set()
+        for level, arch, asm in self.library_asm(src, "bounds", out):
+            if level not in levels:
+                levels.add(level)
+                mod = self.work / f"bounds-asm-O{level}"
+                r = subprocess.run([self.go, "build", "-gcflags=-m", "."], cwd=mod, env=go_env(),
+                                   capture_output=True)
+                mout = tc.decode(r.stdout) + tc.decode(r.stderr)
+                gosrc = (mod / f"{src.stem}.go").read_text(encoding="utf-8")
+                absent = [n for n in ("GsIdx", "GsSub") if not re.search(rf"^(?!func ).*\b{n}\(", gosrc, re.M)]
+                missed = not_inlined(gosrc, mout, {"GsIdx", "GsSub"}) if r.returncode == 0 else [mout[-2000:]]
+                ok = not absent and not missed
+                out.append(("ok" if ok else "fail", f"spill asm -O{level}: GsIdx and GsSub inlined",
+                            None if ok else "\n".join(missed + [f"no call of {n}" for n in absent])))
+            for fn, what in sorted(want.items()):
+                label = f"spill asm {fn} -O{level} {arch}: no {what}"
+                got = (spill_moves if what == "spills" else index_panics)(asm, f"{fn}_g")
+                if got is None:
+                    out.append(("fail", label, f"no {fn}_g in Go's code for {arch}"))
+                    continue
+                out.append(("ok" if not got else "fail", label, None if not got else "\n".join(got)))
+        return out
+
     def bce_gaps(self, src):
         """A reproducer of a gap in the front end's bounds-check elimination
         (test/go/bce_gaps/, issue #26): at -O1 and -O2, where calls are
@@ -3374,6 +3535,10 @@ def main():
             futures.append(pool.submit(r.wide_asm))
         if not args.bless and (not args.names or "selects" in args.names):
             futures.append(pool.submit(r.select_asm))
+        # The code Go makes of bounds checks (issue #40), beside their export
+        # library's own tests.
+        if not args.bless and (not args.names or "bounds" in args.names):
+            futures.append(pool.submit(r.spill_asm))
         # The frames of locals handed to inlined bodies by reference (issue
         # #24), beside their export library's own tests.
         if not args.bless and (not args.names or "inline_refs" in args.names):
