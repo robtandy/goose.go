@@ -1,0 +1,19 @@
+bump2 93 279 24
+both 24
+shift [1, 4, 3, 4] 2
+nudge 4 4
+mark 4 1 1
+total 16 middle 7
+larger 3 107 same false true
+kept 42 42
+find 4 -1
+count_to 11
+deferred 5 50
+area 12 12
+reshape 75 0
+packed 7 7
+show 9 10
+advance 2 30
+fill [7, 4, 5, 6]
+flip false 8.75
+depth 103 0
