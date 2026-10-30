@@ -2555,6 +2555,7 @@ class Runner:
         if check("bind_goose.go's //go:generate line runs goose", argv[:1] == ["goose"], line[0] if line else ""):
             code, o, e = run_capture([self.exe, "--check"] + argv[1:], cwd=mod)
             check("goose --check of what go generate wrote", code == 0, f"exit {code}\n{o}{e}")
+            check("the kernel's compile warns of nothing", ": warning:" not in o + e, o + e)
         text = gofile.read_text(encoding="utf-8")
         counts = {k: text.count(k) for k in EXAMPLE_LOADS}
         check("its loads", counts == EXAMPLE_LOADS, f"{counts}, where the guide says {EXAMPLE_LOADS}")
