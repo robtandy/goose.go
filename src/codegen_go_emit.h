@@ -1425,11 +1425,10 @@ inline string GoHeaderFlags(const GoOptions &o, uint64_t framereserve, uint64_t 
 // The whole file: a build constraint where --go-build gives one, a header
 // Go tools know generated code by, which records what wrote the file (the
 // compiler's version, the runtime's revision and the options, issue #21),
-// the package, the imports, the runtime
-// configuration and the runtime -- the part the program uses, all of it, or
-// none, where it imports the runtime's package (codegen_go_runtime.h) --
-// then the program, laid out as gofmt lays it out (GoFormat), and the
-// --include files. With --go-runtime-file the configuration and the
+// the package, the imports, the runtime configuration and the runtime --
+// the part the program uses, all of it, or none, where it imports the
+// runtime's package (codegen_go_runtime.h) -- then the program, laid out
+// as gofmt lays it out (GoFormat), and the --include files. With --go-runtime-file the configuration and the
 // runtime go to that file instead (runtimefiletext), which the package's
 // programs share, and the program's own names carry its file's name.
 inline string CodeGenGo::Source(const string &srcname) {
