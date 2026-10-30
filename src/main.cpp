@@ -1913,6 +1913,10 @@ int Main(int argc, char **argv) {
             go.runtime = goruntime == "import" ? GO_RT_IMPORT : goruntime == "full" ? GO_RT_FULL : GO_RT_EMBED;
             go.unexported = gounexported;
             go.nowithstack = gonowithstack;
+            go.version = CompilerVersion();
+            go.optlevel = optlevel;
+            go.nobce = nobce;
+            go.defaults = StackConfigOf({});
             // The package's runtime file: beside the program's, in its
             // package, which its name in the program's header is relative
             // to; and what it holds where it is there already.
