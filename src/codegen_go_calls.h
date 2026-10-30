@@ -28,7 +28,7 @@ inline string CodeGenGo::FreeVarArg(const VarDef *fv) {
         if (!ours || !vpool.count(fv)) return name;
         auto &p = vpool[fv];
         auto t = T();
-        Decl(t, "GsPref", cat("GsPref{&", name, ", ", vstk[fv], ", &", p.first, ", ", p.second, "}"));
+        Decl(t, "GsPref", cat("GsPref{Hdr: &", name, ", Stk: ", vstk[fv], ", FreeHdr: &", p.first, ", FreeStk: ", p.second, "}"));
         return t;
     }
     if (fv->type && IsResz(fv->type))
@@ -1023,7 +1023,7 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
         }
         case B_EXIT: {
             auto x = GenX(an[0]);
-            L("GsExit(", Coerce(x, an[0]->exprtype, ast.inttypes[IS_I64], ln), ")");
+            L("gsProg.Exit(", Coerce(x, an[0]->exprtype, ast.inttypes[IS_I64], ln), ")");
             return;
         }
         case B_DEFAULT: {
@@ -1154,7 +1154,7 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             usesthreads = true;
             if (d.k == GD_DISCARD) return;
             auto want = d.t ? d.t : c->exprtype;
-            L(d.s, " = ", Coerce("GsHardwareThreads()", ast.inttypes[IS_I64], want, ln));
+            L(d.s, " = ", Coerce("gsProg.HardwareThreads()", ast.inttypes[IS_I64], want, ln));
             return;
         }
         case B_THREAD_SPAWN: case B_THREAD_SPAWN_CONTAINED: case B_THREAD_WAIT: case B_QPUT: {
@@ -1243,8 +1243,8 @@ inline void CodeGenGo::EmitPrint(Call *c) {
         RenderInto(cur, end, a, c);
     }
     rtarget = saved;
-    L(cur, " = gsPutStr(", cur, ", ", end, ", \"\\n\")");
-    L("gsOut(", base, ", ", cur, ")");
+    L(cur, " = GsPutStr(", cur, ", ", end, ", \"\\n\")");
+    L("GsOut(", base, ", ", cur, ")");
     // An overload grew the line as a builder: the stack's top goes back.
     if (rt.used) L(Top(k), " = ", base);
 }
@@ -1291,7 +1291,7 @@ inline void CodeGenGo::EmitUserFormat(const string &cur, const GoLoc &l, FnSpec 
     if (rt.b.hdr.empty()) {
         // print's line, from where it starts.
         auto h = T();
-        Decl(h, "GsRhdr", cat("GsRhdr{", rt.base, ", int64(uintptr(", cur, ") - uintptr(", rt.base, "))}"));
+        Decl(h, "GsRhdr", cat("GsRhdr{Base: ", rt.base, ", Len: int64(uintptr(", cur, ") - uintptr(", rt.base, "))}"));
         b.t = GrowU8();
         b.hdr = h;
         b.stk = rt.stk;
@@ -1368,7 +1368,7 @@ inline void CodeGenGo::PlaceRender(const string &cur, const string &end, const R
     rctx = ra.ctx;
     auto t = ra.t;
     if (ra.lit) {
-        L(cur, " = gsPutStr(", cur, ", ", end, ", ", GoStr(ra.lit->val), ")");
+        L(cur, " = GsPutStr(", cur, ", ", end, ", ", GoStr(ra.lit->val), ")");
         return;
     }
     if (!ra.scalar) {
@@ -1378,14 +1378,14 @@ inline void CodeGenGo::PlaceRender(const string &cur, const string &end, const R
     auto &x = ra.x;
     switch (t->kind) {
         case TY_INT:
-            if (t->intstorage == IS_U64) L(cur, " = gsFmtU64(", cur, ", ", end, ", ", x, ")");
-            else L(cur, " = gsFmtI64(", cur, ", ", end, ", ", Coerce(x, t, ast.inttypes[IS_I64], ln), ")");
+            if (t->intstorage == IS_U64) L(cur, " = GsFmtU64(", cur, ", ", end, ", ", x, ")");
+            else L(cur, " = GsFmtI64(", cur, ", ", end, ", ", Coerce(x, t, ast.inttypes[IS_I64], ln), ")");
             return;
         case TY_FLT:
-            L(cur, " = gsFmt", t->fltstorage == FS_F32 ? "F32" : "F64", "(", cur, ", ", end, ", ", x, ")");
+            L(cur, " = GsFmt", t->fltstorage == FS_F32 ? "F32" : "F64", "(", cur, ", ", end, ", ", x, ")");
             return;
         default:
-            L(cur, " = gsFmtBool(", cur, ", ", end, ", ", x, ")");
+            L(cur, " = GsFmtBool(", cur, ", ", end, ", ", x, ")");
             return;
     }
 }

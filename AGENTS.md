@@ -23,6 +23,7 @@ The compiler is a C++20 single-translation-unit binary (`src/main.cpp` includes 
   ```bash
   ./build/goose version
   ```
+- **The Go runtime is the compiler's**: the build embeds the source of `runtime/go/` (all of it but `goose_package.go` and `goose_extra.go`, `cmake/go_runtime.cmake`), which is the one copy of the runtime a `--target=go` file holds or imports. After editing it, rebuild the compiler; `test/run_go_tests.py` fails where the compiler's runtime is not `runtime/go`'s. A name the generated code calls must be exported there, marked `//goose:internal` where a file holding the runtime keeps it to itself (DESIGN.md §2, §3.11).
 
 ## Running Tests
 

@@ -26,10 +26,10 @@ func importDid() string {
 	switch {
 	case debug.SetPanicOnFault(false):
 		return "turned on the main goroutine's panic on fault"
-	case gsMaps.Load() != 0:
-		return fmt.Sprintf("mapped memory %d times", gsMaps.Load())
-	case len(gsBlocks) != 0:
-		return fmt.Sprintf("made %d blocks of data stacks", len(gsBlocks))
+	case mapCount() != 0:
+		return fmt.Sprintf("mapped memory %d times", mapCount())
+	case blockCount() != 0:
+		return fmt.Sprintf("made %d blocks of data stacks", blockCount())
 	case starts_g != 0 || ANSWER_g != 0:
 		return "ran the globals' initializers"
 	}
@@ -57,8 +57,8 @@ func TestStartsOnce(t *testing.T) {
 	if n := Started(); n != 1 {
 		t.Errorf("the initializers ran %d times", n)
 	}
-	if gsMaps.Load() == 0 || len(gsBlocks) == 0 {
-		t.Errorf("the start reserved nothing: %d mappings, %d blocks", gsMaps.Load(), len(gsBlocks))
+	if mapCount() == 0 || blockCount() == 0 {
+		t.Errorf("the start reserved nothing: %d mappings, %d blocks", mapCount(), blockCount())
 	}
 }
 

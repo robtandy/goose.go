@@ -92,7 +92,7 @@ func TestAbortMessages(t *testing.T) {
 }
 
 // abort(msg)'s message is the program's bytes, copied before the stacks
-// they may live on unwind.
+// they may live on unwind (GsAbortSlice), or a literal's (GsAbortMsg).
 func TestAbortMsgCopies(t *testing.T) {
 	gs := NewStackBlock(1, 1<<20, 64<<10)
 	defer gs.Close()
@@ -101,14 +101,17 @@ func TestAbortMsgCopies(t *testing.T) {
 	var e *GsError
 	func() {
 		defer func() { e, _ = recover().(*GsError) }()
-		GsAbortMsg(gs.Stks[0], int64(len(msg)), "abort_msg.goose", 15)
+		GsAbortSlice(GsSlice{Data: gs.Stks[0], Len: int64(len(msg))}, "abort_msg.goose", 15)
 	}()
 	*(*byte)(gs.Stks[0]) = 'X'
 	if e == nil || e.Msg != msg || e.Error() != "goose runtime error: custom failure (abort_msg.goose:15)" {
 		t.Fatalf("abort(msg): %#v", e)
 	}
-	if got := abortText(func() { GsAbortMsg(nil, 0, "t.goose", 7) }); got != "goose runtime error: "+at {
+	if got := abortText(func() { GsAbortSlice(GsSlice{}, "t.goose", 7) }); got != "goose runtime error: "+at {
 		t.Errorf("an empty message: %q", got)
+	}
+	if got := abortText(func() { GsAbortMsg("a literal", "t.goose", 7) }); got != "goose runtime error: a literal"+at {
+		t.Errorf("a literal message: %q", got)
 	}
 }
 
@@ -659,12 +662,20 @@ func TestVarints(t *testing.T) {
 		if n != size || GsUlebSize(p) != n || uint64(GsUlebRead(p)) != v {
 			t.Fatalf("%d: wrote %d bytes, size %d, read %d", v, n, GsUlebSize(p), GsUlebRead(p))
 		}
-		end := unsafe.Add(p, n)
-		if got, k := GsUlebCheck(p, end); got != v || k != n {
+		if got, k := GsUlebCheck(p, 0, n); got != v || k != n {
 			t.Fatalf("GsUlebCheck of %d: %d, %d bytes", v, got, k)
 		}
-		if _, k := GsUlebCheck(p, unsafe.Add(end, -1)); k != 0 {
+		if _, k := GsUlebCheck(p, 0, n-1); k != 0 {
 			t.Fatalf("GsUlebCheck of %d cut short: %d bytes", v, k)
+		}
+		// At an offset into the image, bounded by its end.
+		*(*byte)(unsafe.Add(p, n)) = 0
+		GsUlebWrite(unsafe.Add(p, 1), v)
+		if got, k := GsUlebCheck(p, 1, n+1); got != v || k != n {
+			t.Fatalf("GsUlebCheck of %d at 1: %d, %d bytes", v, got, k)
+		}
+		if _, k := GsUlebCheck(p, 1, n); k != 0 {
+			t.Fatalf("GsUlebCheck of %d at 1 cut short: %d bytes", v, k)
 		}
 		// Zigzag: the signed values round the same encodings.
 		s := int64(v)
@@ -675,7 +686,7 @@ func TestVarints(t *testing.T) {
 		if GsZigRead(p) != s || GsUlebSize(p) != n {
 			t.Fatalf("zigzag varint of %d", s)
 		}
-		if got, k := GsZigCheck(p, unsafe.Add(p, n)); got != s || k != n {
+		if got, k := GsZigCheck(p, 0, n); got != s || k != n {
 			t.Fatalf("GsZigCheck of %d: %d, %d bytes", s, got, k)
 		}
 	}
@@ -696,17 +707,20 @@ func TestVarints(t *testing.T) {
 	}
 	for _, b := range bad {
 		GsMemCpy(p, unsafe.Pointer(unsafe.SliceData(b)), int64(len(b)))
-		if v, k := GsUlebCheck(p, unsafe.Add(p, len(b))); k != 0 {
+		if v, k := GsUlebCheck(p, 0, int64(len(b))); k != 0 {
 			t.Errorf("GsUlebCheck(% x) = %d, %d bytes; want it rejected", b, v, k)
 		}
 	}
 	u64max := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}
 	GsMemCpy(p, unsafe.Pointer(&u64max[0]), 10)
-	if v, k := GsUlebCheck(p, unsafe.Add(p, 10)); v != math.MaxUint64 || k != 10 {
+	if v, k := GsUlebCheck(p, 0, 10); v != math.MaxUint64 || k != 10 {
 		t.Errorf("GsUlebCheck of u64.max: %d, %d bytes", v, k)
 	}
-	if _, k := GsUlebCheck(p, unsafe.Add(p, -1)); k != 0 {
+	if _, k := GsUlebCheck(p, 0, -1); k != 0 {
 		t.Error("GsUlebCheck reads before an image that ends before it starts")
+	}
+	if _, k := GsUlebCheck(p, 10, 10); k != 0 {
+		t.Error("GsUlebCheck reads at the end of an image")
 	}
 }
 

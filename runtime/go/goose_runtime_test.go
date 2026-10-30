@@ -206,9 +206,9 @@ func TestEnsureStacksAndReset(t *testing.T) {
 	}
 }
 
-// The fixed-frame stack: reserved with the block, written and read through
-// its slots, rewound by Reset and released by Close; the zero block gets
-// one from EnsureFrame.
+// The fixed-frame stack: reserved with the block, of the program's size,
+// written and read through its slots, rewound by Reset and released by
+// Close.
 func TestFixedFrame(t *testing.T) {
 	gs := NewStackBlock(1, 1<<20, 64<<10)
 	if gs.Frame == nil || gs.Frame != gs.FrameBase {
@@ -236,20 +236,13 @@ func TestFixedFrame(t *testing.T) {
 	if err := gs.Close(); err != nil {
 		t.Fatalf("Close of a closed block: %v", err)
 	}
-	var z GsStackBlock
-	z.EnsureFrame()
-	defer z.Close()
-	if z.Frame == nil || z.Frame != z.FrameBase {
-		t.Fatal("the zero block's frame")
-	}
-}
-
-func TestZeroBlockEnsureStacks(t *testing.T) {
-	var gs GsStackBlock
-	gs.EnsureStacks(1)
-	defer gs.Close()
-	if len(gs.Stks) != 1 || gs.Stks[0] == nil || gs.Cap[0] > GsStackReserve || gs.Cap[0] < gsRegionMin {
-		t.Fatalf("the zero block's first stack: %d stacks, capacity %v", len(gs.Stks), gs.Cap)
+	// A program's blocks have its frame's size, whatever their stacks'.
+	p := &GsProgram{StackReserve: 1 << 20, StackGap: 64 << 10, FrameReserve: 4 << 20}
+	for _, b := range []*GsStackBlock{p.NewStackBlock(1, 2<<20, 0), p.AcquireStackBlock(1)} {
+		if n := uintptr(b.FrameEnd) - uintptr(b.FrameBase); n != 4<<20 {
+			t.Errorf("a program's block has a frame of %d bytes, want its 4 MB", n)
+		}
+		b.Close()
 	}
 }
 
@@ -383,14 +376,14 @@ func TestRegionMappings(t *testing.T) {
 	}
 }
 
-// mappedBlockBase makes a block, checks its region is mapped while the
-// block is still reachable, and returns where the region starts. Once it
-// returns nothing references the block, which the collector may then
-// close at any time.
+// mappedBlockBase takes a block from the pool, checks its region is mapped
+// while the block is still reachable, and returns where the region starts.
+// Once it returns nothing references the block, which the collector may
+// then close at any time.
 //
 //go:noinline
 func mappedBlockBase(t *testing.T) uintptr {
-	gs := NewStackBlock(1, 1<<20, 64<<10)
+	gs := (&GsProgram{StackReserve: 1 << 20, StackGap: 64 << 10, FrameReserve: 1 << 20}).AcquireStackBlock(1)
 	*(*byte)(gs.Base[0]) = 1
 	base := uintptr(gs.Base[0])
 	if !regionMapped(procMaps(t), base, 1<<20) {
@@ -401,8 +394,10 @@ func mappedBlockBase(t *testing.T) uintptr {
 	return base
 }
 
-// A block nothing references any more is closed by the collector, as the
-// pool drops blocks at collections.
+// A block of the pool's that nothing references any more is closed by the
+// collector, as the pool drops blocks at collections. (One NewStackBlock
+// made lasts until Close: the runtime keeps it, to name its thread program
+// in a report of an overflow.)
 func TestUnreachableBlockIsClosed(t *testing.T) {
 	base := mappedBlockBase(t)
 	deadline := time.Now().Add(10 * time.Second)

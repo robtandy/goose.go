@@ -60,6 +60,25 @@ target_include_directories(goose PRIVATE
     "${GOOSE_UPSTREAM}/third_party/subprocess"
 )
 
+# The Go runtime (runtime/go), embedded in the compiler as it builds
+# (cmake/go_runtime.cmake, src/codegen_go_runtime.h): the files a
+# --target=go file takes its runtime from, in the order it writes them.
+# goose_package.go and goose_extra.go are the package's alone.
+set(GOOSE_GO_RUNTIME_FILES
+    goose_runtime.go goose_bytes.go goose_format.go goose_spans.go goose_os.go goose_threads.go)
+set(go_runtime_h "${CMAKE_CURRENT_BINARY_DIR}/go_runtime/goose_go_runtime.h")
+list(TRANSFORM GOOSE_GO_RUNTIME_FILES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/runtime/go/"
+     OUTPUT_VARIABLE go_runtime_srcs)
+list(JOIN GOOSE_GO_RUNTIME_FILES "," go_runtime_names)
+add_custom_command(OUTPUT "${go_runtime_h}"
+    COMMAND "${CMAKE_COMMAND}" "-DDIR=${CMAKE_CURRENT_SOURCE_DIR}/runtime/go" "-DFILES=${go_runtime_names}"
+            "-DOUT=${go_runtime_h}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/go_runtime.cmake"
+    DEPENDS ${go_runtime_srcs} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/go_runtime.cmake"
+    COMMENT "Embedding the Go runtime (runtime/go)"
+    VERBATIM)
+target_sources(goose PRIVATE "${go_runtime_h}")
+target_include_directories(goose PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/go_runtime")
+
 if(MSVC)
     target_sources(goose PRIVATE "${GOOSE_UPSTREAM}/src/goose.manifest")
 elseif(WIN32)

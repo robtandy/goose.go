@@ -1,10 +1,7 @@
 package goose
 
 import (
-	"bytes"
-	"encoding/binary"
 	"math"
-	"math/bits"
 	"os"
 	"strconv"
 	"sync"
@@ -12,32 +9,32 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Aborts (goose_spec.md §9.3), as src/runtime/runtime_impl.h words them.
-// A failed check panics with a *GsError: a Go caller of exported Goose code
-// can recover it, and a Goose program's main, deferring GsExitOnAbort, ends
-// as the C runtime ends one, with the message on stderr and exit status 1.
-// The failure helpers whose message needs formatting are out of line, so
-// that the checks calling them stay small enough for Go to inline.
+// Aborts (§9.3). A failed check panics with a *GsError, which the program's
+// main recovers (GsExitOnAbort): the message on stderr, as the C runtime
+// words it, and exit status 1. A library never exits the process, which is
+// its host's (GsProgram.Library): there an abort, and exit(), stay the
+// *GsError's panic, which the caller of an export fn's entry point may
+// recover.
 
-// Error ids for GsAbort, numbered as the C runtime's GS_E_* are.
+// The error ids of GsAbort, numbered as the C runtime's GS_E_* are.
 const (
-	GsECapacity   = iota // limited array capacity exceeded
-	GsESlice             // slice bounds out of range
-	GsEReloff            // relative reference offset overflow
-	GsEAssert            // assert failed
-	GsECapRange          // invalid capacity
-	GsEResizeFill        // resize growth requires a fill value
-	GsEResizeNeg         // resize to a negative length
-	GsEPop               // pop on empty array
-	GsEThreadID          // thread_wait on an unknown thread id
-	GsEThreadSelf        // a worker cannot wait for itself
-	GsETag               // corrupt ADT tag (debug builds only)
-	GsEEndian            // serialization on a big-endian host
-	GsESliceLen          // slice pool length negative or beyond any data stack
-	GsEPoolSlice         // a slice handed to a slice pool is not one of its runs
-	GsERelNull           // a non-null optional self-relative target has offset zero
-	GsEPopN              // pop_n of a negative count or more than the length
-	GsEQBound            // a queue limit of zero or less
+	GsECapacity = iota
+	GsESlice
+	GsEReloff
+	GsEAssert
+	GsECapRange
+	GsEResizeFill
+	GsEResizeNeg
+	GsEPop
+	GsEThreadID
+	GsEThreadSelf
+	GsETag
+	GsEEndian
+	GsESliceLen
+	GsEPoolSlice
+	GsERelNull
+	GsEPopN
+	GsEQBound
 )
 
 var gsErrMsgs = [...]string{
@@ -60,21 +57,21 @@ var gsErrMsgs = [...]string{
 	GsEQBound:     "queue limit of zero or less",
 }
 
-// GsError is a Goose runtime error: what every failed check and abort
-// panics with.
+// GsError is a Goose runtime error: what an abort or a failed check panics
+// with.
 type GsError struct {
-	Msg  string // what failed, as the C runtime words it
-	File string // the .goose file of the check, "" for the runtime's own failures
-	Line int    // the line of the check
+	Msg  string // What failed.
+	File string // The .goose file of the check; "" for the runtime's own failures.
+	Line int
 }
 
 // Error is the error's text as the C runtime prints it, less the newline:
 // "goose runtime error: " and the message, then the check's location.
 func (e *GsError) Error() string { return "goose runtime error: " + e.Text() }
 
-// Text is what Error prints after "goose runtime error: ", the location
-// included: the message a contained worker's abort leaves for thread_wait
-// (goose_spec.md §11.2).
+// Text is what the error prints after "goose runtime error: ", its
+// location included: the message a contained worker's abort leaves for
+// thread_wait (§11.2).
 func (e *GsError) Text() string {
 	if e.File == "" {
 		return e.Msg
@@ -82,20 +79,26 @@ func (e *GsError) Text() string {
 	return e.Msg + " (" + e.File + ":" + strconv.Itoa(e.Line) + ")"
 }
 
-// GsExitOnAbort, deferred at the top of a goroutine running Goose code,
-// ends the process as the C runtime does when a Goose runtime error panics
-// out of that goroutine: the error on stderr, then exit status 1. Any other
+// GsExitOnAbort, deferred by the program's main, ends the process as the C
+// runtime does when a Goose runtime error panics: the message on stderr and
+// exit status 1. So does a fault in a data stack's guard gap, which the
+// program's main has the runtime panic with (debug.SetPanicOnFault): a stack
+// that grew past its region, as C's fault handler reports it. Any other
 // panic goes on.
 func GsExitOnAbort() {
 	if r := recover(); r != nil {
-		gsEndOnPanic(r)
+		gsEndOnPanic(r, false)
 	}
 }
 
 // gsEndOnPanic ends the process for what a thread program's goroutine
 // recovered, as GsExitOnAbort has it; a panic of no runtime error goes on.
-func gsEndOnPanic(r any) {
-	if e, ok := r.(*GsError); ok {
+// A library's goes on as the runtime error's *GsError (GsAbortOf): on a
+// worker's goroutine, which the runtime started, no host recovers it, and
+// it ends the process as any goroutine's unrecovered panic does.
+func gsEndOnPanic(r any, library bool) {
+	r = GsAbortOf(r)
+	if e, ok := r.(*GsError); ok && !library {
 		gsEnd(1, e.Error()+"\n")
 	}
 	panic(r)
@@ -109,7 +112,8 @@ var gsEnding struct {
 	on bool
 }
 
-// gsEnd ends the process with code, msg on stderr first.
+// gsEnd ends the process with code, msg on stderr first: a program's, never
+// a library's (GsProgram.Library).
 func gsEnd(code int, msg string) {
 	gsEnding.Lock()
 	if gsEnding.on {
@@ -124,36 +128,187 @@ func gsEnd(code int, msg string) {
 	os.Exit(code)
 }
 
-// GsPanic is a failure of the runtime itself (gs_panic), which has no
-// location in the program.
-func GsPanic(msg string) {
-	panic(&GsError{Msg: msg})
-}
+// GsPanic is a failure of the runtime itself, which has no location in the
+// program.
+func GsPanic(msg string) { panic(&GsError{Msg: msg}) }
 
-// GsAbort is a failed check with one of the GsE* error ids (gs_abort).
+// GsAbort is a failed check with one of the GsE* ids.
 func GsAbort(err int, file string, line int) {
 	panic(&GsError{Msg: gsErrMsgs[err], File: file, Line: line})
 }
 
-// GsAbortMsg is the program's own abort(msg) (gs_abort_msg): n bytes of
-// message at msg, which may be anywhere a Goose value is, and so are copied
-// before the stacks unwind.
-//
-//go:noinline
-func GsAbortMsg(msg unsafe.Pointer, n int64, file string, line int) {
-	panic(&GsError{Msg: string(unsafe.Slice((*byte)(msg), n)), File: file, Line: line})
+// GsAbortMsg is the program's own abort(msg).
+func GsAbortMsg(msg string, file string, line int) {
+	panic(&GsError{Msg: msg, File: file, Line: line})
 }
 
-// GsIdxFail is a failed bounds check of index i against length n.
-//
-//go:noinline
-func GsIdxFail(i, n int64, file string, line int) {
-	panic(&GsError{Msg: "index " + strconv.FormatInt(i, 10) + " out of bounds (length " +
-		strconv.FormatInt(n, 10) + ")", File: file, Line: line})
+// GsAbortSlice is abort(msg) of a message the program computed, the bytes
+// of a u8 slice (gs_abort_msg).
+func GsAbortSlice(msg GsSlice, file string, line int) {
+	panic(&GsError{Msg: string(unsafe.Slice((*byte)(msg.Data), msg.Len)), File: file, Line: line})
 }
 
-// GsIdx is i, checked to index an array of length n with one unsigned
-// compare (GS_IDX).
+// GsUnreachable is what a function panics with where control cannot get to
+// the end of it, which the checker found: a compiler bug if it does.
+func GsUnreachable(file string, line int) *GsError {
+	return &GsError{Msg: "unreachable code reached", File: file, Line: line}
+}
+
+// GsBool is b, as a call. Go's vet takes `c && c` and `n != 1 || n != 2`
+// for mistakes, which a Goose program may write: it leaves an operand that
+// is a call out of the comparisons.
+func GsBool(b bool) bool { return b }
+
+// GsTagError is a debug build's failed check of an ADT's tag, which no
+// variant has (GS_E_TAG): a compiler bug if it ever fails.
+func GsTagError(file string, line int) *GsError {
+	return &GsError{Msg: gsErrMsgs[GsETag], File: file, Line: line}
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-size values (§3). A slice is the address of its first element and
+// their count; Data is a Go pointer, so that the collector sees a slice of
+// a Go variable as it sees a reference to one.
+
+// GsSlice is a slice T[:] of any element type (§3.10).
+type GsSlice struct {
+	Data unsafe.Pointer
+	Len  int64
+}
+
+// GsRhdr is the header of a resizable value (§5.1, §5.2, C.2): Len elements
+// from Base, which sit on top of the header's data stack, so that pushing an
+// element writes it at the stack's top, moves the top past it and counts
+// it. The base never moves.
+type GsRhdr struct {
+	Base unsafe.Pointer
+	Len  int64
+}
+
+// GsRref is a fat reference to a resizable value (C's gs_rref): its header,
+// and the index in the GsStackBlock of the data stack its elements top, so
+// that a callee can grow the value it was handed.
+type GsRref struct {
+	Hdr *GsRhdr
+	Stk int64
+}
+
+// GsPref is a reference to a reusable[] pool (C's gs_pref): the element
+// array as a GsRref, and the freelist's header and data stack.
+type GsPref struct {
+	Hdr     *GsRhdr
+	Stk     int64
+	FreeHdr *GsRhdr
+	FreeStk int64
+}
+
+// GsStr is the slice of a string literal's bytes, which are read-only.
+func GsStr(s string) GsSlice { return GsSlice{unsafe.Pointer(unsafe.StringData(s)), int64(len(s))} }
+
+// ---------------------------------------------------------------------------
+// Go values across the boundary, both ways: the exported entry points of the
+// program's export fns take Go's own slices, strings and pointers, and the
+// Go functions its extern fns call take its slices, which these view in
+// place, with no copy (DESIGN.md §3.5).
+
+// GsBytes is what a const u8[:] parameter of an exported entry point takes:
+// a string's bytes, or a []byte's.
+type GsBytes interface{ ~string | ~[]byte }
+
+// What an exported entry point is handed may be stored where only the data
+// stacks see it, which Go's stacks must not move away from while it runs:
+// GsEscape makes the Go compiler keep it off them, on the heap, where
+// nothing moves (its condition never holds). The collector does not see it
+// there either, so the entry point keeps the argument alive until the call
+// returns (runtime.KeepAlive).
+var gsEscapeSink struct {
+	b bool
+	p unsafe.Pointer
+}
+
+// GsEscape is p, which the Go compiler takes to escape to the heap.
+//
+//goose:internal
+func GsEscape(p unsafe.Pointer) unsafe.Pointer {
+	if gsEscapeSink.b {
+		gsEscapeSink.p = p
+	}
+	return p
+}
+
+// GsBytesOf is the u8 slice of a string's or a []byte's bytes, in place: a
+// string's header begins as a slice's does, with its data and its length.
+func GsBytesOf[T GsBytes](s T) GsSlice {
+	return GsSlice{GsEscape(*(*unsafe.Pointer)(unsafe.Pointer(&s))), int64(len(s))}
+}
+
+// GsSliceOf is the slice of xs's elements, in place. A Go T has the
+// layout of the Goose type it stands for.
+func GsSliceOf[T any](xs []T) GsSlice {
+	return GsSlice{GsEscape(unsafe.Pointer(unsafe.SliceData(xs))), int64(len(xs))}
+}
+
+// GsSliceFromBytes is the u8 slice of b's bytes, and GsSliceFromString of
+// s's, which are read-only, in place.
+func GsSliceFromBytes(b []byte) GsSlice {
+	return GsSlice{GsEscape(unsafe.Pointer(unsafe.SliceData(b))), int64(len(b))}
+}
+
+func GsSliceFromString(s string) GsSlice {
+	return GsSlice{GsEscape(unsafe.Pointer(unsafe.StringData(s))), int64(len(s))}
+}
+
+// GsSliceToBytes is the []byte of a u8 slice's bytes, and GsSliceToString
+// the string, in place: valid as long as what the slice views is, and for
+// the string, unchanged meanwhile. GsSliceToSlice is a []T of a slice's
+// elements, its T the Go type of their Goose type.
+func GsSliceToBytes(s GsSlice) []byte { return unsafe.Slice((*byte)(s.Data), s.Len) }
+
+func GsSliceToString(s GsSlice) string { return unsafe.String((*byte)(s.Data), s.Len) }
+
+func GsSliceToSlice[T any](s GsSlice) []T { return unsafe.Slice((*T)(s.Data), s.Len) }
+
+// GsBldAppend appends data to the u8[>..] builder b refers to, for a Go
+// function an extern fn calls (gs_bld_append): a builder's bytes top its
+// data stack, so they go at the stack's top, and its count grows. It may
+// not shrink the builder, nor keep b past its call. gs is the block the
+// function is handed with the builder.
+func GsBldAppend(gs *GsStackBlock, b GsRref, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	gsBldPut(gs, b, unsafe.Pointer(unsafe.SliceData(data)), len(data))
+}
+
+// GsBldAppendString appends the bytes of s, as GsBldAppend does.
+func GsBldAppendString(gs *GsStackBlock, b GsRref, s string) {
+	if len(s) == 0 {
+		return
+	}
+	gsBldPut(gs, b, unsafe.Pointer(unsafe.StringData(s)), len(s))
+}
+
+func gsBldPut(gs *GsStackBlock, b GsRref, p unsafe.Pointer, n int) {
+	top, end := gs.Stks[b.Stk], gs.End(b.Stk)
+	if uintptr(n) > uintptr(end)-uintptr(top) {
+		gsOverflow(end)
+	}
+	copy(unsafe.Slice((*byte)(top), n), unsafe.Slice((*byte)(p), n))
+	gs.Stks[b.Stk] = unsafe.Add(top, n)
+	b.Hdr.Len += int64(n)
+}
+
+// GsSub is the slice of the elements lo up to hi of the n at p, each es
+// bytes. An empty one starts where it is, at the end of the run too, so
+// that two at different places are different slices (§3.10): what a slice
+// can point into is never the Go heap, where an address one past an
+// object's end would be no valid Go pointer.
+func GsSub(p unsafe.Pointer, lo, hi, n, es int64) GsSlice {
+	_ = n
+	return GsSlice{unsafe.Add(p, lo*es), hi - lo}
+}
+
+// GsIdx is i, checked to be an index of an array of n elements (GS_IDX).
 func GsIdx(i, n int64, file string, line int) int64 {
 	if uint64(i) >= uint64(n) {
 		GsIdxFail(i, n, file, line)
@@ -161,366 +316,88 @@ func GsIdx(i, n int64, file string, line int) int64 {
 	return i
 }
 
-// GsDivFail is a division or modulo by zero, which every build checks.
+// GsIdxFail is a failed bounds check of index i against length n.
+//
+//goose:internal
+func GsIdxFail(i, n int64, file string, line int) {
+	panic(&GsError{Msg: "index " + strconv.FormatInt(i, 10) + " out of bounds (length " +
+		strconv.FormatInt(n, 10) + ")", File: file, Line: line})
+}
+
+// GsMemEq says whether the n bytes at a and b are the same.
+func GsMemEq(a, b unsafe.Pointer, n int64) bool {
+	return n == 0 || a == b ||
+		string(unsafe.Slice((*byte)(a), n)) == string(unsafe.Slice((*byte)(b), n))
+}
+
+// GsRelLoad is the address an optional relative reference at slot holding
+// off encodes: null where off is 0 (§3.9).
+func GsRelLoad(slot unsafe.Pointer, off int64) unsafe.Pointer {
+	if off == 0 {
+		return nil
+	}
+	return unsafe.Add(slot, off)
+}
+
+// GsPoolLoad is the address an optional `in pool` reference holding off
+// encodes, from its pool's base: null where off is 0 (§3.9).
+func GsPoolLoad(base unsafe.Pointer, off int64) unsafe.Pointer {
+	if off == 0 {
+		return nil
+	}
+	return unsafe.Add(base, off-1)
+}
+
+// GsPoolOff is what an optional `in pool` reference to p stores: its
+// distance from its pool's base plus one, or 0 for null.
+func GsPoolOff(p, base unsafe.Pointer) uint64 {
+	if p == nil {
+		return 0
+	}
+	return uint64(uintptr(p)-uintptr(base)) + 1
+}
+
+// GsRelOff is the offset from slot the address p stores as in an optional
+// relative reference: 0 for null.
+func GsRelOff(p, slot unsafe.Pointer) int64 {
+	if p == nil {
+		return 0
+	}
+	return int64(uintptr(p) - uintptr(slot))
+}
+
 func GsDivFail(file string, line int) {
 	panic(&GsError{Msg: "division by zero", File: file, Line: line})
 }
 
-// GsDivOvf is i64.min / -1, which every build checks.
 func GsDivOvf(file string, line int) {
 	panic(&GsError{Msg: "integer overflow in division", File: file, Line: line})
 }
 
-// GsOvf is a debug build's failed overflow check of a op b at type typ.
-//
-//go:noinline
+// GsOvf and GsOvfNeg are a debug build's failed overflow checks.
 func GsOvf(a int64, op string, b int64, typ, file string, line int) {
 	panic(&GsError{Msg: "integer overflow (debug): " + strconv.FormatInt(a, 10) + " " + op + " " +
 		strconv.FormatInt(b, 10) + " at " + typ, File: file, Line: line})
 }
 
-// GsOvfNeg is a debug build's failed overflow check of -a at type typ.
-//
-//go:noinline
 func GsOvfNeg(a int64, typ, file string, line int) {
 	panic(&GsError{Msg: "integer overflow (debug): -(" + strconv.FormatInt(a, 10) + ") at " + typ,
 		File: file, Line: line})
 }
 
-func gsAsFail(why, num, typ, file string, line int) {
-	panic(&GsError{Msg: "as conversion " + why + " (debug): " + num + " as " + typ, File: file, Line: line})
-}
-
-// GsAsFailI is a debug build's failed `as` check of the integer v into typ.
-//
-//go:noinline
-func GsAsFailI(why string, v int64, typ, file string, line int) {
-	gsAsFail(why, strconv.FormatInt(v, 10), typ, file, line)
-}
-
-// GsAsFailU is a debug build's failed `as` check of the unsigned v into typ.
-//
-//go:noinline
-func GsAsFailU(why string, v uint64, typ, file string, line int) {
-	gsAsFail(why, strconv.FormatUint(v, 10), typ, file, line)
-}
-
-// GsAsFailF is a debug build's failed `as` check of the float d into typ,
-// d named in its text form (§3.7): an f32's own where f32 is set.
-//
-//go:noinline
-func GsAsFailF(why string, d float64, f32 bool, typ, file string, line int) {
-	gsAsFail(why, string(gsAppendFloat(nil, d, f32)), typ, file, line)
-}
-
-// gsAppendFloat appends a float's text form (§3.7, gs_fmt_f64 and
-// gs_fmt_f32): the fewest significant digits that read back as the value
-// (of its own type, an f32 where f32 is set), and of those the nearest,
-// laid out as C's %g lays them out at a precision of max(15, digits) but
-// always with a fraction or an exponent: 1.0, 0.1, 1e+20, 1.5e-07.
-func gsAppendFloat(dst []byte, v float64, f32 bool) []byte {
-	switch {
-	case v != v:
-		return append(dst, "nan"...)
-	case math.IsInf(v, 1):
-		return append(dst, "inf"...)
-	case math.IsInf(v, -1):
-		return append(dst, "-inf"...)
-	}
-	if math.Signbit(v) {
-		dst = append(dst, '-')
-		v = -v
-	}
-	if v == 0 {
-		return append(dst, "0.0"...)
-	}
-	size := 64
-	if f32 {
-		size = 32
-	}
-	// The shortest digits, as d.ddde±xx: dig, and the exponent x of the
-	// first digit.
-	var buf [32]byte
-	e := strconv.AppendFloat(buf[:0], v, 'e', -1, size)
-	var dig [24]byte
-	n, i := 0, 0
-	for ; e[i] != 'e'; i++ {
-		if e[i] != '.' {
-			dig[n] = e[i]
-			n++
-		}
-	}
-	x := 0
-	for _, c := range e[i+2:] {
-		x = x*10 + int(c-'0')
-	}
-	if e[i+1] == '-' {
-		x = -x
-	}
-	switch {
-	case x < -4 || x >= max(n, 15):
-		dst = append(dst, dig[0])
-		if n > 1 {
-			dst = append(dst, '.')
-			dst = append(dst, dig[1:n]...)
-		}
-		dst = append(dst, 'e')
-		if x < 0 {
-			dst = append(dst, '-')
-			x = -x
-		} else {
-			dst = append(dst, '+')
-		}
-		if x >= 100 {
-			dst = append(dst, byte('0'+x/100))
-		}
-		return append(dst, byte('0'+x/10%10), byte('0'+x%10))
-	case x < 0:
-		dst = append(dst, "0."...)
-		for j := -1; j > x; j-- {
-			dst = append(dst, '0')
-		}
-		return append(dst, dig[:n]...)
-	}
-	for j := 0; j < n || j <= x; j++ {
-		if j == x+1 {
-			dst = append(dst, '.')
-		}
-		if j < n {
-			dst = append(dst, dig[j])
-		} else {
-			dst = append(dst, '0')
-		}
-	}
-	// A whole number still reads as a float: 1.0, not 1.
-	if n <= x+1 {
-		dst = append(dst, ".0"...)
-	}
-	return dst
+// GsAsFail is a debug build's failed `as` check, num the source value's text.
+func GsAsFail(why, num, typ, file string, line int) {
+	panic(&GsError{Msg: "as conversion " + why + " (debug): " + num + " as " + typ,
+		File: file, Line: line})
 }
 
 // ---------------------------------------------------------------------------
-// Integer semantics (§6.2). Go's own arithmetic already wraps as Goose's
-// release builds do, unsigned and signed, so a release build needs these
-// only for division and modulo, which check for zero in every build and
-// whose % is Euclidean. A debug build calls the rest, which abort where
-// the result does not fit the operands' type, naming the operands, the
-// type and the operation's file and line. Shift counts are masked to the
-// width, which the generated code writes out itself.
+// Integer semantics (§6.2). Go's +, - and * wrap as a release build's do, at
+// every width, so only division needs a helper there: a zero divisor aborts
+// in every build, and so does i64.min / -1; a narrower signed quotient that
+// does not fit wraps, as Go's own `/` does. `%` is Euclidean. A debug build
+// checks the signed operations as well.
 
-// GsAddI8 is a + b in a debug build: aborts on overflow.
-func GsAddI8(a, b int8, file string, line int) int8 {
-	r := a + b
-	if (a^r)&(b^r) < 0 {
-		GsOvf(int64(a), "+", int64(b), "i8", file, line)
-	}
-	return r
-}
-
-// GsAddI16 is a + b in a debug build: aborts on overflow.
-func GsAddI16(a, b int16, file string, line int) int16 {
-	r := a + b
-	if (a^r)&(b^r) < 0 {
-		GsOvf(int64(a), "+", int64(b), "i16", file, line)
-	}
-	return r
-}
-
-// GsAddI32 is a + b in a debug build: aborts on overflow.
-func GsAddI32(a, b int32, file string, line int) int32 {
-	r := a + b
-	if (a^r)&(b^r) < 0 {
-		GsOvf(int64(a), "+", int64(b), "i32", file, line)
-	}
-	return r
-}
-
-// GsAddI64 is a + b in a debug build: aborts on overflow.
-func GsAddI64(a, b int64, file string, line int) int64 {
-	r := a + b
-	if (a^r)&(b^r) < 0 {
-		GsOvf(a, "+", b, "i64", file, line)
-	}
-	return r
-}
-
-// GsSubI8 is a - b in a debug build: aborts on overflow.
-func GsSubI8(a, b int8, file string, line int) int8 {
-	r := a - b
-	if (a^b)&(a^r) < 0 {
-		GsOvf(int64(a), "-", int64(b), "i8", file, line)
-	}
-	return r
-}
-
-// GsSubI16 is a - b in a debug build: aborts on overflow.
-func GsSubI16(a, b int16, file string, line int) int16 {
-	r := a - b
-	if (a^b)&(a^r) < 0 {
-		GsOvf(int64(a), "-", int64(b), "i16", file, line)
-	}
-	return r
-}
-
-// GsSubI32 is a - b in a debug build: aborts on overflow.
-func GsSubI32(a, b int32, file string, line int) int32 {
-	r := a - b
-	if (a^b)&(a^r) < 0 {
-		GsOvf(int64(a), "-", int64(b), "i32", file, line)
-	}
-	return r
-}
-
-// GsSubI64 is a - b in a debug build: aborts on overflow.
-func GsSubI64(a, b int64, file string, line int) int64 {
-	r := a - b
-	if (a^b)&(a^r) < 0 {
-		GsOvf(a, "-", b, "i64", file, line)
-	}
-	return r
-}
-
-// GsMulI8 is a * b in a debug build: aborts on overflow.
-func GsMulI8(a, b int8, file string, line int) int8 {
-	r := int64(a) * int64(b)
-	if r != int64(int8(r)) {
-		GsOvf(int64(a), "*", int64(b), "i8", file, line)
-	}
-	return int8(r)
-}
-
-// GsMulI16 is a * b in a debug build: aborts on overflow.
-func GsMulI16(a, b int16, file string, line int) int16 {
-	r := int64(a) * int64(b)
-	if r != int64(int16(r)) {
-		GsOvf(int64(a), "*", int64(b), "i16", file, line)
-	}
-	return int16(r)
-}
-
-// GsMulI32 is a * b in a debug build: aborts on overflow.
-func GsMulI32(a, b int32, file string, line int) int32 {
-	r := int64(a) * int64(b)
-	if r != int64(int32(r)) {
-		GsOvf(int64(a), "*", int64(b), "i32", file, line)
-	}
-	return int32(r)
-}
-
-// GsMulI64 is a * b in a debug build: aborts on overflow.
-func GsMulI64(a, b int64, file string, line int) int64 {
-	r := a * b
-	if a != 0 && b != 0 &&
-		((a == -1 && b == math.MinInt64) || (b == -1 && a == math.MinInt64) || r/b != a) {
-		GsOvf(a, "*", b, "i64", file, line)
-	}
-	return r
-}
-
-// GsNegI8 is -a in a debug build: aborts on overflow.
-func GsNegI8(a int8, file string, line int) int8 {
-	if a == math.MinInt8 {
-		GsOvfNeg(int64(a), "i8", file, line)
-	}
-	return -a
-}
-
-// GsNegI16 is -a in a debug build: aborts on overflow.
-func GsNegI16(a int16, file string, line int) int16 {
-	if a == math.MinInt16 {
-		GsOvfNeg(int64(a), "i16", file, line)
-	}
-	return -a
-}
-
-// GsNegI32 is -a in a debug build: aborts on overflow.
-func GsNegI32(a int32, file string, line int) int32 {
-	if a == math.MinInt32 {
-		GsOvfNeg(int64(a), "i32", file, line)
-	}
-	return -a
-}
-
-// GsNegI64 is -a in a debug build: aborts on overflow.
-func GsNegI64(a int64, file string, line int) int64 {
-	if a == math.MinInt64 {
-		GsOvfNeg(a, "i64", file, line)
-	}
-	return -a
-}
-
-// Division truncates toward zero; modulo is Euclidean, in [0, |b|) for any
-// a. Both abort on a zero divisor in every build. i64.min / -1 aborts in
-// every build too, while at the narrower signed types the same case wraps
-// in a release build (GsDivI8 and co.) and aborts in a debug one
-// (GsDivI8Debug and co.). x % -1 is 0 for every x.
-
-// GsDivU8 is a / b: aborts on a zero divisor.
-func GsDivU8(a, b uint8, file string, line int) uint8 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	return a / b
-}
-
-// GsDivU16 is a / b: aborts on a zero divisor.
-func GsDivU16(a, b uint16, file string, line int) uint16 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	return a / b
-}
-
-// GsDivU32 is a / b: aborts on a zero divisor.
-func GsDivU32(a, b uint32, file string, line int) uint32 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	return a / b
-}
-
-// GsDivU64 is a / b: aborts on a zero divisor.
-func GsDivU64(a, b uint64, file string, line int) uint64 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	return a / b
-}
-
-// GsModU8 is a % b: aborts on a zero divisor.
-func GsModU8(a, b uint8, file string, line int) uint8 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	return a % b
-}
-
-// GsModU16 is a % b: aborts on a zero divisor.
-func GsModU16(a, b uint16, file string, line int) uint16 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	return a % b
-}
-
-// GsModU32 is a % b: aborts on a zero divisor.
-func GsModU32(a, b uint32, file string, line int) uint32 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	return a % b
-}
-
-// GsModU64 is a % b: aborts on a zero divisor.
-func GsModU64(a, b uint64, file string, line int) uint64 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	return a % b
-}
-
-// GsDivI8 is a / b in a release build: aborts on a zero divisor, and
-// i8.min / -1 wraps to i8.min.
 func GsDivI8(a, b int8, file string, line int) int8 {
 	if b == 0 {
 		GsDivFail(file, line)
@@ -528,8 +405,6 @@ func GsDivI8(a, b int8, file string, line int) int8 {
 	return a / b
 }
 
-// GsDivI16 is a / b in a release build: aborts on a zero divisor, and
-// i16.min / -1 wraps to i16.min.
 func GsDivI16(a, b int16, file string, line int) int16 {
 	if b == 0 {
 		GsDivFail(file, line)
@@ -537,8 +412,6 @@ func GsDivI16(a, b int16, file string, line int) int16 {
 	return a / b
 }
 
-// GsDivI32 is a / b in a release build: aborts on a zero divisor, and
-// i32.min / -1 wraps to i32.min.
 func GsDivI32(a, b int32, file string, line int) int32 {
 	if b == 0 {
 		GsDivFail(file, line)
@@ -546,44 +419,6 @@ func GsDivI32(a, b int32, file string, line int) int32 {
 	return a / b
 }
 
-// GsDivI8Debug is a / b in a debug build: aborts on a zero divisor and on
-// i8.min / -1.
-func GsDivI8Debug(a, b int8, file string, line int) int8 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	if b == -1 && a == math.MinInt8 {
-		GsOvf(int64(a), "/", int64(b), "i8", file, line)
-	}
-	return a / b
-}
-
-// GsDivI16Debug is a / b in a debug build: aborts on a zero divisor and
-// on i16.min / -1.
-func GsDivI16Debug(a, b int16, file string, line int) int16 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	if b == -1 && a == math.MinInt16 {
-		GsOvf(int64(a), "/", int64(b), "i16", file, line)
-	}
-	return a / b
-}
-
-// GsDivI32Debug is a / b in a debug build: aborts on a zero divisor and
-// on i32.min / -1.
-func GsDivI32Debug(a, b int32, file string, line int) int32 {
-	if b == 0 {
-		GsDivFail(file, line)
-	}
-	if b == -1 && a == math.MinInt32 {
-		GsOvf(int64(a), "/", int64(b), "i32", file, line)
-	}
-	return a / b
-}
-
-// GsDivI64 is a / b in every build: aborts on a zero divisor and on
-// i64.min / -1.
 func GsDivI64(a, b int64, file string, line int) int64 {
 	if b == 0 {
 		GsDivFail(file, line)
@@ -594,172 +429,341 @@ func GsDivI64(a, b int64, file string, line int) int64 {
 	return a / b
 }
 
-// GsModI8 is the Euclidean a % b, in [0, |b|): aborts on a zero divisor.
+func GsDivU8(a, b uint8, file string, line int) uint8 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	return a / b
+}
+
+func GsDivU16(a, b uint16, file string, line int) uint16 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	return a / b
+}
+
+func GsDivU32(a, b uint32, file string, line int) uint32 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	return a / b
+}
+
+func GsDivU64(a, b uint64, file string, line int) uint64 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	return a / b
+}
+
+// The debug build's narrow signed division, which also aborts where the
+// quotient does not fit (-128 / -1 at i8).
+func GsDivI8Debug(a, b int8, file string, line int) int8 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	if b == -1 && a == math.MinInt8 {
+		GsOvf(int64(a), "/", int64(b), "i8", file, line)
+	}
+	return a / b
+}
+
+func GsDivI16Debug(a, b int16, file string, line int) int16 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	if b == -1 && a == math.MinInt16 {
+		GsOvf(int64(a), "/", int64(b), "i16", file, line)
+	}
+	return a / b
+}
+
+func GsDivI32Debug(a, b int32, file string, line int) int32 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	if b == -1 && a == math.MinInt32 {
+		GsOvf(int64(a), "/", int64(b), "i32", file, line)
+	}
+	return a / b
+}
+
 func GsModI8(a, b int8, file string, line int) int8 {
 	return int8(gsModNarrow(int64(a), int64(b), file, line))
 }
 
-// GsModI16 is the Euclidean a % b, in [0, |b|): aborts on a zero divisor.
 func GsModI16(a, b int16, file string, line int) int16 {
 	return int16(gsModNarrow(int64(a), int64(b), file, line))
 }
 
-// GsModI32 is the Euclidean a % b, in [0, |b|): aborts on a zero divisor.
 func GsModI32(a, b int32, file string, line int) int32 {
 	return int32(gsModNarrow(int64(a), int64(b), file, line))
 }
 
-// gsModNarrow is the Euclidean a % b of two values of a type narrower than
-// i64, where |b| always fits.
+// The Euclidean remainder of operands that fit in 32 bits: in [0, |b|).
 func gsModNarrow(a, b int64, file string, line int) int64 {
 	if b == 0 {
 		GsDivFail(file, line)
 	}
-	t := a % b
-	if t < 0 {
+	r := a % b
+	if r < 0 {
 		if b < 0 {
-			return t - b
+			r -= b
+		} else {
+			r += b
 		}
-		return t + b
 	}
-	return t
+	return r
 }
 
-// GsModI64 is the Euclidean a % b, in [0, |b|): aborts on a zero divisor.
-// |b| is taken unsigned, so a divisor of i64.min works.
+// i64.min % -1 is 0, as every x % -1 is; |b| is taken unsigned, so a divisor
+// of i64.min works too.
 func GsModI64(a, b int64, file string, line int) int64 {
 	if b == 0 {
 		GsDivFail(file, line)
 	}
-	t := a % b
-	if t < 0 {
-		if b < 0 {
-			return int64(uint64(t) - uint64(b))
-		}
-		return t + b
+	if b == -1 {
+		return 0
 	}
-	return t
+	r := a % b
+	if r < 0 {
+		m := uint64(b)
+		if b < 0 {
+			m = -m
+		}
+		r = int64(uint64(r) + m)
+	}
+	return r
+}
+
+func GsModU8(a, b uint8, file string, line int) uint8 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	return a % b
+}
+
+func GsModU16(a, b uint16, file string, line int) uint16 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	return a % b
+}
+
+func GsModU32(a, b uint32, file string, line int) uint32 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	return a % b
+}
+
+func GsModU64(a, b uint64, file string, line int) uint64 {
+	if b == 0 {
+		GsDivFail(file, line)
+	}
+	return a % b
+}
+
+// The debug build's checked signed arithmetic: the operands' type is in the
+// name, and the result aborts where it does not fit that type.
+func GsAddI8(a, b int8, file string, line int) int8 {
+	r := int64(a) + int64(b)
+	if r != int64(int8(r)) {
+		GsOvf(int64(a), "+", int64(b), "i8", file, line)
+	}
+	return int8(r)
+}
+
+func GsSubI8(a, b int8, file string, line int) int8 {
+	r := int64(a) - int64(b)
+	if r != int64(int8(r)) {
+		GsOvf(int64(a), "-", int64(b), "i8", file, line)
+	}
+	return int8(r)
+}
+
+func GsMulI8(a, b int8, file string, line int) int8 {
+	r := int64(a) * int64(b)
+	if r != int64(int8(r)) {
+		GsOvf(int64(a), "*", int64(b), "i8", file, line)
+	}
+	return int8(r)
+}
+
+func GsNegI8(a int8, file string, line int) int8 {
+	if a == math.MinInt8 {
+		GsOvfNeg(int64(a), "i8", file, line)
+	}
+	return -a
+}
+
+func GsAddI16(a, b int16, file string, line int) int16 {
+	r := int64(a) + int64(b)
+	if r != int64(int16(r)) {
+		GsOvf(int64(a), "+", int64(b), "i16", file, line)
+	}
+	return int16(r)
+}
+
+func GsSubI16(a, b int16, file string, line int) int16 {
+	r := int64(a) - int64(b)
+	if r != int64(int16(r)) {
+		GsOvf(int64(a), "-", int64(b), "i16", file, line)
+	}
+	return int16(r)
+}
+
+func GsMulI16(a, b int16, file string, line int) int16 {
+	r := int64(a) * int64(b)
+	if r != int64(int16(r)) {
+		GsOvf(int64(a), "*", int64(b), "i16", file, line)
+	}
+	return int16(r)
+}
+
+func GsNegI16(a int16, file string, line int) int16 {
+	if a == math.MinInt16 {
+		GsOvfNeg(int64(a), "i16", file, line)
+	}
+	return -a
+}
+
+func GsAddI32(a, b int32, file string, line int) int32 {
+	r := int64(a) + int64(b)
+	if r != int64(int32(r)) {
+		GsOvf(int64(a), "+", int64(b), "i32", file, line)
+	}
+	return int32(r)
+}
+
+func GsSubI32(a, b int32, file string, line int) int32 {
+	r := int64(a) - int64(b)
+	if r != int64(int32(r)) {
+		GsOvf(int64(a), "-", int64(b), "i32", file, line)
+	}
+	return int32(r)
+}
+
+func GsMulI32(a, b int32, file string, line int) int32 {
+	r := int64(a) * int64(b)
+	if r != int64(int32(r)) {
+		GsOvf(int64(a), "*", int64(b), "i32", file, line)
+	}
+	return int32(r)
+}
+
+func GsNegI32(a int32, file string, line int) int32 {
+	if a == math.MinInt32 {
+		GsOvfNeg(int64(a), "i32", file, line)
+	}
+	return -a
+}
+
+func GsAddI64(a, b int64, file string, line int) int64 {
+	r := a + b
+	if (a^r)&(b^r) < 0 {
+		GsOvf(a, "+", b, "i64", file, line)
+	}
+	return r
+}
+
+func GsSubI64(a, b int64, file string, line int) int64 {
+	r := a - b
+	if (a^b)&(a^r) < 0 {
+		GsOvf(a, "-", b, "i64", file, line)
+	}
+	return r
+}
+
+func GsMulI64(a, b int64, file string, line int) int64 {
+	r := a * b
+	if a != 0 && b != 0 &&
+		((a == -1 && b == math.MinInt64) || (b == -1 && a == math.MinInt64) || r/b != a) {
+		GsOvf(a, "*", b, "i64", file, line)
+	}
+	return r
+}
+
+func GsNegI64(a int64, file string, line int) int64 {
+	if a == math.MinInt64 {
+		GsOvfNeg(a, "i64", file, line)
+	}
+	return -a
 }
 
 // ---------------------------------------------------------------------------
-// Conversions (§6.3). A debug build checks every `as` that could change
-// its value, aborting with the value, the target type and the cast's file
-// and line; a release build converts as Go does, except from a float,
-// whose conversion to an integer is defined in every build (GsF2IWrap).
-// A conversion to a float is a plain Go conversion in every build.
+// Conversions (§6.3). `as!`, and `as` in a release build, take a float to an
+// integer by truncating it toward zero and wrapping modulo 2^64, the same on
+// every platform; a debug build's `as` aborts wherever the value changes.
 
-// GsRangeI is v, checked to lie in [lo, hi], the range of the signed or
-// unsigned type typ, in a debug build (GS_RANGE).
-func GsRangeI(v, lo, hi int64, typ, file string, line int) int64 {
-	if v < lo || v > hi {
-		GsAsFailI("out of range", v, typ, file, line)
-	}
-	return v
-}
-
-// GsRangeU is v, checked to be at most hi, the largest value of typ, in a
-// debug build (GS_RANGE_U).
-func GsRangeU(v, hi uint64, typ, file string, line int) uint64 {
-	if v > hi {
-		GsAsFailU("out of range", v, typ, file, line)
-	}
-	return v
-}
-
-// GsF2I is d as an integer of typ, a signed type or an unsigned one
-// narrower than u64 whose range is [lo, hi], checked in a debug build to
-// keep its value (GS_F2I). f32 says d holds an f32, for the message.
-func GsF2I(d float64, f32 bool, lo, hi int64, typ, file string, line int) int64 {
-	if d >= -0x1p63 && d < 0x1p63 {
-		if v := int64(d); v >= lo && v <= hi && float64(v) == d {
-			return v
-		}
-	}
-	gsF2IFail(d, f32, lo, hi, typ, file, line)
-	return 0
-}
-
-//go:noinline
-func gsF2IFail(d float64, f32 bool, lo, hi int64, typ, file string, line int) {
-	if !(d >= -0x1p63 && d < 0x1p63) {
-		GsAsFailF("out of range", d, f32, typ, file, line)
-	}
-	if v := int64(d); v < lo || v > hi {
-		GsAsFailF("out of range", d, f32, typ, file, line)
-	}
-	GsAsFailF("changes the value", d, f32, typ, file, line)
-}
-
-// GsF2U is d as a u64, checked in a debug build to keep its value
-// (GS_F2U). f32 says d holds an f32, for the message.
-func GsF2U(d float64, f32 bool, file string, line int) uint64 {
-	if d >= 0 && d < 0x1p64 {
-		if v := uint64(d); float64(v) == d {
-			return v
-		}
-	}
-	gsF2UFail(d, f32, file, line)
-	return 0
-}
-
-//go:noinline
-func gsF2UFail(d float64, f32 bool, file string, line int) {
-	if !(d >= 0 && d < 0x1p64) {
-		GsAsFailF("out of range", d, f32, "u64", file, line)
-	}
-	GsAsFailF("changes the value", d, f32, "u64", file, line)
-}
-
-// GsF2IWrap is `as!` from a float to an integer, and a release build's
-// `as` (gs_f2iwrap): truncated toward zero, then wrapped modulo 2^64; the
-// caller truncates the result to a narrower type. NaN, and an infinity,
-// whose wrap is no number, give 0. A value lies in the i64 range exactly
-// when its truncation does, and there Go's conversion truncates by itself,
-// so only NaN and the values beyond the range take the wrap, out of line.
 func GsF2IWrap(d float64) int64 {
-	if d >= -0x1p63 && d < 0x1p63 {
+	if d >= -9223372036854775808.0 && d < 9223372036854775808.0 {
 		return int64(d)
 	}
 	return gsF2IWrapSlow(d)
 }
 
-//go:noinline
 func gsF2IWrapSlow(d float64) int64 {
 	if d != d || math.IsInf(d, 0) {
 		return 0
 	}
-	// Exact: d and its remainder are whole multiples of 2^11.
-	d = math.Mod(math.Trunc(d), 0x1p64)
+	d = math.Mod(math.Trunc(d), 18446744073709551616.0)
 	if d < 0 {
-		d += 0x1p64
+		d += 18446744073709551616.0
 	}
 	return int64(uint64(d))
 }
 
-// GsF2UWrap is GsF2IWrap as an unsigned value: `as!` (and a release
-// build's `as`) from a float to u64.
-func GsF2UWrap(d float64) uint64 {
-	return uint64(GsF2IWrap(d))
+// The debug build's checked `as` between integer types, to a range lo..hi,
+// and from u64, to 0..hi.
+func GsRangeI(v, lo, hi int64, typ, file string, line int) int64 {
+	if v < lo || v > hi {
+		GsAsFail("out of range", strconv.FormatInt(v, 10), typ, file, line)
+	}
+	return v
+}
+
+func GsRangeU(v, hi uint64, typ, file string, line int) uint64 {
+	if v > hi {
+		GsAsFail("out of range", strconv.FormatUint(v, 10), typ, file, line)
+	}
+	return v
+}
+
+// The debug build's checked `as` from a float: to a type of range lo..hi,
+// and to u64. f32: d is an f32's value, and is named in that type's text.
+func GsF2I(d float64, f32 bool, lo, hi int64, typ, file string, line int) int64 {
+	if !(d >= -9223372036854775808.0 && d < 9223372036854775808.0) {
+		GsAsFail("out of range", gsFloatText(d, f32), typ, file, line)
+	}
+	v := int64(d)
+	if v < lo || v > hi {
+		GsAsFail("out of range", gsFloatText(d, f32), typ, file, line)
+	}
+	if float64(v) != d {
+		GsAsFail("changes the value", gsFloatText(d, f32), typ, file, line)
+	}
+	return v
+}
+
+func GsF2U(d float64, f32 bool, file string, line int) uint64 {
+	if !(d >= 0 && d < 18446744073709551616.0) {
+		GsAsFail("out of range", gsFloatText(d, f32), "u64", file, line)
+	}
+	v := uint64(d)
+	if float64(v) != d {
+		GsAsFail("changes the value", gsFloatText(d, f32), "u64", file, line)
+	}
+	return v
 }
 
 // ---------------------------------------------------------------------------
-// varint (§3.6): ULEB128, the signed positions zigzag-encoded. The readers
-// trust their input, as the generated code's walkers of a value it built
-// may; the checks bound every read by the image's end, for verifying bytes
-// that came from elsewhere (docs/design/serialization.md).
+// Variable-size values (§3.6, docs/implementation.md §6.1): a length prefix
+// or a varint is ULEB128, a signed varint value zigzag-encoded on top.
 
-// GsUlebRead is the ULEB128 at p. A one-byte varint, the common case of an
-// inline array's length prefix, inlines; longer ones continue out of line
-// (GS_ULEB_READ).
+// GsUlebRead is the ULEB128 at p (GS_ULEB_READ).
 func GsUlebRead(p unsafe.Pointer) int64 {
-	if b := *(*byte)(p); b < 0x80 {
-		return int64(b)
-	}
-	return gsUlebReadSlow(p)
-}
-
-//go:noinline
-func gsUlebReadSlow(p unsafe.Pointer) int64 {
 	var v uint64
 	for shift := uint(0); ; shift += 7 {
 		b := *(*byte)(p)
@@ -773,14 +777,6 @@ func gsUlebReadSlow(p unsafe.Pointer) int64 {
 
 // GsUlebSize is the size in bytes of the ULEB128 at p (GS_ULEB_SIZE).
 func GsUlebSize(p unsafe.Pointer) int64 {
-	if *(*byte)(p) < 0x80 {
-		return 1
-	}
-	return gsUlebSizeSlow(p)
-}
-
-//go:noinline
-func gsUlebSizeSlow(p unsafe.Pointer) int64 {
 	n := int64(1)
 	for *(*byte)(unsafe.Add(p, n-1)) >= 0x80 {
 		n++
@@ -801,47 +797,40 @@ func GsUlebWrite(p unsafe.Pointer, v uint64) int64 {
 	return n + 1
 }
 
-// GsZigEncode is v zigzag-encoded: 0, -1, 1, -2, ... as 0, 1, 2, 3, ...
-func GsZigEncode(v int64) uint64 {
-	return uint64(v)<<1 ^ uint64(v>>63)
-}
-
-// GsZigDecode is the value u zigzag-encodes.
-func GsZigDecode(u uint64) int64 {
+// GsZigRead is the zigzag-encoded varint at p (gs_zig_read).
+func GsZigRead(p unsafe.Pointer) int64 {
+	u := uint64(GsUlebRead(p))
 	return int64(u>>1) ^ -int64(u&1)
 }
 
-// GsZigRead is the zigzag-encoded varint at p.
-func GsZigRead(p unsafe.Pointer) int64 {
-	if b := *(*byte)(p); b < 0x80 {
-		return int64(b>>1) ^ -int64(b&1)
-	}
-	return gsZigReadSlow(p)
-}
-
-//go:noinline
-func gsZigReadSlow(p unsafe.Pointer) int64 {
-	return GsZigDecode(uint64(gsUlebReadSlow(p)))
-}
-
 // GsZigWrite writes v as a zigzag-encoded varint at p, returning its size
-// in bytes.
+// in bytes (gs_zig_write).
 func GsZigWrite(p unsafe.Pointer, v int64) int64 {
-	return GsUlebWrite(p, GsZigEncode(v))
+	return GsUlebWrite(p, uint64(v)<<1^uint64(v>>63))
 }
 
-// GsUlebCheck reads the ULEB128 at p of an image that ends at end, for the
+// GsLenCheck is the check of a count that goes into a length field: it
+// must fit the field's storage (EmitLenCheck).
+func GsLenCheck(n int64, max uint64) {
+	if uint64(n) > max {
+		GsPanic("array length exceeds storage range")
+	}
+}
+
+// GsUlebCheck reads the ULEB128 at byte q of the n bytes at p, for the
 // verifier (gs_uleb_check): the value and its size in bytes, which is 0
-// where the varint runs past end or past ten bytes, carries payload bits
-// above the 64th, or is not in its shortest form.
-func GsUlebCheck(p, end unsafe.Pointer) (v uint64, n int64) {
-	room := int64(uintptr(end) - uintptr(p))
+// where the varint runs past n or past ten bytes, carries payload bits
+// above the 64th, or is not in its shortest form. Nothing past the n bytes
+// is formed into an address.
+//
+//goose:internal
+func GsUlebCheck(p unsafe.Pointer, q, n int64) (v uint64, k int64) {
 	for shift := uint(0); ; shift += 7 {
-		if n >= room {
+		if q+k >= n {
 			return 0, 0
 		}
-		b := *(*byte)(unsafe.Add(p, n))
-		n++
+		b := *(*byte)(unsafe.Add(p, q+k))
+		k++
 		if shift > 63 || (shift == 63 && b&0x7e != 0) {
 			return 0, 0
 		}
@@ -850,301 +839,101 @@ func GsUlebCheck(p, end unsafe.Pointer) (v uint64, n int64) {
 			if shift != 0 && b == 0 { // A redundant high zero group.
 				return 0, 0
 			}
-			return v, n
+			return v, k
 		}
 	}
 }
 
 // GsZigCheck is GsUlebCheck for a zigzag-encoded varint (gs_zig_check).
-func GsZigCheck(p, end unsafe.Pointer) (v int64, n int64) {
-	u, n := GsUlebCheck(p, end)
-	return GsZigDecode(u), n
-}
-
-// ---------------------------------------------------------------------------
-// Memory (docs/implementation.md §6.1). An empty slice's Data is nil where
-// the slice was zero-filled; these take nil for no bytes. Each inlines: a
-// run of 4 to 16 bytes, where keys, names and elements mostly are, is two
-// overlapping loads (and stores) per side, as in gs_memeq and gs_memcpy,
-// which fold to one path where the length is a constant; any other run is
-// one call of Go's own memequal or memmove, which take long runs a block at
-// a time. Equality does not care about byte order, so the loads are the
-// host's own.
-
-// GsMemEq says whether the n bytes at a and b are equal.
-func GsMemEq(a, b unsafe.Pointer, n int64) bool {
-	switch {
-	case n >= 8 && n <= 16:
-		return (*(*uint64)(a)^*(*uint64)(b))|
-			(*(*uint64)(unsafe.Add(a, n-8))^*(*uint64)(unsafe.Add(b, n-8))) == 0
-	case n >= 4 && n < 8:
-		return (*(*uint32)(a)^*(*uint32)(b))|
-			(*(*uint32)(unsafe.Add(a, n-4))^*(*uint32)(unsafe.Add(b, n-4))) == 0
-	}
-	return n <= 0 || unsafe.String((*byte)(a), n) == unsafe.String((*byte)(b), n)
-}
-
-// GsMemCpy copies n bytes from src to dst (gs_memcpy). A short run is read
-// whole before it is written, so the runs may overlap, though the
-// generated code never asks for that here.
-func GsMemCpy(dst, src unsafe.Pointer, n int64) {
-	switch {
-	case n >= 8 && n <= 16:
-		x, y := *(*uint64)(src), *(*uint64)(unsafe.Add(src, n-8))
-		*(*uint64)(dst), *(*uint64)(unsafe.Add(dst, n-8)) = x, y
-	case n >= 4 && n < 8:
-		x, y := *(*uint32)(src), *(*uint32)(unsafe.Add(src, n-4))
-		*(*uint32)(dst), *(*uint32)(unsafe.Add(dst, n-4)) = x, y
-	default:
-		copy(unsafe.Slice((*byte)(dst), n), unsafe.Slice((*byte)(src), n))
-	}
-}
-
-// GsMemMove copies n bytes from src to dst, which may overlap
-// (gs_memmove).
-func GsMemMove(dst, src unsafe.Pointer, n int64) {
-	if n > 0 {
-		copy(unsafe.Slice((*byte)(dst), n), unsafe.Slice((*byte)(src), n))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Byte search: std's find_any and find_pair (docs/stdlib.md). A set
-// arrives as std's ByteSet, made by its byte_set, which GsByteSet lays out
-// as the Goose struct is: Members is the set, one byte per value, and Kind
-// says how a block of bytes is tested for it: by comparing with 1 to 3 of
-// Bytes (kinds 1-3), or as the range Bytes[0] .. Bytes[0] + Bytes[1] (kind
-// 4), both complemented where Invert is set; kind 0 is the empty set, or
-// with Invert every byte. Lo and Hi are the nibble tables a set of kind 5
-// has nothing else than, which the C runtime's SSSE3 search reads.
 //
-// The search tests 8 bytes at a time as a word, for kinds 1 to 4, and one
-// byte at a time by Members for any other set, as the C runtime's search
-// falls back to; a set of one byte is Go's own IndexByte. No load reaches
-// past the range, which may end where a data stack's guard gap begins: its
-// last part is tested as the range's last whole word, with the positions
-// before it, already tested, shifted out of the result.
-
-// GsByteSet is std's ByteSet (gs_byteset).
-type GsByteSet struct {
-	Members [256]uint8
-	Kind    uint8
-	Invert  uint8
-	Bytes   [3]uint8
-	Lo      [16]uint8
-	Hi      [16]uint8
+//goose:internal
+func GsZigCheck(p unsafe.Pointer, q, n int64) (int64, int64) {
+	u, k := GsUlebCheck(p, q, n)
+	return int64(u>>1) ^ -int64(u&1), k
 }
 
-const (
-	gsLow7  = 0x7f7f7f7f7f7f7f7f
-	gsHigh1 = 0x8080808080808080
-	gsOnes  = 0x0101010101010101
-)
-
-// gsWordSet is a set of kind 1 to 4 as a test of a word of 8 bytes. Each
-// field is a byte repeated across a word: for kinds 1 to 3, a, b and c are
-// the bytes compared with (the first again where there are fewer); for a
-// range, a is its first byte's low 7 bits, b that byte's high bit flipped,
-// and c is 255 less the range's width. flip is the high bit of every byte
-// where the set is complemented.
-type gsWordSet struct {
-	a, b, c uint64
-	flip    uint64
-	rng     bool
+// GsBmSet and GsBmGet are the verifier's element starts, one bit per image
+// byte (GS_BM_SET, GS_BM_GET), in scratch on a data stack.
+//
+//goose:internal
+func GsBmSet(bm unsafe.Pointer, i int64) {
+	*(*byte)(unsafe.Add(bm, i>>3)) |= 1 << (i & 7)
 }
 
-func gsWordSetOf(s *GsByteSet) gsWordSet {
-	var w gsWordSet
-	b0 := uint64(s.Bytes[0]) * gsOnes
-	switch s.Kind {
-	case 1:
-		w.a, w.b, w.c = b0, b0, b0
-	case 2:
-		w.a, w.b, w.c = b0, uint64(s.Bytes[1])*gsOnes, b0
-	case 3:
-		w.a, w.b, w.c = b0, uint64(s.Bytes[1])*gsOnes, uint64(s.Bytes[2])*gsOnes
-	default:
-		w.rng = true
-		w.a, w.b = b0&gsLow7, ^b0&gsHigh1
-		w.c = uint64(255-s.Bytes[1]) * gsOnes
-	}
-	if s.Invert != 0 {
-		w.flip = gsHigh1
-	}
-	return w
+//goose:internal
+func GsBmGet(bm unsafe.Pointer, i int64) bool {
+	return *(*byte)(unsafe.Add(bm, i>>3))>>(i&7)&1 != 0
 }
 
-// gsEqBytes is the high bit of each byte of x that equals the same byte of
-// a, b or c, a set of kind 1 to 3. A byte y of x ^ a is zero exactly where
-// (y & 0x7f) + 0x7f leaves the high bit clear and so does y: no carry
-// crosses from one byte to the next.
-func gsEqBytes(x, a, b, c uint64) uint64 {
-	ya, yb, yc := x^a, x^b, x^c
-	return ^((((ya & gsLow7) + gsLow7) | ya) & (((yb & gsLow7) + gsLow7) | yb) &
-		(((yc & gsLow7) + gsLow7) | yc)) & gsHigh1
+// GsIsLE says whether the host is little-endian, which serialization needs
+// (gs_is_le).
+//
+//goose:internal
+func GsIsLE() bool {
+	x := uint16(1)
+	return *(*byte)(unsafe.Pointer(&x)) == 1
 }
 
-// gsInRange is the high bit of each byte of x in the range a, b and c
-// describe (gsWordSet): those whose distance t above the first byte,
-// wrapping, has t + 255 - width carry out of no byte. t comes from a
-// subtraction that cannot borrow across bytes, each high bit fixed after,
-// and the carries from the sums of the low 7 bits of each byte.
-func gsInRange(x, a, b, c uint64) uint64 {
-	t := ((x | gsHigh1) - a) ^ ((x & gsHigh1) ^ b)
-	return ^((t & c) | ((t ^ c) & ((t & gsLow7) + (c & gsLow7)))) & gsHigh1
-}
+// ---------------------------------------------------------------------------
+// The C functions std and math bind as extern fns (runtime_ext.h), where
+// Go's own library has no equivalent. A ByteSet's members, a bool[256],
+// lead it.
 
-// gsLoad64 is the 8 bytes at p as a little-endian word, so that byte k of
-// the word is p[k] on every host.
-func gsLoad64(p unsafe.Pointer) uint64 {
-	return binary.LittleEndian.Uint64((*[8]byte)(p)[:])
-}
-
-// GsScanAny is the first i < n with p[i] in the set, or -1 where there is
-// none (gs_scan_any).
-func GsScanAny(p unsafe.Pointer, n int64, set *GsByteSet) int64 {
-	if n <= 0 {
-		return -1
-	}
-	switch set.Kind {
-	case 0:
-		if set.Invert != 0 {
-			return 0
-		}
-		return -1
-	case 1, 2, 3, 4:
-		if set.Kind == 1 && set.Invert == 0 {
-			return int64(bytes.IndexByte(unsafe.Slice((*byte)(p), n), set.Bytes[0]))
-		}
-		if n >= 8 {
-			w := gsWordSetOf(set)
-			return gsScanAnyWords(p, n, &w)
-		}
-	}
-	return gsScanAnyBytes(p, n, set)
-}
-
-// gsScanAnyWords is GsScanAny over n >= 8 bytes, two words at a time while
-// they fit, then a word at a time, the last one ending at n with its bytes
-// before i, already tested, shifted out.
-func gsScanAnyWords(p unsafe.Pointer, n int64, w *gsWordSet) int64 {
-	a, b, c, flip, rng := w.a, w.b, w.c, w.flip, w.rng
-	i := int64(0)
-	for ; i+16 <= n; i += 16 {
-		x0, x1 := gsLoad64(unsafe.Add(p, i)), gsLoad64(unsafe.Add(p, i+8))
-		var m0, m1 uint64
-		if rng {
-			m0, m1 = gsInRange(x0, a, b, c), gsInRange(x1, a, b, c)
-		} else {
-			m0, m1 = gsEqBytes(x0, a, b, c), gsEqBytes(x1, a, b, c)
-		}
-		if m0, m1 = m0^flip, m1^flip; m0|m1 != 0 {
-			if m0 != 0 {
-				return i + int64(bits.TrailingZeros64(m0)>>3)
-			}
-			return i + 8 + int64(bits.TrailingZeros64(m1)>>3)
-		}
-	}
-	for ; i < n; i += 8 {
-		j, shift := i, uint(0)
-		if j > n-8 {
-			j, shift = n-8, uint(i-n+8)*8
-		}
-		x := gsLoad64(unsafe.Add(p, j))
-		var m uint64
-		if rng {
-			m = gsInRange(x, a, b, c)
-		} else {
-			m = gsEqBytes(x, a, b, c)
-		}
-		if m = (m ^ flip) >> shift; m != 0 {
-			return i + int64(bits.TrailingZeros64(m)>>3)
-		}
-	}
-	return -1
-}
-
-func gsScanAnyBytes(p unsafe.Pointer, n int64, set *GsByteSet) int64 {
-	m := &set.Members
-	i := int64(0)
-	for ; i+8 <= n; i += 8 {
-		q := (*[8]byte)(unsafe.Add(p, i))
-		if m[q[0]]|m[q[1]]|m[q[2]]|m[q[3]]|m[q[4]]|m[q[5]]|m[q[6]]|m[q[7]] != 0 {
-			break
-		}
-	}
-	for ; i < n; i++ {
-		if m[*(*byte)(unsafe.Add(p, i))] != 0 {
+// GsFindAny is std's find_any: the first i with s[i] in set, -1 if none
+// (gs_find_any).
+func GsFindAny(s GsSlice, set unsafe.Pointer) int64 {
+	m := (*[256]bool)(set)
+	for i := int64(0); i < s.Len; i++ {
+		if m[*(*byte)(unsafe.Add(s.Data, i))] {
 			return i
 		}
 	}
 	return -1
 }
 
-// GsScanPair is the first i with p[i] in a and p[i + d] in b, of those
-// with i + d < n, or -1 where there is none (gs_scan_pair).
-func GsScanPair(p unsafe.Pointer, n int64, a *GsByteSet, d int64, b *GsByteSet) int64 {
-	if d < 0 || d >= n {
-		return -1
-	}
-	np := n - d // the positions both bytes fit at
-	// A set of every byte leaves a search for the other.
-	if a.Kind == 0 {
-		if a.Invert != 0 {
-			return GsScanAny(unsafe.Add(p, d), np, b)
-		}
-		return -1
-	}
-	if b.Kind == 0 {
-		if b.Invert != 0 {
-			return GsScanAny(p, np, a)
-		}
-		return -1
-	}
-	if np >= 8 && a.Kind <= 4 && b.Kind <= 4 {
-		wa, wb := gsWordSetOf(a), gsWordSetOf(b)
-		return gsScanPairWords(p, np, &wa, d, &wb)
-	}
-	return gsScanPairBytes(p, np, a, d, b)
-}
-
-// gsScanPairWords is GsScanPair over np >= 8 positions, a word of each
-// set's bytes at a time, the last word ending at np as in gsScanAnyWords.
-func gsScanPairWords(p unsafe.Pointer, np int64, wa *gsWordSet, d int64, wb *gsWordSet) int64 {
-	aa, ab, ac, aflip, arng := wa.a, wa.b, wa.c, wa.flip, wa.rng
-	ba, bb, bc, bflip, brng := wb.a, wb.b, wb.c, wb.flip, wb.rng
-	for i := int64(0); i < np; i += 8 {
-		j, shift := i, uint(0)
-		if j > np-8 {
-			j, shift = np-8, uint(i-np+8)*8
-		}
-		q := unsafe.Add(p, j)
-		xa, xb := gsLoad64(q), gsLoad64(unsafe.Add(q, d))
-		var ma, mb uint64
-		if arng {
-			ma = gsInRange(xa, aa, ab, ac)
-		} else {
-			ma = gsEqBytes(xa, aa, ab, ac)
-		}
-		if brng {
-			mb = gsInRange(xb, ba, bb, bc)
-		} else {
-			mb = gsEqBytes(xb, ba, bb, bc)
-		}
-		if m := ((ma ^ aflip) & (mb ^ bflip)) >> shift; m != 0 {
-			return i + int64(bits.TrailingZeros64(m)>>3)
-		}
-	}
-	return -1
-}
-
-// gsScanPairBytes is the first of the np positions i with p[i] in a and
-// p[i + d] in b.
-func gsScanPairBytes(p unsafe.Pointer, np int64, a *GsByteSet, d int64, b *GsByteSet) int64 {
-	for i := int64(0); i < np; i++ {
-		if a.Members[*(*byte)(unsafe.Add(p, i))]&b.Members[*(*byte)(unsafe.Add(p, i+d))] != 0 {
+// GsFindPair is std's byte_set_pair: the first i with s[i] in a and
+// s[i+d] in b, of those with i + d < s.Len; -1 if none (gs_find_pair).
+func GsFindPair(s GsSlice, a unsafe.Pointer, d int64, b unsafe.Pointer) int64 {
+	ma, mb := (*[256]bool)(a), (*[256]bool)(b)
+	for i := int64(0); i+d < s.Len; i++ {
+		if ma[*(*byte)(unsafe.Add(s.Data, i))] && mb[*(*byte)(unsafe.Add(s.Data, i+d))] {
 			return i
 		}
 	}
 	return -1
+}
+
+// GsFrexp is C's frexp: the fraction, its exponent through e.
+func GsFrexp(x float64, e *int32) float64 {
+	f, n := math.Frexp(x)
+	*e = int32(n)
+	return f
+}
+
+// GsMulAddF32 is math's mul_add at f32 (gs_mul_addf), x * y + z rounded
+// once, as math.FMA is at f64 (gs_mul_add): Go has FMA wherever it runs,
+// as C has it on arm64. The f32 product is exact in an f64, and so is the
+// sum but where its rounding to an f64 lands halfway between two f32s,
+// which is then moved toward what the rounding dropped, so that the one
+// rounding to f32 is the exact sum's (musl's fmaf).
+func GsMulAddF32(x, y, z float32) float32 {
+	xy := float64(float64(x) * float64(y))
+	r := xy + float64(z)
+	u := math.Float64bits(r)
+	if u&0x1fffffff != 0x10000000 || u>>52&0x7ff == 0x7ff || (r-xy == float64(z) && r-float64(z) == xy) {
+		return float32(r)
+	}
+	var err float64
+	neg := u>>63 != 0
+	if neg == (float64(z) > xy) {
+		err = xy - r + float64(z)
+	} else {
+		err = float64(z) - r + xy
+	}
+	if neg == (err < 0) {
+		u++
+	} else {
+		u--
+	}
+	return float32(math.Float64frombits(u))
 }

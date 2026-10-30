@@ -289,7 +289,6 @@ inline string CodeGenGo::GenWideLoad(Binary *b) {
     while (l.t->kind == TY_REF) DerefLoc(l);
     auto v = ArrayView(l, first.ix->line);
     auto at = WideAt(IndexValue(first.ix->idx), k0 - first.off);
-    usesbinary = usesbinary || !dry;
     auto x = cat("binary.", WideOrder(le), ".Uint", 8 * n, "(", WideBytes(v, at, n), ")");
     auto ut = ast.inttypes[n == 2 ? IS_U16 : n == 4 ? IS_U32 : IS_U64];
     return Coerce(Coerce(x, ut, ot, b->line), ot, b->exprtype, b->line);
@@ -425,7 +424,6 @@ inline bool CodeGenGo::GenWideStoreLoop(ForLoop *f) {
     vnames.erase(f->vdef);
     auto ut = ast.inttypes[n == 2 ? IS_U16 : n == 4 ? IS_U32 : IS_U64];
     auto x = Coerce(GenX(v), v->exprtype, ut, a->line);
-    usesbinary = usesbinary || !dry;
     L("binary.", WideOrder(le), ".PutUint", 8 * n, "(", WideBytes(view, at, n), ", ", x, ")");
     return true;
 }
@@ -489,7 +487,6 @@ inline size_t CodeGenGo::GenWideStoreRun(const vector<Node *> &stmts, size_t i) 
         auto at = WideAt(IndexValue(w[0].ix->idx), k0 - w[0].off);
         auto ut = ast.inttypes[n == 2 ? IS_U16 : n == 4 ? IS_U32 : IS_U64];
         auto x = Coerce(GenX(v0), v0->exprtype, ut, first->line);
-        usesbinary = usesbinary || !dry;
         L("binary.", WideOrder(le), ".PutUint", 8 * n, "(", WideBytes(view, at, n), ", ", x, ")");
         PopSc();
         return (size_t)n;

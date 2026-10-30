@@ -646,7 +646,7 @@ inline string CodeGenGo::LoadLoc(GoLoc l, TypeExpr *et, Line ln) {
     if (et->kind == TY_SLICE && l.t->kind == TY_ARRAY) {
         // A whole array where a slice of it is wanted (§3.10).
         auto v = ArrayView(l, ln);
-        return cat("GsSlice{", v.data, ", ", v.len, "}");
+        return cat("GsSlice{Data: ", v.data, ", Len: ", v.len, "}");
     }
     if (IsStaticLimited(et) &&
         (l.t->kind == TY_SLICE || (l.t->kind == TY_ARRAY && !TEq(l.t, et))))

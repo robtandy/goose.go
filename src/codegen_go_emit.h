@@ -902,8 +902,11 @@ inline void CodeGenGo::EmitGlobalInit() {
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
     auto fb = FinishBody(body, true);
     UsesGl(fb);
+    initempty = fb.find_first_not_of(" \t\n") == string::npos;
+    initat = code.size();
     Append(code, "// The globals' initializers, in declaration order (§11.1).\n"
                  "func gsInitGlobals(gs *GsStackBlock) {\n\t_ = gs\n", fb, "}\n\n");
+    initlen = code.size() - initat;
 }
 
 // A global's dedicated stack, and its pool's freelist's, set up where its
@@ -944,7 +947,9 @@ inline void CodeGenGo::InitGlobalStack(VarDef *d) {
 // call of an export fn's entry point starts it (gsLibStart, issue #18),
 // which initializes the globals, and only those, on the package's block,
 // so that importing the package does nothing. The Go program that imports
-// it runs instead of its fn main(), if it has one.
+// it runs instead of its fn main(), if it has one. A library with nothing
+// to start -- no global to initialize, no worker to spawn -- has no start
+// (issue #19): its entry points call the functions directly.
 inline void CodeGenGo::EmitProgram() {
     BoundStacksOf(*this);
     auto mainstacks = ProgramStacksOf(*this, MainRootsOf(*this));
@@ -980,15 +985,19 @@ inline void CodeGenGo::EmitProgram() {
     // Under GS_STACK_STATS the program reports, as it ends, the stacks it
     // took, as C's gs_stack_stats does.
     string stats;
-    if (opts.stackstats && !opts.library) stats = cat("\tgsStackStats(gs, ", mainstacks, ")\n");
+    if (opts.stackstats && !opts.library) stats = cat("\tgsProg.StackStats(gs, ", mainstacks, ")\n");
     // In a program with workers, main's block runs main's instance, which
     // the export fns' entry points copy their globals from.
     string inst;
     if (workers) inst = "\tgs.Gl = unsafe.Pointer(&gsGlobalsMain)\n\tgsMainBlock = gs\n";
-    auto start = cat("\tgsRtStart(", opts.stacks.budget, ", ", mainstacks + globalregions, ", ", workerregions, ")\n"
-                     "\tgs := NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n",
+    auto start = cat("\tgsProg.Start(", opts.stacks.budget, ", ", mainstacks + globalregions, ", ", workerregions, ")\n"
+                     "\tgs := gsProg.NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n",
                      inst, "\tgsInitGlobals(gs)\n");
-    if (!opts.library) {
+    libstart = opts.library && (workers || !initempty || globalregions > 0);
+    if (opts.library && !libstart) {
+        // Nothing to start, and no gsInitGlobals for a start to call.
+        code.erase(initat, initlen);
+    } else if (!opts.library) {
         Append(code, "func main() {\n"
                      "\tdefer GsExitOnAbort()\n"
                      "\tdebug.SetPanicOnFault(true)\n",
@@ -1019,7 +1028,7 @@ inline void CodeGenGo::EmitProgram() {
                      "// panic on fault it turns on for the start only.\n"
                      "func gsLibInit() {\n"
                      "\tdefer func() {\n\t\tif atomic.LoadUint32(&gsLib.ok) == 0 {\n"
-                     "\t\t\tgsLib.fail = gsAbortOf(recover())\n\t\t\tpanic(gsLib.fail)\n\t\t}\n\t}()\n"
+                     "\t\t\tgsLib.fail = GsAbortOf(recover())\n\t\t\tpanic(gsLib.fail)\n\t\t}\n\t}()\n"
                      "\tdefer debug.SetPanicOnFault(debug.SetPanicOnFault(true))\n",
                start, "\tatomic.StoreUint32(&gsLib.ok, 1)\n}\n");
     }
@@ -1347,64 +1356,36 @@ static string GoIncludeLines(const string &name, const string &body) {
     return out;
 }
 
+// The settings a package's runtime file records, which every program
+// compiled into the package must share (--go-runtime-file): what the
+// runtime is to its files, the names it gives the runtime's, and the
+// configuration its blocks are made with.
+inline string GoRuntimeSettings(const GoOptions &o, uint64_t framereserve) {
+    return cat("runtime=", o.runtime == GO_RT_IMPORT ? "import" : o.runtime == GO_RT_FULL ? "full" : "embed",
+               " names=", o.unexported ? "unexported" : "exported", " stack-reserve=", o.stacks.reserve,
+               " stack-gap=", o.stacks.gap, " frame-reserve=", framereserve);
+}
+
 // The whole file: a build constraint where --go-build gives one, a header
 // Go tools know generated code by, the package, the imports, the runtime
-// configuration and the runtime, then the program, laid out as gofmt lays
-// it out (GoFormat), and the --include files.
+// configuration and the runtime -- the part the program uses, all of it, or
+// none, where it imports the runtime's package (codegen_go_runtime.h) --
+// then the program, laid out as gofmt lays it out (GoFormat), and the
+// --include files. With --go-runtime-file the configuration and the
+// runtime go to that file instead (runtimefiletext), which the package's
+// programs share, and the program's own names carry its file's name.
 inline string CodeGenGo::Source(const string &srcname) {
+    auto &rt = GoRuntime();
+    auto imp = opts.runtime == GO_RT_IMPORT, full = opts.runtime == GO_RT_FULL;
+    auto shared = !opts.runtimefile.empty();
     // Go source is UTF-8 throughout, comments included: the file's name as
     // printable ASCII.
-    string name = srcname;
-    for (auto &c : name)
-        if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
-    // The imports: the runtime's, the OS layer's where the program calls it,
-    // and the --include files' (incimports), each package once, in gofmt's
-    // order: by path, then by name.
-    vector<pair<string, string>> imports;
-    auto add = [&](const string &n, const string &path) {
-        // A name that is the package's own is no name.
-        auto own = path.substr(path.find_last_of('/') + 1);
-        auto nm = n == own ? string() : n;
-        for (auto &[in, ip] : imports)
-            if (ip == path && in == nm) return;
-        imports.push_back({ nm, path });
+    auto ascii = [](string s) {
+        for (auto &c : s)
+            if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
+        return s;
     };
-    for (auto p : { "math", "os", "runtime", "runtime/debug", "strconv", "sync", "sync/atomic", "syscall", "unsafe" })
-        add("", p);
-    if (usesbits) add("", "math/bits");
-    if (usesbinary) add("", "encoding/binary");
-    if (usesos)
-        for (auto p : { "bytes", "io", "path/filepath", "strings", "time" }) add("", p);
-    if (usesthreads) add("", "time");
-    for (auto &[n, p] : incimports) add(n, p);
-    sort(imports.begin(), imports.end(), [](auto &a, auto &b) {
-        return a.second != b.second ? a.second < b.second : a.first < b.first;
-    });
-    string imps;
-    for (auto &[n, p] : imports) Append(imps, "\t", n, n.empty() ? "" : " ", GoStr(p), "\n");
-    string s = cat(opts.build.empty() ? "" : cat("//go:build ", opts.build, "\n\n"),
-                   "// Code generated by the Goose compiler from ", name, ". DO NOT EDIT.\n"
-                   "//\n"
-                   "// Names from the program carry a _g suffix, which keeps them clear of Go's\n"
-                   "// keywords and of the runtime's gs and Gs names; a namespaced name ns::x is\n"
-                   "// ns_x_g followed by the namespace's length.\n\n"
-                   "package ", opts.package, "\n\n"
-                   "import (\n", imps, ")\n\n"
-                   "// The runtime configuration the program was compiled with (--stack-reserve,\n"
-                   "// -D GS_STACK_RESERVE, -D GS_STACK_GAP, --frame-reserve), and whether it is a\n"
-                   "// library (--library), which never exits the process: its host's.\n"
-                   "const (\n\tgsStackReserve = ", opts.stacks.reserve,
-                   "\n\tgsStackGap     = ", opts.stacks.gap,
-                   "\n\tgsFrameReserve = ", FrameReserve(),
-                   "\n\tgsLibrary      = ", opts.library ? "true" : "false", "\n)\n\n");
-    for (auto part : go_runtime_prologue) s += part;
-    if (usesos) {
-        Append(s, "\n// os.resource_dir's directory where it is not the executable's: the entry\n"
-                  "// source's, for goose run.\nconst gsJitResourceDir = ", GoStr(opts.resourcedir), "\n");
-        for (auto part : go_runtime_os) s += part;
-    }
-    if (usesthreads)
-        for (auto part : go_runtime_threads) s += part;
+    string name = ascii(srcname);
     // A program with workers keeps its globals in program instances.
     string inst;
     if (workers)
@@ -1415,19 +1396,318 @@ inline string CodeGenGo::Source(const string &srcname) {
                    "// The block main's program runs, whose stacks hold main's instance's values.\n"
                    "var gsMainBlock *GsStackBlock\n\n");
     if (!qdecls.empty()) inst += cat("// The queues (§11.2), one per element type.\n", qdecls, "\n");
-    Append(s, "\n", GoFormat(cat("// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", tdecls, inst,
-                                 gdecls, gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code,
-                                 xcode.empty() ? "" : "// ---- export fns' entry points ----\n\n", xcode, eqcode,
-                                 bcode, ldstcode)));
-    // The --include files, last, so that the //line directives naming each
-    // hold to its end.
+    if (usesos)
+        inst += cat("// os.resource_dir's directory where it is not the executable's: the entry\n"
+                    "// source's, for goose run.\nconst gsJitResourceDir = ", GoStr(opts.resourcedir), "\n\n");
+    // The program's place in the runtime, where its Go names it: its
+    // configuration, which the blocks it makes have, its pool, and whether
+    // it is a library.
+    auto progdecl = [&](bool library) {
+        return cat("// The program's place in the runtime: the configuration its blocks are made with,\n"
+                   "// the pool of them its export fns' entry points take theirs from, and the cap on\n"
+                   "// its workers", library ? "; and it is a library, which never exits the process" : "", ".\n"
+                   "var gsProg = GsProgram{StackReserve: gsStackReserve, StackGap: gsStackGap, FrameReserve: "
+                   "gsFrameReserve", library ? ", Library: true" : "", "}\n\n");
+    };
+    // The package's own, in its runtime file, which the runtime's block API
+    // makes blocks for (NewStackBlock, AcquireStackBlock), of the sizes the
+    // package's programs share: each program has one of its own too.
+    auto pkgprogdecl = string("// The package's place in the runtime, whose blocks the runtime's block API makes\n"
+                              "// (NewStackBlock, AcquireStackBlock), of the configuration its programs share; each\n"
+                              "// program has a place of its own too.\n"
+                              "var gsProg = GsProgram{StackReserve: gsStackReserve, StackGap: gsStackGap, FrameReserve: "
+                              "gsFrameReserve}\n\n");
+    auto program = [&](bool withprog) {
+        return cat("// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", withprog ? progdecl(opts.library) : "",
+                   tdecls, inst, gdecls, gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code,
+                   xcode.empty() ? "" : "// ---- export fns' entry points ----\n\n", xcode, eqcode, bcode, ldstcode);
+    };
+    // What the program's Go and the --include files' use of the runtime's,
+    // by the names the runtime declares them by; and of Go's packages.
+    // The packages the program's Go may name besides the runtime's: math/bits,
+    // and encoding/binary, which a wide load or store calls
+    // (codegen_go_wide.h).
+    auto known = rt.imports;
+    known["bits"] = "math/bits";
+    known["binary"] = "encoding/binary";
+    GoUses uses;
+    GoScanUses(program(false), known, uses);
+    auto proguses = uses;
     for (auto &[iname, ibody] : incbodies) {
-        string n = iname;
-        for (auto &c : n)
-            if ((uint8_t)c < 32 || (uint8_t)c >= 127) c = '?';
-        Append(s, "\n// ---- --include ", n, " ----\n", GoIncludeLines(n, ibody));
+        GoUses inc;
+        GoScanUses(ibody, {}, inc);
+        uses.refs.insert(inc.refs.begin(), inc.refs.end());
+        uses.sels.insert(inc.sels.begin(), inc.sels.end());
     }
-    return s;
+    auto refs = uses.refs, sels = uses.sels;
+    // The block type of --go-unexported's NameWithStack entry points, and
+    // the pool's two that make one, which the package exports for them: an
+    // alias of the runtime's own.
+    auto alias = opts.unexported && !imp && !opts.nowithstack && !entrynames.empty();
+    string aliastext;
+    if (alias) {
+        aliastext = "// StackBlock is the block of data stacks an export fn's NameWithStack entry point\n"
+                    "// runs on, which a caller may keep across calls.\ntype StackBlock = GsStackBlock\n\n";
+        if (hostblocks)
+            aliastext += "// AcquireStackBlock is a block of at least numStacks empty data stacks from the\n"
+                         "// runtime's pool, which allocates and reserves nothing once the pool holds one: hand\n"
+                         "// it back with ReleaseStackBlock, and until then it is the caller's alone.\n"
+                         "func AcquireStackBlock(numStacks int) *StackBlock { return gsProg.AcquireStackBlock(numStacks) }\n\n"
+                         "// ReleaseStackBlock rewinds gs, a block AcquireStackBlock gave, and gives it back to\n"
+                         "// the pool: nothing may use what its stacks hold afterwards.\n"
+                         "func ReleaseStackBlock(gs *StackBlock) { gsProg.ReleaseStackBlock(gs) }\n\n";
+        GoUses au;
+        GoScanUses(aliastext, {}, au);
+        // Its own names are no uses of the runtime's.
+        for (auto n : { "StackBlock", "AcquireStackBlock", "ReleaseStackBlock" }) au.refs.erase(n);
+        refs.insert(au.refs.begin(), au.refs.end());
+        sels.insert(au.sels.begin(), au.sels.end());
+    }
+    // What a host of a library uses besides its entry points: the error an
+    // abort panics with, and where an entry point runs on a block the
+    // caller holds, the blocks the runtime makes.
+    if (opts.library && !opts.unexported) {
+        refs.insert("GsError");
+        if (hostblocks) {
+            for (auto n : { "NewStackBlock", "AcquireStackBlock", "ReleaseStackBlock" }) refs.insert(n);
+            for (auto n : { "Close", "Reset", "EnsureStacks" }) sels.insert(n);
+        }
+    }
+    // The names the runtime gets in a file, by the names it declares them
+    // by: an internal one's, or with --go-unexported every one's, unexported,
+    // in its comments as well; or the package's, where the file imports it.
+    unordered_map<string, string> rtcode, rtwords;
+    for (auto &n : rt.toplevel) {
+        if (imp) {
+            if (isupper((unsigned char)n[0])) rtcode[n] = cat(GO_RUNTIME_NAME, ".", n);
+        } else if (rt.internal.count(n) || (opts.unexported && isupper((unsigned char)n[0]))) {
+            rtcode[n] = rtwords[n] = GoUnexport(n);
+        }
+    }
+    // A runtime file already there: its settings must be this compile's,
+    // and what it holds of the runtime it goes on holding, for the
+    // package's other programs.
+    auto settings = GoRuntimeSettings(opts, FrameReserve());
+    if (shared && opts.runtimeexists) {
+        auto &old = opts.runtimeold;
+        auto at = old.find("// goose-runtime: ");
+        if (at == string::npos)
+            throw CompileError { cat("--go-runtime-file ", opts.runtimefile, ": the file is no runtime file the Goose "
+                                     "compiler wrote; remove it, or name another") };
+        auto line = old.substr(at + 18, old.find('\n', at) - at - 18);
+        if (line != settings)
+            throw CompileError { cat("--go-runtime-file ", opts.runtimefile, " holds the runtime of programs compiled "
+                                     "with ", line, ", and this one is compiled with ", settings, ": the programs of a "
+                                     "package share its runtime, and so its settings (remove the file to start over)") };
+        auto oldsrc = GoParseDecls(old);
+        for (auto &d : oldsrc.decls)
+            if (d.kind == "package" && (d.names.empty() || d.names[0] != opts.package))
+                throw CompileError { cat("--go-runtime-file ", opts.runtimefile, " is the runtime of package ",
+                                         d.names.empty() ? string("?") : d.names[0], ", and this file's package is ",
+                                         opts.package) };
+        // Every name it uses, by the name the runtime declares it by.
+        unordered_map<string, string> canon;
+        for (auto &[from, to] : rtcode) canon[to] = from;
+        GoUses ou;
+        GoScanUses(old, {}, ou);
+        for (auto &n : ou.refs) {
+            auto it = canon.find(n);
+            refs.insert(it != canon.end() ? it->second : n);
+        }
+        sels.insert(ou.sels.begin(), ou.sels.end());
+        sels.insert(ou.refs.begin(), ou.refs.end());
+        if (ou.refs.count("StackBlock") && !alias && !imp && opts.unexported) {
+            alias = true;
+            aliastext = "// StackBlock is the block of data stacks an export fn's NameWithStack entry point\n"
+                        "// runs on, which a caller may keep across calls.\ntype StackBlock = GsStackBlock\n\n";
+        }
+        if (ou.refs.count("AcquireStackBlock") && opts.unexported && !imp && aliastext.find("func Acquire") == string::npos)
+            aliastext += "// AcquireStackBlock is a block of at least numStacks empty data stacks from the\n"
+                         "// runtime's pool, which allocates and reserves nothing once the pool holds one: hand\n"
+                         "// it back with ReleaseStackBlock, and until then it is the caller's alone.\n"
+                         "func AcquireStackBlock(numStacks int) *StackBlock { return gsProg.AcquireStackBlock(numStacks) }\n\n"
+                         "// ReleaseStackBlock rewinds gs, a block AcquireStackBlock gave, and gives it back to\n"
+                         "// the pool: nothing may use what its stacks hold afterwards.\n"
+                         "func ReleaseStackBlock(gs *StackBlock) { gsProg.ReleaseStackBlock(gs) }\n\n";
+    }
+    // The program's place in the runtime, its own where its Go names it, and
+    // the package's where the runtime's API does: one and the same in a
+    // package of one program.
+    auto progvar = uses.refs.count("gsProg") != 0;
+    auto aliasprog = alias && aliastext.find("gsProg") != string::npos;
+    auto pkgprog = false;
+    vector<GoRuntimeModel::Ref> decls;
+    for (;;) {
+        auto r = refs;
+        if (progvar || pkgprog) r.insert("GsProgram");
+        decls = imp ? vector<GoRuntimeModel::Ref> {} : GoRuntimeReach(r, sels, full);
+        auto rtprog = aliasprog;
+        for (auto d : decls) rtprog = rtprog || rt.D(d).refs.count("gsProg");
+        auto &have = shared ? pkgprog : progvar;
+        if (rtprog && !have) {
+            have = true;
+            continue;
+        }
+        break;
+    }
+    // In a package of several programs, the program's own names carry its
+    // file's name (x_tag_g), which keeps them apart from the others'; with
+    // --go-unexported, those that Go would export are unexported, but for
+    // the types its entry points name, which a host names too. The entry
+    // points keep their names.
+    auto prog = program(progvar);
+    unordered_map<string, string> prename;
+    {
+        auto ps = GoParseDecls(prog);
+        set<string> declared;
+        for (auto &d : ps.decls)
+            for (auto &n : d.names) declared.insert(n);
+        for (auto &n : declared) {
+            if (entrynames.count(n) || n == "main" || n == "init" || n == "_") continue;
+            auto m = n;
+            if (shared && !opts.tag.empty()) {
+                auto g = m.rfind("_g");
+                auto tail = g == string::npos ? string() : m.substr(g + 2);
+                auto ours = g != string::npos && all_of(tail.begin(), tail.end(), [](char c) {
+                    return isdigit((unsigned char)c) || c == '_';
+                });
+                m = ours ? cat(m.substr(0, g), "_", opts.tag, "_g", tail) : cat(m, "_", opts.tag);
+            }
+            if (opts.unexported && isupper((unsigned char)m[0]) && !sigtypes.count(n)) {
+                auto u = cat("_", m);
+                while (declared.count(u)) u = cat("_", u);
+                m = u;
+            }
+            if (m != n) prename[n] = m;
+        }
+    }
+    // Go's checks of the program's names against the runtime's: no rename
+    // may land on one.
+    for (auto &[from, to] : prename)
+        if (rt.toplevel.count(to) || GoRuntimeName(to))
+            Fail(Line {}, cat("internal: the program's ", from, " renamed to the runtime's ", to));
+    // The renames, then gofmt's layout of the program's Go.
+    prog = GoFormat(GoRenameIdents(prog, rtcode, prename, imp ? unordered_map<string, string> {} : rtwords));
+    if (imp) {
+        // A name the program's Go uses that the runtime keeps to itself is
+        // one the package cannot reach.
+        for (auto &n : proguses.refs)
+            if (rt.toplevel.count(n) && !isupper((unsigned char)n[0]))
+                Fail(Line {}, cat("internal: the Go backend names the runtime's ", n, ", which it does not export"));
+    }
+    // The --include files' Go, the runtime's names and the program's in it
+    // renamed as the program's are.
+    vector<string> incs;
+    for (auto &[iname, ibody] : incbodies) {
+        auto n = ascii(iname);
+        incs.push_back(cat("// ---- --include ", n, " ----\n",
+                           GoIncludeLines(n, GoRenameIdents(ibody, rtcode, prename, {}))));
+    }
+    // The runtime, and the package's configuration: in this file, or in the
+    // package's runtime file.
+    string config = cat("// The runtime configuration the package's programs were compiled with\n"
+                        "// (--stack-reserve, -D GS_STACK_RESERVE, -D GS_STACK_GAP, --frame-reserve).\n"
+                        "const (\n\tgsStackReserve = ", opts.stacks.reserve, "\n\tgsStackGap     = ", opts.stacks.gap,
+                        "\n\tgsFrameReserve = ", FrameReserve(), "\n)\n\n");
+    string runtime;
+    if (!decls.empty())
+        runtime = cat("// ---- runtime ----\n"
+                      "// The Goose runtime for Go, the package ", GO_RUNTIME_PATH, "\n"
+                      "// (runtime/go): ",
+                      full ? "all of it (--go-runtime=full)"
+                      : shared ? "the part of it the package's programs use"
+                               : "the part of it the program uses",
+                      ", which builds with nothing\n"
+                      "// but the Go standard library. Its names start with gs or Gs, which no name\n"
+                      "// from the program does (those end in _g), and are the runtime's own: a file\n"
+                      "// that holds it may not declare them.\n\n",
+                      GoRuntimeText(decls, rtcode, rtwords));
+    // The alias's own names are the package's, which no rename touches.
+    auto aliascode = rtcode, aliaswords = rtwords;
+    for (auto n : { "StackBlock", "AcquireStackBlock", "ReleaseStackBlock" }) {
+        aliascode.erase(n);
+        aliaswords.erase(n);
+    }
+    string pkgsection = cat(config, pkgprog ? GoRenameIdents(pkgprogdecl, rtcode, {}, rtwords) : "",
+                            alias ? GoRenameIdents(aliastext, aliascode, {}, aliaswords) : "", runtime);
+    // The imports a text needs: the packages its Go names, and the runtime's
+    // where it is imported.
+    auto importsof = [&](const vector<string> &texts, const vector<string> &rtonly,
+                         const vector<pair<string, string>> &extra) {
+        vector<pair<string, string>> imports;
+        auto add = [&](const string &n, const string &path) {
+            // A name that is the package's own is no name.
+            auto nm = n == GoPathName(path) ? string() : n;
+            for (auto &[in, ip] : imports)
+                if (ip == path && in == nm) return;
+            imports.push_back({ nm, path });
+        };
+        for (auto &text : texts) {
+            GoUses u;
+            GoScanUses(text, known, u);
+            for (auto &p : u.pkgs) add(p, known.at(p));
+        }
+        // The runtime's package, where the file imports it, and the Go of
+        // an --include file names it too, which imports what else it uses.
+        if (imp) {
+            vector<string> all = texts;
+            all.insert(all.end(), rtonly.begin(), rtonly.end());
+            for (auto &text : all) {
+                GoUses u;
+                GoScanUses(text, { { GO_RUNTIME_NAME, GO_RUNTIME_PATH } }, u);
+                if (u.pkgs.count(GO_RUNTIME_NAME)) add(GO_RUNTIME_NAME, GO_RUNTIME_PATH);
+            }
+        }
+        for (auto &[n, p] : extra) add(n, p);
+        sort(imports.begin(), imports.end(), [](auto &a, auto &b) {
+            return a.second != b.second ? a.second < b.second : a.first < b.first;
+        });
+        string imps;
+        for (auto &[n, p] : imports) Append(imps, "\t", n, n.empty() ? "" : " ", GoStr(p), "\n");
+        return imps.empty() ? string() : cat("import (\n", imps, ")\n\n");
+    };
+    auto header = cat("// Code generated by the Goose compiler from ", name, ". DO NOT EDIT.\n"
+                      "//\n"
+                      "// Names from the program carry a _g suffix, which keeps them clear of Go's\n"
+                      "// keywords and of the runtime's gs and Gs names; a namespaced name ns::x is\n"
+                      "// ns_x_g followed by the namespace's length.",
+                      shared ? cat(" In a package whose programs share a\n// runtime file (", ascii(opts.runtimefile),
+                                   "), they carry their file's name before the suffix\n// too: x_", opts.tag, "_g.")
+                             : string(),
+                      imp ? cat("\n//\n// The runtime is the package ", GO_RUNTIME_PATH, ",\n// imported as ",
+                                GO_RUNTIME_NAME, " (--go-runtime=import).")
+                          : string(),
+                      "\n\n");
+    auto build = opts.build.empty() ? string() : cat("//go:build ", opts.build, "\n");
+    // The parts of a file, a blank line between each two, as gofmt keeps
+    // them; the --include files last, so that the //line directives naming
+    // each hold to its end.
+    auto join = [](const vector<string> &parts) {
+        string out;
+        for (auto p : parts) {
+            while (!p.empty() && p.back() == '\n') p.pop_back();
+            if (p.empty()) continue;
+            Append(out, out.empty() ? "" : "\n\n", p);
+        }
+        return out + "\n";
+    };
+    vector<string> parts = { build, header, cat("package ", opts.package) };
+    if (!shared) {
+        parts.push_back(importsof({ pkgsection, prog }, incs, incimports));
+        parts.push_back(pkgsection);
+    } else {
+        parts.push_back(importsof({ prog }, incs, incimports));
+        runtimefiletext = join({ cat("// Code generated by the Goose compiler. DO NOT EDIT.\n//\n"
+                                     "// The Goose runtime of package ", opts.package, "'s programs (--go-runtime-file),\n"
+                                     "// which they share: what they use of it, and its configuration. A compile of\n"
+                                     "// one of them writes it again, with what the others use of it still in it,\n"
+                                     "// and requires the settings this line records to be its own.\n"
+                                     "// goose-runtime: ", settings),
+                                 cat("package ", opts.package), importsof({ pkgsection }, {}, {}), pkgsection });
+    }
+    parts.push_back(prog);
+    parts.insert(parts.end(), incs.begin(), incs.end());
+    return join(parts);
 }
 
 }  // namespace goose
