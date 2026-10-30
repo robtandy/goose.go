@@ -2337,12 +2337,9 @@ class Runner:
                                                   gofile, src], cwd=t)
                         ok, log = ok and code == 0, log + o + e
                     got.append((ok, log, [tc.decode((t / f).read_bytes()) if ok else "" for f in files]))
-                if not got[0][0] and not got[1][0]:
-                    # No Go in either: what the backend refuses is another
-                    # section's.
-                    continue
                 if not got[0][0] or not got[1][0]:
-                    differ.append(f"{label}: compiled in one directory only:\n{got[0][1]}{got[1][1]}")
+                    where = "neither directory" if not got[0][0] and not got[1][0] else "one directory only"
+                    differ.append(f"{label}: compiled in {where}:\n{got[0][1]}{got[1][1]}")
                     continue
                 compared += 1
                 for f, a, b in zip(files, got[0][2], got[1][2]):
@@ -2351,8 +2348,8 @@ class Runner:
                     elif any(str(t) in a or t.name in a for t in dirs):
                         differ.append(f"{label}: {f} names the directory it was compiled in")
             check(f"{compared} compiles in two temporary directories write the same Go, byte for byte",
-                  compared >= len(cases) - 8 and not differ,
-                  f"{compared} of {len(cases)} compiled\n" + "\n".join(differ[:12]))
+                  compared == len(cases) and not differ,
+                  f"{compared} of {len(cases)} compared\n" + "\n".join(differ[:12]))
         finally:
             for t in dirs:
                 shutil.rmtree(t, ignore_errors=True)
