@@ -218,7 +218,9 @@ type GsBytes interface{ ~string | ~[]byte }
 // What an exported entry point is handed may be stored where only the data
 // stacks see it, which Go's stacks must not move away from while it runs:
 // GsEscape makes the Go compiler keep it off them, on the heap, where
-// nothing moves (its condition never holds).
+// nothing moves (its condition never holds). The collector does not see it
+// there either, so the entry point keeps the argument alive until the call
+// returns (runtime.KeepAlive).
 var gsEscapeSink struct {
 	b bool
 	p unsafe.Pointer

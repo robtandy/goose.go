@@ -5,7 +5,7 @@
 // embeds: codegen_go_runtime.h) that the program uses, then the program --
 // or with --go-runtime=import, the program alone, importing the runtime's
 // package, and with --go-runtime-file, the runtime in a file of the
-// package's own (DESIGN.md §3.10).
+// package's own (DESIGN.md §3.11).
 //
 // Representation (DESIGN.md §3):
 // * Scalars are Go's own types: i8..i64 int8..int64, u8..u64 uint8..uint64,

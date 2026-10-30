@@ -54,6 +54,7 @@
 #include "codegen_go_format.h"
 #include "codegen_go_emit.h"
 #include "codegen_go_threads.h"
+#include "codegen_go_shifts.h"
 #include "runtime_inline.h"
 #include "process.h"
 #include "jit.h"
@@ -1829,6 +1830,10 @@ int Main(int argc, char **argv) {
         TypeCheckProgram(ast, library, nocgen || golib);
         // The checker reported the errors it went on past, root by root.
         if (!ast.errors.empty()) return 1;
+        // A shift by a constant count outside its type's width, which the
+        // checker lets pass: --target=go warns of it in the checked program,
+        // before anything is folded or inlined (issue #27).
+        if (gotarget) WarnShiftCounts(ast);
         Optimizer opt(ast, optlevel);
         if (specs) {
             string s;
