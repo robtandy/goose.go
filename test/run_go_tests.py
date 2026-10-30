@@ -23,7 +23,12 @@ import are in programs/modules/), is
    analysis (BoundStacks, src/codegen_stacks.h);
 7. built again at -O2 with -gcflags=all=-d=checkptr, Go's checks of every
    unsafe.Pointer conversion and of the arithmetic on one (which `go test
-   -race` turns on), and run, which must match the C run as well.
+   -race` turns on), and run, which must match the C run as well;
+8. where its source declares the warnings its compile prints, with `//
+   warning:` lines as the C suite's fixtures declare theirs, checked with
+   `goose --check` for both targets: each must print exactly those, one
+   warning line each, in any order, as run_tests.py judges a fixture's
+   (issue #41).
 
 The programs of test/go/build_only/ never end (a loop that only stopping
 them leaves): each is compiled to Go at both levels, vetted and built, and
@@ -223,6 +228,45 @@ def runtime_defines(path):
 
 def error_markers(path):
     return re.findall(r"^// error: (.+)$", path.read_text(encoding="utf-8"), re.MULTILINE)
+
+
+def warning_markers(path):
+    """The warnings a program declares it is compiled with, as run_tests.py
+    reads them: a substring of each warning's message per `// warning:`
+    line."""
+    return re.findall(r"^// warning: (.+)$", path.read_text(encoding="utf-8"), re.MULTILINE)
+
+
+def warning_lines(text):
+    """The warnings a compile printed: (line, message) for each line that
+    starts with a place and `warning:`, as run_tests.py reads them."""
+    return [(m[0], m[1]) for m in (re.match(r"\S.*?: warning: (.*)$", line)
+                                   for line in text.splitlines()) if m]
+
+
+def unmatched_warnings(markers, warnings):
+    """The markers no warning was printed for and the warning lines no marker
+    declares, as run_tests.py pairs them: each marker with a warning line of
+    its own whose message holds it, as many as can be paired (a maximum
+    bipartite matching, since a marker can be part of several messages),
+    a line repeating an earlier one offered last, so that it is the one
+    left over where a warning prints twice."""
+    lines = [line for line, _ in warnings]
+    order = sorted(range(len(lines)), key=lambda w: lines[w] in lines[:w])
+    owner = [None] * len(lines)
+
+    def place(m, tried):
+        for w in order:
+            if w not in tried and markers[m] in warnings[w][1]:
+                tried.add(w)
+                if owner[w] is None or place(owner[w], tried):
+                    owner[w] = m
+                    return True
+        return False
+
+    missing = [marker for m, marker in enumerate(markers) if not place(m, set())]
+    extra = [line for w, line in enumerate(lines) if owner[w] is None]
+    return missing, extra
 
 
 # --- random programs (--fuzz) --------------------------------------------------
@@ -1218,6 +1262,7 @@ class Runner:
                             f"--- go (exit {got[0]}):\n{got[1]}{got[2]}\n--- c (exit {ref[0]}):\n{ref[1]}{ref[2]}"))
             else:
                 out.append(("ok", f"run {name} -O{level} {how}", None))
+        self.declared_warnings(src, flags, out)
         # What test/go/expected/ holds is the C run at -O2.
         ref = refs["2"]
         if ref is None:
@@ -1243,6 +1288,29 @@ class Runner:
                                 f"--- got:\n{text}\n--- want:\n{want}"))
         self.stacks(src, name, flags, out)
         return out
+
+    def declared_warnings(self, src, flags, out):
+        """A program that declares the warnings its compile prints, with
+        `// warning:` lines as the C suite's fixtures declare theirs (issue
+        #41): checked with `goose --check`, for C and with --target=go, it
+        must print exactly those, one warning line each, in any order, as
+        run_tests.py judges a fixture's. One that declares none is not
+        judged here."""
+        markers = warning_markers(src)
+        if not markers:
+            return
+        for target in ([], ["--target=go"]):
+            label = f"warnings {src.stem}{''.join(' ' + t for t in target)}"
+            code, o, e = self.goose(*flags, "--check", *target, src)
+            missing, extra = unmatched_warnings(markers, warning_lines(o + e))
+            if code != 0:
+                out.append(("fail", f"{label} (exit {code})", o + e))
+            elif missing or extra:
+                out.append(("fail", label,
+                            "".join(f"no warning for marker: {m}\n" for m in missing) +
+                            "".join(f"no marker for warning: {w}\n" for w in extra) + o + e))
+            else:
+                out.append(("ok", label, None))
 
     def build_only(self, src):
         """A program that never ends: its Go must vet and build at both
