@@ -49,6 +49,7 @@ add_executable(goose
     src/codegen_go_format.h
     src/codegen_go_threads.h
     src/codegen_go_emit.h
+    src/codegen_go_check.h
     src/codegen_go_shifts.h
 )
 

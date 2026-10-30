@@ -513,6 +513,39 @@ static const GoRuntimeModel &GoRuntime() {
     return rt;
 }
 
+// The runtime's revision, which the header of a file the backend writes
+// records (issue #21): a hash of the text of the files of runtime/go the
+// build embedded, in the order of their names, each its name, a NUL, its
+// text without carriage returns (a checkout's line breaks are no change of
+// the runtime) and a NUL; FNV-1a's 64 bits, as RuntimeVersion hashes the C
+// runtime's text, the high 48 of them in hex. It is runtime/go's as it was
+// when the compiler was built, which --go-runtime=import imports.
+static const string &GoRuntimeRevision() {
+    static const string rev = [] {
+        vector<pair<string, string>> files;
+        for (auto &f : go_runtime_files) {
+            string text;
+            for (int i = 0; i < f.nparts; i++) text += f.parts[i];
+            text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+            files.push_back({ f.name, std::move(text) });
+        }
+        sort(files.begin(), files.end());
+        uint64_t h = 14695981039346656037ull;
+        auto hash = [&](string_view s) {
+            for (auto c : s) h = (h ^ (uint8_t)c) * 1099511628211ull;
+            h = (h ^ 0) * 1099511628211ull;
+        };
+        for (auto &[name, text] : files) {
+            hash(name);
+            hash(text);
+        }
+        char buf[17];
+        snprintf(buf, sizeof(buf), "%012llx", (unsigned long long)(h >> 16));
+        return string(buf);
+    }();
+    return rev;
+}
+
 // Whether a name is the runtime's, in any of the forms a file gives it: as
 // it declares it, unexported, or as --go-unexported's alias of the block
 // type names it (StackBlock).
