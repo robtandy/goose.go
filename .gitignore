@@ -7,3 +7,4 @@ samples/*.pgm
 samples/*.png
 __pycache__
 build/
+dist/
