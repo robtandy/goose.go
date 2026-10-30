@@ -18,8 +18,9 @@
 //   runs it on a block from its program's pool (gsProg.AcquireStackBlock),
 //   rewound and given back as it returns. Both take Go's own
 //   values, which they view in place: a u8[:] as a []byte, a const u8[:] as
-//   a string or a []byte, any other T[:] as a []T, a T& as a *T, a scalar
-//   or a fixed-size value as its Go type, and keep each argument viewing
+//   a string or a []byte, a const (const u8[:])[:] as a []string (issue
+//   #42), any other T[:] as a []T, a T& as a *T, a scalar or a fixed-size
+//   value as its Go type, and keep each argument viewing
 //   Go's memory off Go's moving stacks (GsEscape) and alive until the call
 //   returns (runtime.KeepAlive), which the Goose code may hold only where
 //   the collector does not look -- but where it holds them in Go's own
@@ -312,6 +313,282 @@ inline string CodeGenGo::ExternCallX(Call *c, FnSpec *sp) {
 // ------------------------------------------------------------------
 // export fn.
 
+// A Go []string (issue #42): a Go string is its data and its length, the two
+// words of a const u8[:], so a []string is laid out as a slice of those,
+// const at both depths, since nothing writes a Go string's bytes or the
+// strings of a []string an entry point is handed. An export fn's entry
+// points take a parameter of that type as a []string, which no C host has.
+inline bool GoStringsT(const TypeExpr *t) {
+    return t && t->kind == TY_SLICE && t->cq && t->sub->kind == TY_SLICE && t->sub->cq && IsU8(t->sub->sub);
+}
+
+// A slice of u8 slices, of any constness: what a parameter meant as a Go
+// []string is.
+inline bool GoStringsLikeT(const TypeExpr *t) {
+    return t && t->kind == TY_SLICE && t->sub->kind == TY_SLICE && IsU8(t->sub->sub);
+}
+
+// The checks of an export fn's boundary that TypeCheck::CheckExport makes
+// (vendor/goose/src/typecheck_calls.h), for --target=go's export fns taking
+// a Go []string, which the checker's own check, C's boundary, refuses
+// ("nested references and slices do not cross"): the driver hides them from
+// it (HideGoExports, while the program is checked, as the functions nothing
+// calls are checked) and checks them here, as it would, but for a
+// const (const u8[:])[:] parameter, which crosses. Their messages are its
+// own. docs/upstream/go-string-slices.md proposes the option to upstream's
+// check, which would make these go.
+struct GoExportCheck {
+    Ast &ast;
+
+    static string TypeStr(const TypeExpr *t) {
+        string s;
+        t->Dump(s);
+        return s;
+    }
+
+    // TypeCheck::Reaches: whether t, or a type a value of it reaches through
+    // references, slices, arrays and fields, satisfies pred.
+    static bool Reaches(TypeExpr *t, const function<bool(TypeExpr *)> &pred) {
+        set<pair<const void *, const void *>> seen;
+        function<bool(TypeExpr *)> walk = [&](TypeExpr *t) -> bool {
+            if (!t) return false;
+            if (pred(t)) return true;
+            switch (t->kind) {
+                case TY_REF: return walk(t->ref->sub);
+                case TY_SLICE: return walk(t->sub);
+                case TY_ARRAY: return walk(t->arr->sub);
+                case TY_STRUCT: case TY_ENUM: case TY_VARIANT: {
+                    // Each entered once, as a recursive type reaches itself again;
+                    // a variant apart from its ADT, its payload alone.
+                    auto adt = t->kind == TY_VARIANT ? t->var->adt : t;
+                    const void *inst = adt->kind == TY_STRUCT ? (const void *)adt->struc->inst
+                                       : adt->kind == TY_ENUM ? (const void *)adt->enu->inst
+                                                              : (const void *)adt;
+                    auto key = pair<const void *, const void *>(inst, t->kind == TY_VARIANT ? t->var->variant : nullptr);
+                    if (!seen.insert(key).second) return false;
+                    for (auto &run : Runs(t))
+                        for (auto ft : *run.ftypes)
+                            if (ft && walk(ft)) return true;
+                    return false;
+                }
+                default: return false;
+            }
+        };
+        return walk(t);
+    }
+
+    // The fields of a struct's, an ADT's or a variant's values, as the
+    // checker instantiated them (TypeCheck::FieldRuns).
+    static span<const FieldRun> Runs(TypeExpr *t) {
+        switch (t->kind) {
+            case TY_STRUCT: return t->struc->inst ? RunsOf(t->struc->inst) : span<const FieldRun>();
+            case TY_ENUM: return t->enu->inst ? RunsOf(t->enu->inst) : span<const FieldRun>();
+            case TY_VARIANT: {
+                auto adt = t->var->adt;
+                if (adt->kind != TY_ENUM || !adt->enu->inst) return {};
+                auto ei = adt->enu->inst;
+                return RunsOf(ei, ei->en->VariantIndex(t->var->variant));
+            }
+            default: return {};
+        }
+    }
+
+    // TypeCheck::ClassOf.
+    static SizeClass ClassOf(TypeExpr *t) {
+        switch (t->kind) {
+            case TY_INT: return t->intstorage == IS_VARINT ? SC_VARIABLE : SC_FIXED;
+            case TY_REF: return t->ref->lenstorage == IS_VARINT ? SC_VARIABLE : SC_FIXED;
+            case TY_STRUCT: return t->struc->inst ? t->struc->inst->sclass : SC_VARIABLE;
+            case TY_ENUM:
+                if (!t->enu->varmode) return SC_FIXED;
+                return t->enu->inst ? t->enu->inst->varclass : SC_VARIABLE;
+            case TY_ARRAY:
+                switch (t->arr->akind) {
+                    case A_FIXED: return SC_FIXED;
+                    case A_VAR: return SC_VARIABLE;
+                    case A_LIMITED: return t->arr->size >= 0 ? SC_FIXED : SC_VARIABLE;
+                    default: return SC_RESIZABLE;
+                }
+            case TY_VARIANT: {
+                auto c = SC_FIXED;
+                for (auto &run : Runs(t))
+                    for (auto ft : *run.ftypes)
+                        if (ft) c = std::max(c, ClassOf(ft));
+                return c;
+            }
+            default: return SC_FIXED;
+        }
+    }
+
+    // TypeCheck::IsFlat: no references, slices or relative references at any
+    // depth (§1.1).
+    static bool IsFlat(TypeExpr *t) {
+        switch (t->kind) {
+            case TY_REF: case TY_SLICE: return false;
+            case TY_STRUCT: return t->struc->inst && t->struc->inst->flat;
+            case TY_ENUM: return t->enu->inst && t->enu->inst->flat;
+            case TY_ARRAY: return IsFlat(t->arr->sub);
+            case TY_VARIANT:
+                for (auto &run : Runs(t))
+                    for (auto ft : *run.ftypes)
+                        if (ft && !IsFlat(ft)) return false;
+                return true;
+            default: return true;
+        }
+    }
+
+    // TypeCheck::ExternValueOk: a fixed-size value C takes by value (§7.10).
+    static bool ValueOk(TypeExpr *t, string &why) {
+        if (Reaches(t, [](TypeExpr *t) { return t->kind == TY_INT && t->ix; })) {
+            why = "C code is not checked against the array an index type names (§3.11)";
+            return false;
+        }
+        switch (t->kind) {
+            case TY_INT:
+                if (t->intstorage == IS_VARINT) {
+                    why = "varints have no C form";
+                    return false;
+                }
+                return true;
+            case TY_FLT: case TY_BOOL: return true;
+            case TY_REF: case TY_SLICE: why = "nested references and slices do not cross"; return false;
+            default: break;
+        }
+        if (ClassOf(t) != SC_FIXED) {
+            why = "only fixed-size values cross by value";
+            return false;
+        }
+        if (!IsFlat(t)) {
+            why = "values holding references do not cross";
+            return false;
+        }
+        return true;
+    }
+
+    // TypeCheck::ExternParamOk.
+    static bool ParamOk(TypeExpr *t, string &why) {
+        if (t->kind == TY_REF) {
+            if (t->ref->optional || t->ref->lenstorage >= 0) {
+                why = "only plain references cross";
+                return false;
+            }
+            auto s = t->ref->sub;
+            if (s->kind == TY_ARRAY && s->arr->akind == A_GROW && IsU8(s->arr->sub)) return true;
+            return ValueOk(s, why);
+        }
+        if (t->kind == TY_SLICE) return ValueOk(t->sub, why);
+        return ValueOk(t, why);
+    }
+
+    // TypeCheck::ScanForeignFrom: whether the body holds `return ... from f`
+    // for an f not declared within.
+    static void ScanForeignFrom(Node *n, set<string_view> &names, bool &foreign) {
+        if (!n || foreign) return;
+        if (auto r = Is<Return>(n)) {
+            if (!r->from.empty() && !names.count(r->from)) foreign = true;
+        } else if (auto fd = Is<FnDecl>(n)) {
+            names.insert(fd->sf->name);
+            if (fd->sf->body) ScanForeignFrom(fd->sf->body, names, foreign);
+            return;
+        }
+        n->Children([&](Node *c) { ScanForeignFrom(c, names, foreign); });
+    }
+
+    // CheckExport's checks of sf, in its order: the first that fails is its
+    // error, why, as it is there.
+    bool Check(SFunction *sf, string &why) {
+        auto fail = [&](string w) {
+            why = std::move(w);
+            return false;
+        };
+        if (sf->isnested || sf->isthread || sf->isextern) return fail("must be a top-level Goose function");
+        if (!sf->generics.empty()) return fail("cannot be generic");
+        string_view n = sf->cname;
+        if (n.empty()) return fail("needs a C symbol");
+        if (n == "main" || n == "goose_init") return fail(cat("C symbol ", n, " is reserved"));
+        if (n.rfind("gs_", 0) == 0) return fail("C symbols beginning with gs_ are reserved for Goose internals");
+        if (n[0] == '_' || !isalpha((unsigned char)n[0]) ||
+            !all_of(n.begin(), n.end(), [](char c) { return isalnum((unsigned char)c) || c == '_'; }))
+            return fail("C symbol must be a C identifier");
+        if (IsCKeyword(n)) return fail("C symbol cannot be a C keyword");
+        for (auto other : ast.functions)
+            if (other != sf && other->isexport && other->cname == sf->cname)
+                return fail(cat("C symbol ", n, " is exported more than once"));
+        for (auto &p : sf->params) {
+            if (!p.type) return fail(cat("parameter ", p.name, " needs a type"));
+            if (p.defaultval) return fail(cat("parameter ", p.name, " cannot have a default"));
+        }
+        set<string_view> names = { sf->name };
+        auto foreign = false;
+        if (sf->body) ScanForeignFrom(sf->body, names, foreign);
+        if (foreign) return fail("cannot use return ... from across the C boundary");
+        if (sf->specs.size() != 1) return fail("could not resolve one concrete function signature");
+        auto spec = sf->specs[0];
+        // Its check failed, which was reported: nothing more can be said.
+        if (spec->failed) return true;
+        if (spec->params.size() != sf->params.size()) return fail("could not resolve one concrete function signature");
+        for (size_t i = 0; i < spec->argtypes.size(); i++) {
+            auto t = spec->argtypes[i];
+            auto pn = sf->params[i].name;
+            if (GoStringsT(t)) continue;
+            if (GoStringsLikeT(t))
+                return fail(cat("parameter ", pn, " of type ", TypeStr(t), " cannot cross to Go: a Go []string crosses "
+                                "as a const (const u8[:])[:], whose strings, as Go's, nothing writes"));
+            string w;
+            if (!ParamOk(t, w)) return fail(cat("parameter ", pn, " of type ", TypeStr(t), " cannot cross to C: ", w));
+            if (CarriesPool(t)) return fail(cat("parameter ", pn, " uses a reusable pool and has no public C representation"));
+            if (t->kind == TY_REF && t->ref->sub->kind == TY_ARRAY && t->ref->sub->arr->akind == A_GROW &&
+                IsU8(t->ref->sub->arr->sub))
+                return fail(cat("parameter ", pn, " is a Goose string builder and cannot be passed from C"));
+        }
+        if (spec->rets.size() > 1) return fail("returns at most one value");
+        if (!sf->has_rets && !spec->rets.empty()) return fail("a returned value needs an explicit return type");
+        for (auto t : spec->rets) {
+            if (t->kind == TY_SLICE && IsU8(t->sub)) {
+                if (!t->cq) return fail("a returned u8 slice must be read-only (const u8[:])");
+                continue;
+            }
+            string w;
+            if (!ValueOk(t, w)) return fail(cat("cannot return ", TypeStr(t), " to C: ", w));
+        }
+        return true;
+    }
+};
+
+// The export fns the checker's check of an export's boundary would refuse
+// for a parameter that is a slice of u8 slices, which --target=go checks
+// itself (GoExportCheck): while the program is checked they are no exports,
+// and checked as a function nothing calls is, which is how an export is.
+inline vector<SFunction *> HideGoExports(Ast &ast) {
+    vector<SFunction *> hidden;
+    for (auto sf : ast.functions) {
+        if (!sf->isexport) continue;
+        auto strings = false;
+        for (auto &p : sf->params) strings = strings || GoStringsLikeT(p.type);
+        if (!strings) continue;
+        sf->isexport = false;
+        hidden.push_back(sf);
+    }
+    return hidden;
+}
+
+// The hidden export fns again, each checked as the checker checks one but for
+// a []string, each error reported as the checker reports one, at the fn.
+inline void CheckGoExports(Ast &ast, const vector<SFunction *> &hidden) {
+    for (auto sf : hidden) sf->isexport = true;
+    GoExportCheck ck { ast };
+    for (auto sf : hidden) {
+        // A broken signature was reported where it was found.
+        if (sf->brokensig) continue;
+        string why;
+        if (ck.Check(sf, why)) continue;
+        Diagnostic d;
+        d.where = LocOf(sf->line);
+        d.message = cat("export fn ", sf->name, ": ", why);
+        ast.Report(d);
+    }
+}
+
 // A parameter's Go name in an entry point: its Goose name where Go takes
 // that, else with the _g the program's names have; none of them gs, which
 // the block is, or gs_r, the result.
@@ -380,7 +657,11 @@ inline bool CodeGenGo::HoldsAddr(TypeExpr *t, bool relative) {
 inline bool CodeGenGo::ArgsStayInGo(FnSpec *sp) {
     auto ok = [&](TypeExpr *t) {
         if (!t || t->kind == TY_VOID || t->kind == TY_FN || t->kind == TY_GENERIC || !HoldsAddr(t)) return true;
-        if (t->kind == TY_SLICE) return !HoldsAddr(t->sub);
+        // A slice of what holds no address, or of const slices of it, as a
+        // Go []string is (issue #42): the slices it holds are where Go's
+        // collector sees them, in the memory Go laid out as strings.
+        if (t->kind == TY_SLICE)
+            return !HoldsAddr(t->sub) || (t->cq && t->sub->kind == TY_SLICE && t->sub->cq && !HoldsAddr(t->sub->sub));
         return t->kind == TY_REF && !IsRelRef(t) && !IsFatRef(t) && !CarriesPool(t) && !HoldsAddr(t->ref->sub);
     };
     set<FnSpec *> seen;
@@ -535,6 +816,12 @@ inline void CodeGenGo::EmitExports() {
                 sarg = stay ? view(cat("unsafe.Pointer(unsafe.StringData(", pn, "))")) : cat("GsSliceFromString(", pn, ")");
                 barg = stay ? view(cat("unsafe.Pointer(unsafe.SliceData(", pn, "))")) : cat("GsSliceFromBytes(", pn, ")");
                 bytesnames.push_back(pn);
+                kept.push_back(pn);
+            } else if (GoStringsT(pt)) {
+                // A []string's strings are its elements, each the data and
+                // the length of a const u8[:] (issue #42).
+                gt = "[]string";
+                arg = stay ? view(cat("unsafe.Pointer(unsafe.SliceData(", pn, "))")) : cat("GsSliceOf(", pn, ")");
                 kept.push_back(pn);
             } else if (pt->kind == TY_SLICE) {
                 gt = IsU8(pt->sub) ? string("[]byte") : cat("[]", GoT(pt->sub, ln));

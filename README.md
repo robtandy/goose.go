@@ -96,7 +96,7 @@ Each `export fn` gets two exported Go entry points, named after its symbol with 
 - `FuncNameWithStack(gs, args...)` runs it on a `*GsStackBlock` the caller holds (from `AcquireStackBlock`/`ReleaseStackBlock`, or `NewStackBlock` and `Close`), and gives the block's stacks back as it found them; one that needs no block leaves `gs` alone (`nil` will do). `--go-no-withstack` leaves these out.
 - `FuncNameString(args...)` and `FuncNameBytes(args...)`, where a `const u8[:]` parameter makes `FuncName` generic: `FuncName` taking each such parameter as a `string`, and as a `[]byte`. Not generic, they cost a kernel's caller no more than the call they make, where the generic one costs a little more ([below](#kernels-entry-points-that-go-inlines)). Either is left out where another export fn's entry point has its name (`export fn count_bytes` is `CountBytes`).
 
-The arguments are Go's own values, viewed in place: a `[]byte` for `u8[:]`, a `string` or a `[]byte` for `const u8[:]` (a type parameter `T ~string | ~[]byte` of `FuncName` and `FuncNameWithStack`), a `[]T` for any other `T[:]`, a `*T` for `T&`, and Go's types for scalars and fixed-size values. A call keeps them alive until it returns, so a caller need not. A Go struct holding a slice cannot cross yet: [`docs/design/go_views.md`](docs/design/go_views.md) designs read-only views of one. An abort panics with a `*GsError` in the caller's goroutine, and in a library so does `exit()`: a library never exits the process, which is its host's. A file with `export fn`s and no `fn main()` is a library: a package with no `func main` and no `init`. Importing it does nothing -- it maps no memory, leaves every goroutine's fault handling alone and runs no initializer -- and the first call of an entry point starts it, once, initializing the globals; a start that aborts panics with its `*GsError` in that call and every later one. A call that runs on a block turns `debug.SetPanicOnFault` on for itself only, so that a data stack overflowing into its guard gap panics in the caller's goroutine, and gives the caller's setting back. Each block reserves 64 MB of address space for its fixed-frame stack in a library (1 GB in a program), which `--frame-reserve size` changes. `--library` makes any program one, and its `fn main()` is then not run. The package is `goose` unless `--go-package name` names another (`--go-package` names a program's package too, `main` by default).
+The arguments are Go's own values, viewed in place: a `[]byte` for `u8[:]`, a `string` or a `[]byte` for `const u8[:]` (a type parameter `T ~string | ~[]byte` of `FuncName` and `FuncNameWithStack`), a `[]T` for any other `T[:]`, a `[]string` for `const (const u8[:])[:]` ([below](#a-list-of-strings-string)), a `*T` for `T&`, and Go's types for scalars and fixed-size values. A call keeps them alive until it returns, so a caller need not. A Go struct holding a slice cannot cross yet: [`docs/design/go_views.md`](docs/design/go_views.md) designs read-only views of one. An abort panics with a `*GsError` in the caller's goroutine, and in a library so does `exit()`: a library never exits the process, which is its host's. A file with `export fn`s and no `fn main()` is a library: a package with no `func main` and no `init`. Importing it does nothing -- it maps no memory, leaves every goroutine's fault handling alone and runs no initializer -- and the first call of an entry point starts it, once, initializing the globals; a start that aborts panics with its `*GsError` in that call and every later one. A call that runs on a block turns `debug.SetPanicOnFault` on for itself only, so that a data stack overflowing into its guard gap panics in the caller's goroutine, and gives the caller's setting back. Each block reserves 64 MB of address space for its fixed-frame stack in a library (1 GB in a program), which `--frame-reserve size` changes. `--library` makes any program one, and its `fn main()` is then not run. The package is `goose` unless `--go-package name` names another (`--go-package` names a program's package too, `main` by default).
 
 ```goose
 // stats.goose
@@ -176,6 +176,28 @@ func Sum(xs []uint32) uint64 {
 `go build -gcflags=-m` says so (`can inline Sum`, `xs does not escape`), and Go makes of `Sum(xs)` the instructions it makes of that call written by hand (`test/go/export/inlining/` checks both). Go inlines a function that costs at most 80 of its units, and an entry point costs its function's cost, or 57 for a call of one Go does not inline, and about 10 for each slice it hands on: one whose function costs between about 70 and 80 stays a call. A kernel taking a `const u8[:]` is best called as `FuncNameString` or `FuncNameBytes`: the generic `FuncName` reads its argument's data through its address, which costs its caller a store and a load. In a library with globals to initialize, every entry point checks that the library has started (`gsLibStart`), whose slow path's call costs it 57 more: only the smallest inline there.
 
 Any other export fn may keep what it is handed where Go does not see it -- on a data stack, on the fixed-frame stack, in a struct whose Go value is its bytes, in the Go of an `extern fn` -- and Go moves a goroutine's stack as it grows, which nothing there would follow: its entry points move the arguments to the heap (`GsEscape`, an allocation where a caller's array was on its stack) and keep them alive until the call returns. The functions the entry points call (`sum_g`) are the generated code's own, not an API: their names and signatures change with the program and with `--go-unexported` and `--go-runtime-file`, and a call of one skips a library's start and the block's fault scope ([`DESIGN.md` §3.5](DESIGN.md#35-export-fn-and-extern-fn-in-go-mode)).
+
+### A list of strings: `[]string`
+
+A Go `string` is its data and its length, as a Goose `const u8[:]` is, so a Go `[]string` is laid out as a `const (const u8[:])[:]`, and an export fn taking one has entry points taking a `[]string`, viewed in place:
+
+```goose
+// The tags equal to tag.
+export fn count_tag(tags: const (const u8[:])[:], tag: const u8[:]) -> i64 {
+    var n = 0;
+    for t in tags {
+        if t == tag { n += 1; }
+    }
+    n
+}
+```
+
+```go
+tags := []string{"go", "c", "go"}
+n := lib.CountTagString(tags, "go") // 2, as CountTag(tags, "go") and CountTagBytes(tags, []byte("go")) are
+```
+
+Both depths must be `const`, as Go's strings are read-only: a `(const u8[:])[:]` is refused, naming the type that crosses. Only `--target=go` takes one, since no C host has such a value: the C backend refuses it as it refuses every slice of slices. Its entry points are a kernel's like any other's ([above](#kernels-entry-points-that-go-inlines)): where the export's code keeps the strings in its own variables, they hand the slice on as it is, and Go inlines them; where it may keep them elsewhere, on a data stack say, the call moves the caller's array to the heap, and with it the strings' bytes, and keeps them alive until it returns ([`DESIGN.md` §3.5](DESIGN.md#35-export-fn-and-extern-fn-in-go-mode)).
 
 ## The runtime in a Go package: `--go-runtime`, `--go-runtime-file`, `--go-unexported`
 
@@ -339,6 +361,33 @@ fn sift(v: i64[:], start: i64, n: i64) {
 
 [`DESIGN.md` §3.13](DESIGN.md#313-bounds-checks-issue-40) has the details.
 
+## Recursive kernels: their helpers inlined
+
+The optimizer inlines nothing into a `recursive fn`, nor into the other functions of its cycle, so every call a recursive kernel makes stays a call: a hash function's, a comparator's, an `inline fn`'s. Under `--target=go` a function of a cycle has the inlining any other function has, of the callees that are in no cycle and whose code takes no data stack, nor that of a function they call:
+
+```goose
+// Whether a sorts before b: inlined into ordered, as into any function.
+inline fn less(a: const u8[:], b: const u8[:]) -> bool {
+    var i = 0;
+    while i < a.len && i < b.len {
+        if a[i] != b[i] { return a[i] < b[i]; }
+        i += 1;
+    }
+    a.len < b.len
+}
+
+// The neighbours in order of tags[lo..hi], counted where the halves meet.
+recursive fn ordered(tags: const (const u8[:])[:], lo: i64, hi: i64) -> i64 {
+    if hi - lo < 2 { return 0; }
+    let mid = lo + (hi - lo) / 2;
+    var n = 0;
+    if !less(tags[mid], tags[mid - 1]) { n = 1; }
+    n + ordered(tags, lo, mid) + ordered(tags, mid, hi)
+}
+```
+
+So no thin `recursive fn` around an ordinary function is needed to get them inlined. A callee that takes a data stack -- one that prints, builds a `str`, or holds a resizable value, a fixed one of more than 4096 bytes or a slice literal as large -- stays a call, as in C, so that each activation of the cycle holds the stacks it holds there and both backends report the same (`--stacks`). [`DESIGN.md` §3.14](DESIGN.md#314-inlining-into-recursive-cycles-issue-42) has the details; the C backend keeps upstream's rule, and [`docs/upstream/recursive-inlining.md`](docs/upstream/recursive-inlining.md) proposes the change there.
+
 ## Testing
 
 ```bash
@@ -353,11 +402,12 @@ python3 test/run_go_tests.py --sweep      # and every fixture of the C suite's o
 - `test/go/programs/`, the Go backend's own programs, with what they print in `test/go/expected/` (`--bless` writes those from the C runs), and, for a program that declares the warnings its compile prints with `// warning:` lines as the C suite's fixtures do, exactly those warnings from `goose --check` for both targets (`shift_operand_casts.goose` checks that no cast widening a shift's left operand is called redundant: [`docs/upstream/shift-operand-casts.md`](docs/upstream/shift-operand-casts.md));
 - the C suite's `test/stdlib/` and `test/threads/` fixtures;
 - every sample in `samples/` but those using the C-only `gfx`, `ui`, `audio` and `physics` modules, run in a directory of their own with their arguments and stdin, against `samples/expected/`;
-- the `export fn` libraries of `test/go/export/`, whose Go tests call their entry points (with `testing.AllocsPerRun` checking that a call allocates nothing, and a `TestMain` checking that importing the package mapped nothing);
+- the `export fn` libraries of `test/go/export/`, whose Go tests call their entry points (with `testing.AllocsPerRun` checking that a call allocates nothing, and a `TestMain` checking that importing the package mapped nothing), those of a Go `[]string` (`string_slices/`) and of what the collector must keep alive (`keepalive/`) under `-race` too, where cgo builds;
 - what Go makes of the entry points of the kernels of `test/go/export/inlining/` (`go test -c -gcflags=-m=2`): that it inlines those an `// entry:` line says it does, and that their slices and pointers escape as the line says; and for arm64 and amd64, that a call of each is the instructions of the call of its function written by hand;
 - the code Go makes of the wide loads and stores of `test/go/export/wide/`, for arm64 and for amd64: one load or one store each, of the width its `// asm:` line names; and of the selects of `test/go/export/selects/`: a conditional select each, and no conditional branch but its loop's and its guard's;
 - the code Go makes of the bounds checks of `test/go/export/bounds/`, for arm64 and for amd64: no value spilled to the frame around a check, no check of Go's own past one, and every `GsIdx` and `GsSub` inlined;
 - the reproducers of the bounds-check elimination gaps of `test/go/bce_gaps/`, checked with `goose --check --bce-test`;
+- the helpers inlined into recursive cycles (issue #42): the Go of `test/go/programs/cycle_inlining.goose` and `test/go/export/string_slices/` at -O2, where the Go function of each function an `// inlined:` line annotates calls none of the helpers it names, and calls each one a `// calls:` line names, which takes a data stack;
 - the frames of the export fns of `test/go/export/inline_refs/`, whose locals are handed to inlined functions by reference: as many slots on the fixed-frame stack as each one's `// frame:` line names, none at all for most;
 - the warnings the Go backend gives where the C backend does not yet, of a shift by a constant count outside its type's width (`test/go/warnings/`), each declared by a `// warning:` line as the C suite declares its own;
 - programs that never end, which it only builds (`test/go/build_only/`), data stack overflow, the constructs this version refuses (`test/go/unsupported/`), and the command line (`-o out.go`, `--go-package`, `--go-build`, `--library`, `--frame-reserve`, `--include` and the positions in what it splices in, `goose run`/`goose build --target=go`, `--go-runtime`);

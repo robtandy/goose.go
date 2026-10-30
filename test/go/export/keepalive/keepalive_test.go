@@ -57,6 +57,33 @@ func stringOnes() string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
+type tagList struct{ tags [n / 64]string }
+
+// n/64 strings of 64 bytes of 1 each, the strings of n bytes, as a []string
+// whose array is watched.
+func tagOnes() []string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = 1
+	}
+	s := unsafe.String(unsafe.SliceData(b), len(b))
+	p := freeable[tagList]()
+	for i := range p.tags {
+		p.tags[i] = s[i*64 : (i+1)*64]
+	}
+	return p.tags[:]
+}
+
+// The same strings, whose bytes are watched, as a []string of their own.
+func tagBytesOnes() []string {
+	s := stringOnes()
+	tags := make([]string, n/64)
+	for i := range tags {
+		tags[i] = s[i*64 : (i+1)*64]
+	}
+	return tags
+}
+
 // n/16 points (2, 3).
 func points() []Pt_g {
 	p := freeable[pts]()
@@ -92,6 +119,9 @@ func TestArgumentsLiveThroughTheCall(t *testing.T) {
 		{"KeptPtsWithStack", 6 * n / 16, func() int64 { return KeptPtsWithStack(gs, points()) }},
 		{"KeptPt", 3, func() int64 { return KeptPt(point()) }},
 		{"KeptPtWithStack", 3, func() int64 { return KeptPtWithStack(gs, point()) }},
+		{"KeptTags", 2 * n, func() int64 { return KeptTags(tagOnes()) }},
+		{"KeptTags bytes", 2 * n, func() int64 { return KeptTags(tagBytesOnes()) }},
+		{"KeptTagsWithStack", 2 * n, func() int64 { return KeptTagsWithStack(gs, tagOnes()) }},
 		{"HeldSum", n + 1, func() int64 { return HeldSum(ones()) }},
 		{"HeldSumWithStack", n + 1, func() int64 { return HeldSumWithStack(gs, ones()) }},
 	}

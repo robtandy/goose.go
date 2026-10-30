@@ -66,6 +66,15 @@ export fn trim_left(text: const u8[:]) -> const u8[:] {
     text[i..]
 }
 
+// The bytes of a Go []string's strings, which it takes as a
+// const (const u8[:])[:] (issue #42), viewed in place.
+// entry: inline, no escape
+export fn tags_len(tags: const (const u8[:])[:]) -> i64 {
+    var n = 0;
+    for t in tags { n += t.len; }
+    n
+}
+
 fn weighted(xs: const i64[:], k: i64) -> i64 {
     var s = 0;
     for x, i in xs { s += (i + k) * x; }

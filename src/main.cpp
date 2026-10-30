@@ -56,6 +56,7 @@
 #include "codegen_go_check.h"
 #include "codegen_go_threads.h"
 #include "codegen_go_shifts.h"
+#include "codegen_go_cycles.h"
 #include "runtime_inline.h"
 #include "process.h"
 #include "jit.h"
@@ -1841,7 +1842,17 @@ int Main(int argc, char **argv) {
         golib = gotarget && (golibrary || (!ast.DeclaresMain() &&
                                            any_of(ast.functions.begin(), ast.functions.end(),
                                                   [](SFunction *sf) { return sf->isexport; })));
-        TypeCheckProgram(ast, library, (nocgen && !gocheck) || golib);
+        // The export fns taking a Go []string, which crosses to Go where
+        // nothing does to C (issue #42): the checker's check of an export's
+        // boundary, C's, refuses them, so they are checked as Go's instead.
+        auto goexports = gotarget ? HideGoExports(ast) : vector<SFunction *>();
+        try {
+            TypeCheckProgram(ast, library, (nocgen && !gocheck) || golib);
+        } catch (...) {
+            for (auto sf : goexports) sf->isexport = true;
+            throw;
+        }
+        if (gotarget) CheckGoExports(ast, goexports);
         // The checker reported the errors it went on past, root by root.
         if (!ast.errors.empty()) return 1;
         // A shift by a constant count outside its type's width, which the
@@ -1849,6 +1860,9 @@ int Main(int argc, char **argv) {
         // before anything is folded or inlined (issue #27).
         if (gotarget) WarnShiftCounts(ast);
         Optimizer opt(ast, optlevel);
+        // The optimizer inlines nothing into a recursive fn: --target=go
+        // inlines there what takes no data stack (issue #42).
+        if (gotarget) InlineIntoCycles(opt);
         if (specs) {
             string s;
             opt.DumpSpecs(s);

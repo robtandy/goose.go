@@ -101,6 +101,14 @@ line annotates must take as many slots on the fixed-frame stack as it
 names, `none` none at all, a local handed to an inlined body by reference
 staying a Go local unless its address outlives the body (Runner.frames).
 
+The Go of test/go/programs/cycle_inlining.goose and of
+test/go/export/string_slices/ (issue #42) is read at -O2, where the helpers
+of a recursive fn that take no data stack are inlined into it: the Go
+function of each function an `// inlined:` line annotates must call none of
+the helpers it names, and must call each one a `// calls:` line names, which
+takes one (Runner.cycles). The export libraries of EXPORT_RACE run their
+tests under the race detector too, where cgo builds.
+
 The entry points of the kernels of test/go/export/inlining/ (issue #22) are
 read as Go compiles them, at -O2 and at -O0 (`go test -c -gcflags=-m=2`):
 each export fn an `// entry:` line annotates must have entry points Go can
@@ -315,6 +323,12 @@ def go_declared(text):
         return n[:1].lower() + n[1:]
     return {f"{low(recv)}.{method}" if recv else low(fn or ty or var)
             for recv, method, fn, ty, var in GO_DECL.findall(text)}
+
+# The export libraries whose Go tests run under the race detector as well,
+# where cgo can build it (issue #42): those of a Go []string and of what the
+# collector must keep alive, whose tests leave out under it what sync.Pool,
+# which drops a quarter of what it is given there, makes untrue.
+EXPORT_RACE = {"string_slices", "keepalive"}
 
 # The line Go's tools know generated code by (go help generate), which a
 # generated file's header keeps as it was (issue #21).
@@ -1338,6 +1352,49 @@ def frame_slots(gosrc, fn):
     return m[0], len(re.findall(r"^\t\tgs_fo\d+ += gs_fo\d+ \+", m[0], re.M))
 
 
+# --- helpers inlined into recursive cycles (issue #42) -------------------------
+
+# The sources whose `// inlined:` and `// calls:` lines Runner.cycles checks,
+# and the flags each compiles with besides -O2 --target=go.
+CYCLE_SOURCES = [("programs/cycle_inlining.goose", []),
+                 ("export/string_slices/string_slices.goose", ["--library"])]
+
+
+def cycle_annotations(src):
+    """The functions of src that `// inlined:` and `// calls:` comment lines
+    above name helpers of: name -> (the helpers its Go function must call
+    none of, those it must call)."""
+    want, pending = {}, None
+    for line in src.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        m = re.match(r"^// (inlined|calls): (\w+(?:, \w+)*)$", line)
+        if m:
+            pending = pending or (set(), set())
+            pending[0 if m[1] == "inlined" else 1].update(m[2].split(", "))
+            continue
+        m = re.match(r"^(?:recursive )?fn (\w+)[<(]", line)
+        if m and pending is not None:
+            want[m[1]] = pending
+        if not line.startswith("//"):
+            pending = None
+    return want
+
+
+def go_function(gosrc, name):
+    """The Go function of the Goose function name in the generated Go gosrc:
+    the text of the first whose Go name is name's with the _g of the
+    program's own names (name_g, name_g2, or a nested function's
+    outer_name_g), or None."""
+    m = re.search(rf"^func (?:\w+_)?{re.escape(name)}_g\d*\(.*?^}}$", gosrc, re.M | re.S)
+    return m[0] if m else None
+
+
+def go_calls(text, name):
+    """Whether the Go text calls the Go function of the Goose function name
+    (name_g, name_g2, ...)."""
+    return re.search(rf"\b(?:\w+_)?{re.escape(name)}_g\d*\(", text) is not None
+
+
 # --- the entry points of pure kernels (issue #22) -----------------------------
 
 # What an `// entry:` line can say of an export fn's entry points: Go can
@@ -2190,17 +2247,27 @@ class Runner:
         self.stacks(src, name, [], out)
         return out
 
-    def module_tests(self, mod, label, out, tags=None):
+    def module_tests(self, mod, label, out, tags=None, race=False):
         """The tests of the module in mod: `go vet`, which must find nothing,
         `go test`, and `go test` built with -d=checkptr, Go's checks of every
         unsafe.Pointer conversion and of the arithmetic on one (what `go test
-        -race` turns on): whether all passed, each reported."""
+        -race` turns on); with race, `go test -race` too, where cgo can
+        build it: whether all passed, each reported."""
         tag = [f"-tags={tags}"] if tags else []
-        for what, cmd in (("go vet", ["vet"] + tag + ["./..."]),
-                          ("go test", ["test", "-count=1"] + tag + ["./..."]),
-                          ("go test -d=checkptr", ["test", "-count=1", "-gcflags=all=-d=checkptr"] + tag + ["./..."])):
-            r = subprocess.run([self.go] + cmd, cwd=mod, env=go_env(), capture_output=True)
+        steps = [("go vet", ["vet"] + tag + ["./..."], go_env()),
+                 ("go test", ["test", "-count=1"] + tag + ["./..."], go_env()),
+                 ("go test -d=checkptr", ["test", "-count=1", "-gcflags=all=-d=checkptr"] + tag + ["./..."], go_env())]
+        if race:
+            steps.append(("go test -race", ["test", "-count=1", "-race"] + tag + ["./..."],
+                          dict(go_env(), CGO_ENABLED="1")))
+        for what, cmd, env in steps:
+            r = subprocess.run([self.go] + cmd, cwd=mod, env=env, capture_output=True)
             text = tc.decode(r.stdout) + tc.decode(r.stderr)
+            if what == "go test -race" and r.returncode != 0 and ("cgo" in text or "C compiler" in text or
+                                                                  "-race is not supported" in text):
+                # The race detector needs cgo, and a C compiler.
+                out.append(("skip", f"{label}: {what} (no cgo here)", None))
+                continue
             if r.returncode != 0 or (what == "go vet" and text.strip()):
                 out.append(("fail", f"{label}: {what}", text))
                 return False
@@ -2212,7 +2279,8 @@ class Runner:
         <name>.goose compiled with --target=go --library at -O2 and at -O0,
         each other non-test .go file there spliced in with --include, into
         a module of its own with the directory's _test.go files, which must
-        vet and pass `go test`, built with -d=checkptr as well: their
+        vet and pass `go test`, built with -d=checkptr as well, and for one
+        of EXPORT_RACE under the race detector where cgo builds: their
         checks of what the Go entry points give, and testing.AllocsPerRun's
         that calling them in a loop allocates nothing on Go's heap. Then
         again with the runtime imported (--go-runtime=import, issue #19),
@@ -2259,7 +2327,8 @@ class Runner:
                 if r.returncode != 0:
                     out.append(("fail", f"{label}: go mod init", tc.decode(r.stderr)))
                     continue
-            self.module_tests(mod, label, out, "goose_import" if imp else None)
+            self.module_tests(mod, label, out, "goose_import" if imp else None,
+                              race=name in EXPORT_RACE and not imp)
         return out
 
     # --- the runtime (issue #19) ----------------------------------------------
@@ -3416,6 +3485,43 @@ class Runner:
                         None if slots == n else f"{slots} slot(s):\n" + "\n".join(text.splitlines()[:40])))
         return out
 
+    def cycles(self):
+        """Helpers inlined into the functions of recursive cycles (issue #42):
+        each source of CYCLE_SOURCES compiled with --target=go at -O2, the
+        Go function of each function an `// inlined:` line annotates must
+        call none of the Go functions of the helpers it names, which take no
+        data stack and are inlined into it as into any other function, and
+        must call each one a `// calls:` line names, which takes one and
+        stays a call, as the optimizer leaves every call in a cycle."""
+        out = []
+        for rel, flags in CYCLE_SOURCES:
+            src = HERE / "go" / rel
+            want = cycle_annotations(src)
+            if not want:
+                out.append(("fail", f"cycles: no // inlined: line in {src.name}", None))
+                continue
+            gofile = self.work / f"cycles-{src.stem}-O2.go"
+            gofile.unlink(missing_ok=True)
+            code, o, e = self.goose("-O2", "--target=go", *flags, "-o", gofile, src)
+            if code != 0:
+                out.append(("fail", f"cycles {src.stem} -O2: goose --target=go", o + e))
+                continue
+            gosrc = gofile.read_text(encoding="utf-8")
+            for fn, (inlined, calls) in sorted(want.items()):
+                text = go_function(gosrc, fn)
+                if text is None:
+                    out.append(("fail", f"cycles {src.stem} {fn} -O2", f"no Go function of {fn} in {gofile.name}"))
+                    continue
+                for h in sorted(inlined):
+                    ok = not go_calls(text, h)
+                    out.append(("ok" if ok else "fail", f"cycles {src.stem} {fn} -O2: {h} inlined",
+                                None if ok else "\n".join(text.splitlines()[:60])))
+                for h in sorted(calls):
+                    ok = go_calls(text, h)
+                    out.append(("ok" if ok else "fail", f"cycles {src.stem} {fn} -O2: {h} a call",
+                                None if ok else "\n".join(text.splitlines()[:60])))
+        return out
+
     def entry_points(self):
         """The entry points of the export fns of
         test/go/export/inlining/inlining.goose (issue #22), compiled with
@@ -3691,6 +3797,47 @@ class Runner:
               code == 0 and "\nfunc KeptString(s string, t string) int64 {" in text and
               "\nfunc KeptBytes(n int64) int64 {" in text and "func KeptBytes(s" not in text and
               self.gotool("vet", gofile.name)[0] == 0, o + e)
+        # A Go []string crosses as a const (const u8[:])[:] (issue #42), to Go
+        # alone: its entry points take one. The checker refuses every slice
+        # of slices at an export's boundary, which is C's, so --target=go
+        # checks an export fn taking a slice of u8 slices itself, as the
+        # checker checks one but for that parameter: another constness of it
+        # is refused, and so is all the checker refuses, with its messages.
+        strsrc = self.work / "cli-strings.goose"
+        tc.write_text(strsrc, "export fn count(tags: const (const u8[:])[:], tag: const u8[:]) -> i64 {\n"
+                              "    var n = 0;\n    for t in tags {\n        if t == tag { n += 1; }\n    }\n    n\n}\n")
+        code, o, e = self.goose("--target=go", "-o", gofile, strsrc)
+        text = gofile.read_text(encoding="utf-8") if code == 0 else ""
+        check("an export fn takes a const (const u8[:])[:] as a []string",
+              code == 0 and "\nfunc Count[T0 ~string | ~[]byte](tags []string, tag T0) int64 {" in text and
+              "\nfunc CountWithStack[T0 ~string | ~[]byte](gs *GsStackBlock, tags []string, tag T0) int64 {" in text and
+              "\nfunc CountString(tags []string, tag string) int64 {" in text and
+              self.gotool("vet", gofile.name)[0] == 0, o + e)
+        code, o, e = self.goose("--check", strsrc)
+        check("the C backend refuses a const (const u8[:])[:] parameter of an export fn",
+              code == 1 and "export fn count: parameter tags of type const (const u8[:])[:] cannot cross to C: "
+              "nested references and slices do not cross" in e, f"exit {code}\n{o}{e}")
+        for decl, why in (
+                ("export fn f(tags: (const u8[:])[:]) -> i64 { tags.len }",
+                 "export fn f: parameter tags of type (const u8[:])[:] cannot cross to Go: a Go []string crosses as "
+                 "a const (const u8[:])[:], whose strings, as Go's, nothing writes"),
+                ("export fn f(tags: const (u8[:])[:]) -> i64 { tags.len }",
+                 "export fn f: parameter tags of type const (u8[:])[:] cannot cross to Go: a Go []string crosses"),
+                ("struct Held { xs: const i64[:] }\n"
+                 "export fn f(tags: const (const u8[:])[:], h: Held) -> i64 { tags.len + h.xs.len }",
+                 "export fn f: parameter h of type Held cannot cross to C: values holding references do not cross"),
+                ("export fn f(tags: const (const u8[:])[:], x: i64?) -> i64 { tags.len }",
+                 "export fn f: parameter x of type i64? cannot cross to C: only plain references cross"),
+                ("export fn f(tags: const (const u8[:])[:]) -> const (const u8[:])[:] { tags }",
+                 "export fn f: cannot return const (const u8[:])[:] to C: nested references and slices do not cross"),
+                ("export fn f(tags: const (const u8[:])[:]) -> i64 { tags.len }\n"
+                 'export "f" fn g(x: i64) -> i64 { x }',
+                 "export fn f: C symbol f is exported more than once"),
+                ("export fn f<T>(tags: const (const u8[:])[:], x: T) -> i64 { tags.len }",
+                 "export fn f: cannot be generic")):
+            tc.write_text(strsrc, decl + "\n")
+            code, o, e = self.goose("--target=go", "-o", gofile, strsrc)
+            check(f"--target=go refuses {why.partition(': ')[2]}", code == 1 and why in e, f"exit {code}\n{o}{e}")
         # --include with --target=go is Go: a file whose extern fn the
         # program calls, its imports merged, its errors named in its own
         # lines (//line).
@@ -4038,6 +4185,10 @@ def main():
         # #24), beside their export library's own tests.
         if not args.bless and (not args.names or "inline_refs" in args.names):
             futures.append(pool.submit(r.frames))
+        # The helpers inlined into recursive cycles (issue #42), beside
+        # their program's and their export library's own tests.
+        if not args.bless and (not args.names or {"cycle_inlining", "string_slices"} & set(args.names)):
+            futures.append(pool.submit(r.cycles))
         # What Go makes of the entry points of pure kernels (issue #22),
         # beside their export library's own tests.
         if not args.bless and (not args.names or "inlining" in args.names):
