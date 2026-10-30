@@ -1366,12 +1366,69 @@ inline string GoRuntimeSettings(const GoOptions &o, uint64_t framereserve) {
                " stack-gap=", o.stacks.gap, " frame-reserve=", framereserve);
 }
 
+// The options a file's Go depends on, as one command line gives them, which
+// its header records (issue #21): each spelled one way, in one order, and
+// only where it is not the default, but for the target and the level --
+// whatever spelling the compile had (-o out.go for --target=go, a -D for
+// --debug or --stack-reserve, an option's default given), so that two
+// compiles that say the same write the same file, which goose --check
+// compares a file with. The --include files are named as the file's //line
+// directives name them and the runtime file as the header does, relative
+// to the file; an argument a shell would split or read otherwise is quoted.
+// What does not change the Go is left out: the other -D, which are C's,
+// and --stdlib, whose place is the machine's.
+inline string GoHeaderFlags(const GoOptions &o, uint64_t framereserve, uint64_t defaultframe) {
+    auto arg = [](const string &s) {
+        auto plain = !s.empty() && all_of(s.begin(), s.end(), [](char c) {
+            return isalnum((unsigned char)c) || string_view("_@%+=:,./-").find(c) != string_view::npos;
+        });
+        if (plain) return s;
+        string q = "'";
+        for (auto c : s) q += c == '\'' ? string("'\\''") : string(1, c);
+        return q + "'";
+    };
+    // A size as --stack-reserve and --frame-reserve take one: in the largest
+    // unit it is a whole number of.
+    auto size = [](uint64_t n) {
+        for (auto [shift, unit] : { pair { 40, "T" }, pair { 30, "G" }, pair { 20, "M" }, pair { 10, "K" } })
+            if (n && n % (1ull << shift) == 0) return cat(n >> shift, unit);
+        return cat(n);
+    };
+    string s = cat("--target=go -O", o.optlevel);
+    if (o.debug) s += " --debug";
+    if (o.nobce) s += " --no-bce";
+    if (o.library) s += " --library";
+    if (o.package != (o.library ? "goose" : "main")) Append(s, " --go-package ", o.package);
+    if (!o.build.empty()) Append(s, " --go-build ", arg(o.build));
+    if (o.runtime != GO_RT_EMBED) Append(s, " --go-runtime=", o.runtime == GO_RT_IMPORT ? "import" : "full");
+    if (!o.runtimefile.empty()) Append(s, " --go-runtime-file ", arg(o.runtimefile));
+    if (o.unexported) s += " --go-unexported";
+    if (o.nowithstack) s += " --go-no-withstack";
+    // The runtime's configuration: --stack-reserve's where it takes the
+    // size, and the -D that set it otherwise.
+    auto &st = o.stacks, &def = o.defaults;
+    if (st.reserve != def.reserve) {
+        if (st.reserve >= (64ull << 10) && st.reserve <= (1ull << 48))
+            Append(s, " --stack-reserve ", size(st.reserve));
+        else
+            Append(s, " -DGS_STACK_RESERVE=", st.reserve);
+    }
+    if (st.gap != def.gap) Append(s, " -DGS_STACK_GAP=", st.gap);
+    if (st.budget != def.budget) Append(s, " -DGS_STACK_BUDGET=", st.budget);
+    if (st.maxstacks != def.maxstacks) Append(s, " -DGS_MAX_STACKS=", st.maxstacks);
+    if (o.stackstats) s += " -DGS_STACK_STATS=1";
+    if (framereserve != defaultframe) Append(s, " --frame-reserve ", size(framereserve));
+    for (auto &inc : o.includes) Append(s, " --include ", arg(inc.name));
+    return s;
+}
+
 // The whole file: a build constraint where --go-build gives one, a header
-// Go tools know generated code by, the package, the imports, the runtime
-// configuration and the runtime -- the part the program uses, all of it, or
-// none, where it imports the runtime's package (codegen_go_runtime.h) --
-// then the program, laid out as gofmt lays it out (GoFormat), and the
-// --include files. With --go-runtime-file the configuration and the
+// Go tools know generated code by, which records what wrote the file (the
+// compiler's version, the runtime's revision and the options, issue #21),
+// the package, the imports, the runtime configuration and the runtime --
+// the part the program uses, all of it, or none, where it imports the
+// runtime's package (codegen_go_runtime.h) -- then the program, laid out
+// as gofmt lays it out (GoFormat), and the --include files. With --go-runtime-file the configuration and the
 // runtime go to that file instead (runtimefiletext), which the package's
 // programs share, and the program's own names carry its file's name.
 inline string CodeGenGo::Source(const string &srcname) {
@@ -1666,7 +1723,15 @@ inline string CodeGenGo::Source(const string &srcname) {
         for (auto &[n, p] : imports) Append(imps, "\t", n, n.empty() ? "" : " ", GoStr(p), "\n");
         return imps.empty() ? string() : cat("import (\n", imps, ")\n\n");
     };
+    // What wrote the file (issue #21): after the line Go's tools know
+    // generated code by, which stays as it was, the compiler's version and
+    // the runtime's revision, and the options the Go depends on, which
+    // write it again; the runtime file has the first.
+    auto stamp = cat("// goose-version: ", ascii(opts.version.empty() ? string("unknown") : opts.version),
+                     " (runtime/go ", GoRuntimeRevision(), ")\n");
     auto header = cat("// Code generated by the Goose compiler from ", name, ". DO NOT EDIT.\n"
+                      "//\n", stamp,
+                      "// goose-flags: ", ascii(GoHeaderFlags(opts, FrameReserve(), DefaultFrameReserve())), "\n"
                       "//\n"
                       "// Names from the program carry a _g suffix, which keeps them clear of Go's\n"
                       "// keywords and of the runtime's gs and Gs names; a namespaced name ns::x is\n"
@@ -1697,7 +1762,7 @@ inline string CodeGenGo::Source(const string &srcname) {
         parts.push_back(pkgsection);
     } else {
         parts.push_back(importsof({ prog }, incs, incimports));
-        runtimefiletext = join({ cat("// Code generated by the Goose compiler. DO NOT EDIT.\n//\n"
+        runtimefiletext = join({ cat("// Code generated by the Goose compiler. DO NOT EDIT.\n//\n", stamp, "//\n"
                                      "// The Goose runtime of package ", opts.package, "'s programs (--go-runtime-file),\n"
                                      "// which they share: what they use of it, and its configuration. A compile of\n"
                                      "// one of them writes it again, with what the others use of it still in it,\n"

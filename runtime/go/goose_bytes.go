@@ -298,13 +298,25 @@ func gsBldPut(gs *GsStackBlock, b GsRref, p unsafe.Pointer, n int) {
 	b.Hdr.Len += int64(n)
 }
 
+// gsSubEnd is where an empty slice at the end of its run starts (GsSub): a
+// word of the runtime's own, where no other slice starts, aligned for any
+// element and outside Go's heap.
+var gsSubEnd uint64
+
 // GsSub is the slice of the elements lo up to hi of the n at p, each es
-// bytes. An empty one starts where it is, at the end of the run too, so
-// that two at different places are different slices (§3.10): what a slice
-// can point into is never the Go heap, where an address one past an
-// object's end would be no valid Go pointer.
+// bytes. An empty one starts where it is, so that two at different places
+// are different slices (§4.5), but at the end of a run of any bytes (lo ==
+// n, as in s[s.len..]), where that is one past the run's last byte: the run
+// may end where an object on Go's heap does (an export fn's argument, viewed
+// in place), and an address one past an object's end is no valid Go pointer.
+// -d=checkptr, which -race turns on, aborts on one, and Go's collector may
+// take one for a bad pointer into its heap (issue #39). Such a slice starts
+// at gsSubEnd instead, which no slice of the run, nor the nil one, starts
+// at.
 func GsSub(p unsafe.Pointer, lo, hi, n, es int64) GsSlice {
-	_ = n
+	if lo == n && lo*es != 0 {
+		return GsSlice{unsafe.Pointer(&gsSubEnd), 0}
+	}
 	return GsSlice{unsafe.Add(p, lo*es), hi - lo}
 }
 

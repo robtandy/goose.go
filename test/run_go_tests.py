@@ -114,6 +114,18 @@ text forms (KERNEL_ABSENT), test/go/unexported/ one compiled with
 test/go/shared/ two programs compiled into one package with
 --go-runtime-file, whose tests pass together in each mode.
 
+Reproducible files (issue #21, the section reproducible): a generated
+file's header keeps Go's `// Code generated ... DO NOT EDIT.` line and
+records the compiler's version, the runtime's revision and the options its
+Go depends on, spelled one way whatever the compile's spelling; `--check
+-o out.go` passes a file that is what the compile would write and fails one
+that is stale or missing, with a short diff; and the same programs compiled
+in two temporary directories, each with a standard library of its own, are
+the same Go, byte for byte (Runner.reproducible, Runner.same_go). So the Go
+names a file of the standard library by its place in it, stdlib/std.goose,
+where an abort there names it, and C by its whole path: every C run's
+stderr is compared with the Go's so named (go_file_names).
+
 --sweep also runs the C suite's own programs (test/<category>/*.goose) of
 its other categories through both backends as the test/stdlib/ fixtures
 run: at both levels, with --debug where they ask for it, vetted, built with
@@ -151,6 +163,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -197,6 +210,61 @@ KERNEL_ABSENT = ["func NewStackBlock", "func AcquireStackBlock", "func ReleaseSt
                  "func GsOut", "type gsProgram", "gsLibStart", "gsInitGlobals", '"syscall"', '"sync"',
                  '"os"']
 KERNEL_MAX_LINES = 450
+
+# The line Go's tools know generated code by (go help generate), which a
+# generated file's header keeps as it was (issue #21).
+GO_GENERATED = re.compile(r"^// Code generated .* DO NOT EDIT\.$")
+
+
+def go_runtime_revision():
+    """The runtime's revision a generated file's header records (issue #21):
+    a hash of the text of the files of runtime/go the compiler embeds (every
+    one but its tests and RUNTIME_PACKAGE_ONLY), in the order of their
+    names, each its name, a NUL, its text without carriage returns and a
+    NUL; FNV-1a's 64 bits, as `goose version` hashes the C runtime's text,
+    the high 48 of them in hex."""
+    h = 0xcbf29ce484222325
+    for p in sorted(RUNTIME.glob("*.go"), key=lambda p: p.name):
+        if p.name.endswith("_test.go") or p.name in RUNTIME_PACKAGE_ONLY:
+            continue
+        for b in p.name.encode() + b"\0" + p.read_bytes().replace(b"\r", b"") + b"\0":
+            h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return f"{h >> 16:012x}"
+
+
+# Where an abort's message names its place: (file:line), at its end.
+ABORT_PLACE = re.compile(r"\(([^()\n]+\.goose):(\d+)\)")
+
+
+def go_file_names(text):
+    """text, what a C run printed, with each place an abort names in a file
+    of the standard library named as the Go backend names it (issue #21):
+    by its place in the library, stdlib/std.goose, where the C backend
+    names it by its whole path, which is this machine's. A C run is
+    compared with the Go's so (Runner.c_run)."""
+    libs = [os.path.normpath(UPSTREAM / "stdlib")]
+    if os.environ.get("GOOSE_STDLIB"):
+        libs.append(os.path.normpath(os.path.abspath(os.environ["GOOSE_STDLIB"])))
+
+    def name(m):
+        path = os.path.normpath(m[1])
+        for lib in libs:
+            if os.path.isabs(m[1]) and path.startswith(lib + os.sep):
+                return f"(stdlib/{Path(path).relative_to(lib).as_posix()}:{m[2]})"
+        return m[0]
+    return ABORT_PLACE.sub(name, text)
+
+
+def first_difference(a, b):
+    """Where two texts first differ: the line, and each one's text of it."""
+    la, lb = a.splitlines(), b.splitlines()
+    for i in range(max(len(la), len(lb))):
+        x = la[i] if i < len(la) else "<end>"
+        y = lb[i] if i < len(lb) else "<end>"
+        if x != y:
+            return f"line {i + 1}:\n    {x}\n    {y}"
+    return "in their line breaks"
+
 
 
 def parity_samples():
@@ -1291,7 +1359,9 @@ class Runner:
         compiler's process does from the repository's root, where the
         messages name the source as the Go's do, or in cwd as well with
         jit_in_cwd (a sample reading its data, whose source is then named
-        by its whole path)."""
+        by its whole path). Its stderr names a file of the standard library
+        as the Go backend does, by its place in the library
+        (go_file_names)."""
         if self.cc is None:
             # TinyCC in the compiler's process: what the compile itself
             # prints to stderr (its warnings) comes before the program's.
@@ -1312,10 +1382,12 @@ class Runner:
             _, _, warnings = compiler(*flags, "--check", src)
             if warnings and e.startswith(warnings):
                 e = e[len(warnings):]
-            return code, o, e
+            return code, o, go_file_names(e)
         exe = self.c_build(src, name, flags, out)
-        return None if exe is None else run_capture([exe] + list(args), cwd=cwd, timeout=timeout,
-                                                    stdin_path=stdin)
+        if exe is None:
+            return None
+        code, o, e = run_capture([exe] + list(args), cwd=cwd, timeout=timeout, stdin_path=stdin)
+        return code, o, go_file_names(e)
 
     def c_build(self, src, name, flags, out):
         """The C backend's executable for src, at the Goose level flags name
@@ -2158,6 +2230,282 @@ class Runner:
                         None if ok else f"exit {code}\n{o}{e}"))
         return out
 
+    # --- reproducible files (issue #21) -----------------------------------------
+
+    def reproducible(self):
+        """What makes a generated file reproducible (issue #21). Its header
+        keeps the line Go's tools know generated code by as it was
+        (GO_GENERATED), and records the compiler's version, `goose
+        version`'s, the revision of the runtime it embeds
+        (go_runtime_revision) and the options its Go depends on, as one
+        command line spells them whichever spelling the compile had, so
+        that two compiles that say the same write the same file; a runtime
+        file's header records the version. `--check` with `-o out.go` (and
+        `goose check -o out.go`) writes nothing: it exits with 0 where out.go,
+        and the --go-runtime-file, are what the compile would write, and
+        with 1 where one is not, or is missing, with a short diff of each.
+        And the same programs compiled in two temporary directories, each
+        with a standard library of its own, are the same Go, byte for byte
+        (Runner.same_go)."""
+        out = []
+
+        def check(what, ok, detail=""):
+            out.append(("ok" if ok else "fail", f"reproducible: {what}", None if ok else detail))
+
+        work = self.work / "reproducible"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        hello = HERE / "go" / "programs" / "print.goose"
+        code, o, e = self.goose("version")
+        m = re.match(r"goose (\S+) \(runtime [0-9a-f]{12}\)\n$", o)
+        check("goose version", code == 0 and m is not None, o + e)
+        stamp = f"// goose-version: {m[1] if m else '?'} (runtime/go {go_runtime_revision()})\n"
+
+        def compile_go(flags, src=hello, name="hello.go"):
+            """The Go the compiler writes of src with flags, or ""."""
+            gofile = work / name
+            gofile.unlink(missing_ok=True)
+            code, o, e = self.goose(*flags, "-o", gofile, src)
+            if code != 0:
+                check(f"goose {' '.join(map(str, flags))} -o {name}", False, f"exit {code}\n{o}{e}")
+                return ""
+            return gofile.read_text(encoding="utf-8")
+
+        def header(text):
+            """A generated file's comments before its package clause."""
+            return text[:text.find("\npackage ")]
+
+        # The header: Go's line as it was, then the version, the runtime's
+        # revision and the options.
+        text = compile_go([])
+        first = text.split("\n", 1)[0]
+        check("the header keeps Go's line, and records the version, the runtime's revision and the options",
+              first == "// Code generated by the Goose compiler from test/go/programs/print.goose. DO NOT EDIT." and
+              GO_GENERATED.match(first) is not None and
+              header(text).startswith(f"{first}\n//\n{stamp}// goose-flags: --target=go -O2\n//\n// Names "),
+              header(text))
+        # The options the Go depends on, each spelled one way, in one order,
+        # and only where it is not the default: whatever spelling the
+        # compile had (-o out.go for --target=go, a -D for --debug or
+        # --stack-reserve, a default given), and with -D the Go backend does
+        # not read left out.
+        helper = work / "helper.go"
+        tc.write_text(helper, 'package main\n\nimport "strings"\n\n'
+                              'func shout(gs *GsStackBlock, s GsSlice, out GsRref) {\n'
+                              '\tGsBldAppendString(gs, out, strings.ToUpper(GsSliceToString(s))+"!")\n}\n')
+        shout = work / "shout.goose"
+        tc.write_text(shout, 'extern fn shout(s: const u8[:], out: u8[>..]&);\n\n'
+                             'fn main() {\n    var b: u8[>..] = [];\n    shout("hi", b);\n    print(b);\n}\n')
+        for flags, want, src in (
+                ([], "--target=go -O2", hello),
+                (["--target", "go", "-O2", "--go-package", "main", "--go-runtime=embed", "--stack-reserve", "2G",
+                  "-DGS_STACK_GAP=0x100000", "-DGS_UNREAD=1"], "--target=go -O2", hello),
+                (["--go-package", "geese"], "--target=go -O2 --go-package geese", hello),
+                (["-O0", "--debug", "--no-bce", "--go-package=geese"], "--target=go -O0 --debug --no-bce --go-package geese",
+                 hello),
+                (["--library"], "--target=go -O2 --library", hello),
+                (["--library", "--go-package", "goose", "--frame-reserve", "64M"], "--target=go -O2 --library", hello),
+                (["--frame-reserve", "64M"], "--target=go -O2 --frame-reserve 64M", hello),
+                (["--go-build", "linux&&amd64 ||!goose_x"], "--target=go -O2 --go-build '(linux && amd64) || !goose_x'",
+                 hello),
+                (["--go-runtime", "full", "--go-unexported", "--go-no-withstack"],
+                 "--target=go -O2 --go-runtime=full --go-unexported --go-no-withstack", hello),
+                (["--go-runtime=import"], "--target=go -O2 --go-runtime=import", hello),
+                (["--stack-reserve", "64K", "-DGS_STACK_GAP=0x2000", "-DGS_STACK_BUDGET=(1 << 40)", "-DGS_MAX_STACKS=64",
+                  "-DGS_STACK_STATS=1", "--frame-reserve", "2M"],
+                 "--target=go -O2 --stack-reserve 64K -DGS_STACK_GAP=8192 -DGS_STACK_BUDGET=1099511627776 "
+                 "-DGS_MAX_STACKS=64 -DGS_STACK_STATS=1 --frame-reserve 2M", hello),
+                (["-DGS_DEBUG=1", "-DGS_STACK_RESERVE=0x10000"], "--target=go -O2 --debug --stack-reserve 64K", hello),
+                (["-DGS_STACK_RESERVE=0x100"], "--target=go -O2 -DGS_STACK_RESERVE=256", hello),
+                (["--include", helper], "--target=go -O2 --include helper.go", shout)):
+            head = header(compile_go(flags, src))
+            got = re.search(r"\n// goose-flags: (.*)\n", head)
+            check(f"// goose-flags: {want}", got is not None and got[1] == want, head)
+        heads = [header(compile_go(["--go-package", p], name=f"package-{p}.go")) for p in ("geese", "ducks")]
+        check("--go-package changes the header", heads[0] != heads[1] and "--go-package geese\n" in heads[0] and
+              "--go-package ducks\n" in heads[1], "\n".join(heads))
+        same = [compile_go(["--go-package=geese", "-DGS_DEBUG=1", "-DGS_STACK_RESERVE=0x10000"], name="same-a.go"),
+                compile_go(["--debug", "--stack-reserve", "64K", "--target=go", "-O2", "--go-package", "geese"],
+                           name="same-b.go")]
+        check("two compiles that say the same in other words write the same file", same[0] and same[0] == same[1],
+              first_difference(*same))
+        # A runtime file's header records the version; the programs' headers
+        # the runtime file among their options.
+        shared = work / "shared"
+        shared.mkdir()
+        sd = HERE / "go" / "shared"
+        rt = shared / "goose_runtime.go"
+        sargs = ["--target=go", "--library", "--go-package", "shared", "--go-runtime-file", rt]
+        for prog in ("geom", "text"):
+            code, o, e = self.goose(*sargs, "-o", shared / f"{prog}.go", sd / f"{prog}.goose")
+            check(f"goose {prog}.goose --go-runtime-file", code == 0, f"exit {code}\n{o}{e}")
+        rttext = rt.read_text(encoding="utf-8") if rt.exists() else ""
+        geom = (shared / "geom.go").read_text(encoding="utf-8") if (shared / "geom.go").exists() else ""
+        check("the runtime file's header records the version, and a program's header its runtime file",
+              rttext.startswith(f"// Code generated by the Goose compiler. DO NOT EDIT.\n//\n{stamp}//\n") and
+              "\n// goose-flags: --target=go -O2 --library --go-package shared --go-runtime-file goose_runtime.go\n"
+              in header(geom), header(rttext) + "\n" + header(geom))
+        # --check: the files the compile would write, compared with those
+        # there, which it leaves as they are.
+        src = work / "check.goose"
+        shutil.copy(hello, src)
+        gofile = work / "check.go"
+        code, o, e = self.goose("--target=go", "--go-package", "geese", "-o", gofile, src)
+        written = gofile.read_bytes() if code == 0 else b""
+        check("goose -o check.go", code == 0, f"exit {code}\n{o}{e}")
+        wlines = tc.decode(written).splitlines()
+
+        def checked(*flags):
+            """--check of check.go: the exit code, stdout and stderr, and
+            whether the file is as it was."""
+            before = gofile.read_bytes() if gofile.exists() else None
+            code, o, e = self.goose(*flags, "-o", gofile, src)
+            return code, o, e, (gofile.read_bytes() if gofile.exists() else None) == before
+
+        for args in (["--target=go", "--check", "--go-package", "geese"],
+                     ["check", "--target=go", "--go-package=geese"],
+                     ["--check", "-O2", "--go-runtime=embed", "--go-package", "geese"]):
+            code, o, e, kept = checked(*args)
+            check(f"goose {' '.join(args)} -o check.go: the file is up to date",
+                  code == 0 and not o and not e and kept, f"exit {code}\n{o}{e}")
+        code, o, e, kept = checked("--target=go", "--check", "--stats", "--go-package", "geese")
+        check("--check --stats: up to date", code == 0 and f"\n{gofile} is up to date ({len(written)} bytes)\n" in o
+              and kept, f"exit {code}\n{o}{e}")
+        # Other options: the header's options and the package clause differ.
+        code, o, e, kept = checked("--target=go", "--check", "--go-package", "ducks")
+        check("--check: a file compiled with other options is stale, with a diff of the lines that differ",
+              code == 1 and not o and kept and e.startswith(f"{gofile} is stale: ") and
+              "\n-// goose-flags: --target=go -O2 --go-package geese\n"
+              "+// goose-flags: --target=go -O2 --go-package ducks\n" in e and
+              "\n-package geese\n+package ducks\n" in e, f"exit {code}\n{o}{e}")
+        # A file another compiler wrote: its version.
+        tc.write_text(gofile, tc.decode(written).replace(stamp, "// goose-version: v0.1 (runtime/go 0123456789ab)\n"))
+        code, o, e, kept = checked("--target=go", "--check", "--go-package", "geese")
+        check("--check: a file another compiler wrote is stale",
+              code == 1 and kept and f"\n@@ -3 +3 @@\n-// goose-version: v0.1 (runtime/go 0123456789ab)\n+{stamp}" in e,
+              f"exit {code}\n{o}{e}")
+        gofile.write_bytes(written)
+        # The source changed: the one line of Go it changes.
+        tc.write_text(src, hello.read_text(encoding="utf-8").replace('"hello, world"', '"hello, there"'))
+        at = next((i for i, line in enumerate(wlines) if '"hello, world"' in line), 0)
+        hunk = f"\n@@ -{at + 1} +{at + 1} @@\n-{wlines[at]}\n+{wlines[at].replace('hello, world', 'hello, there')}\n" \
+            if wlines else "?"
+        code, o, e, kept = checked("--target=go", "--check", "--go-package", "geese")
+        check("--check: the file of a source that changed is stale, the line it changes its diff",
+              code == 1 and kept and e.startswith(f"{gofile} is stale: ") and hunk in e and
+              e.endswith(hunk[1:] if hunk.startswith("\n") else hunk), f"exit {code}\n{o}{e}\n--- want:{hunk}")
+        shutil.copy(hello, src)
+        # A diff of many lines is cut short.
+        code, o, e, kept = checked("--target=go", "--check", "--go-package", "geese", "--go-runtime=full")
+        check("--check: a long diff is cut short", code == 1 and kept and len(e.splitlines()) <= 30 and
+              "more " in e.splitlines()[-1], f"exit {code}\n{o}{e}")
+        # Other line breaks, which goose would write as \n.
+        gofile.write_bytes(written.replace(b"\n", b"\r\n"))
+        code, o, e, kept = checked("--target=go", "--check", "--go-package", "geese")
+        check("--check: a file with \\r\\n line breaks is stale", code == 1 and kept and "line breaks" in e,
+              f"exit {code}\n{o}{e}")
+        # The program checked as the compile that writes the file checks it:
+        # one with no fn main() and no export fn is refused, which a check
+        # of the program alone lets pass.
+        nomain = work / "nomain.goose"
+        tc.write_text(nomain, "fn helper() -> i64 { 1 }\n")
+        for args in (["--target=go"], ["--target=go", "--check"], ["check", "--target=go"]):
+            code, o, e = self.goose(*args, "-o", work / "nomain.go", nomain)
+            check(f"goose {' '.join(args)} -o nomain.go refuses a program with no fn main()",
+                  code == 1 and "needs exactly one global fn main()" in e, f"exit {code}\n{o}{e}")
+        code, o, e = self.goose("check", "--target=go", nomain)
+        check("goose check --target=go, with no -o, checks a file with no fn main() on its own",
+              code == 0 and not o and not e, f"exit {code}\n{o}{e}")
+        # No file at all: stale, and still none.
+        gofile.unlink()
+        code, o, e, kept = checked("--target=go", "--check", "--go-package", "geese")
+        check("--check: a missing file is stale, and is not written",
+              code == 1 and kept and not gofile.exists() and f"cannot read {gofile}" in e, f"exit {code}\n{o}{e}")
+        # A package's runtime file is checked too, as the compile would
+        # write it again.
+        for prog in ("geom", "text"):
+            code, o, e = self.goose(*sargs, "--check", "-o", shared / f"{prog}.go", sd / f"{prog}.goose")
+            check(f"--check {prog}.go --go-runtime-file: both files up to date", code == 0 and not o and not e,
+                  f"exit {code}\n{o}{e}")
+        rtbytes = rt.read_bytes() if rt.exists() else b""
+        rt.write_bytes(rtbytes.replace(b"\n// goose-runtime: ", b"\n// An edit.\n// goose-runtime: ", 1))
+        code, o, e = self.goose(*sargs, "--check", "-o", shared / "geom.go", sd / "geom.goose")
+        check("--check: a runtime file that is not what the compile would write is stale",
+              code == 1 and e.startswith(f"{rt} is stale: ") and "\n-// An edit.\n" in e and
+              "geom.go is stale" not in e, f"exit {code}\n{o}{e}")
+        rt.write_bytes(rtbytes)
+        self.same_go(check, helper, shout)
+        return out
+
+    def same_go(self, check, helper, shout):
+        """The same programs compiled in two temporary directories, each
+        holding a copy of them and a standard library of its own, which the
+        compiles are given by its whole path, as two machines would have
+        them in places of their own (issue #21): every program of
+        test/go/programs/, with the flags its first line names, at -O2 and
+        at -O0; every fixture of the C suite's test/stdlib/, which import
+        most of the library; and a program with the runtime whole,
+        unexported or imported, a library, an --include (helper, by shout)
+        and two programs sharing a runtime file. Each compile runs in its
+        directory and names its files relative to it, and the Go must be
+        the same, byte for byte, naming neither directory."""
+        dirs = [Path(tempfile.mkdtemp(prefix="goose-same-")), Path(tempfile.mkdtemp(prefix="goose-same-other-"))]
+        try:
+            for t in dirs:
+                shutil.copytree(HERE / "go" / "programs", t / "programs")
+                shutil.copytree(UPSTREAM_TEST / "stdlib", t / "fixtures")
+                shutil.copytree(UPSTREAM / "stdlib", t / "stdlib")
+                shutil.copytree(HERE / "go" / "shared", t / "shared")
+                shutil.copy(helper, t / "helper.go")
+                shutil.copy(shout, t / "shout.goose")
+            # Each case: its compiles, (flags, source, -o), in order, and the
+            # files to compare once they ran.
+            cases = []
+            for p in sorted((HERE / "go" / "programs").glob("*.goose")):
+                for level in ("-O2", "-O0"):
+                    cases.append((f"programs/{p.name} {level}",
+                                  [(goose_flags(p) + [level], f"programs/{p.name}", f"out/{p.stem}{level}.go")],
+                                  [f"out/{p.stem}{level}.go"]))
+            for p in sorted((UPSTREAM_TEST / "stdlib").glob("*.goose")):
+                cases.append((f"test/stdlib/{p.name}", [(runtime_defines(p), f"fixtures/{p.name}", f"out/{p.stem}.go")],
+                              [f"out/{p.stem}.go"]))
+            for k, flags in enumerate((["--go-runtime=full"], ["--go-unexported"], ["--go-runtime=import"],
+                                       ["--library", "--go-package", "geese", "--debug"])):
+                cases.append((f"programs/print.goose {' '.join(flags)}",
+                              [(flags, "programs/print.goose", f"out/print-{k}.go")], [f"out/print-{k}.go"]))
+            cases.append(("shout.goose --include helper.go", [(["--include", "helper.go"], "shout.goose", "shout.go")],
+                          ["shout.go"]))
+            sargs = ["--library", "--go-package", "shared", "--go-runtime-file", "shared/goose_runtime.go"]
+            cases.append(("shared/geom.goose and shared/text.goose --go-runtime-file",
+                          [(sargs, "shared/geom.goose", "shared/geom.go"), (sargs, "shared/text.goose", "shared/text.go")],
+                          ["shared/geom.go", "shared/text.go", "shared/goose_runtime.go"]))
+            differ, compared = [], 0
+            for label, runs, files in cases:
+                got = []
+                for t in dirs:
+                    ok, log = True, ""
+                    for flags, src, gofile in runs:
+                        code, o, e = run_capture([self.exe, "--stdlib", t / "stdlib", *flags, "--target=go", "-o",
+                                                  gofile, src], cwd=t)
+                        ok, log = ok and code == 0, log + o + e
+                    got.append((ok, log, [tc.decode((t / f).read_bytes()) if ok else "" for f in files]))
+                if not got[0][0] or not got[1][0]:
+                    where = "neither directory" if not got[0][0] and not got[1][0] else "one directory only"
+                    differ.append(f"{label}: compiled in {where}:\n{got[0][1]}{got[1][1]}")
+                    continue
+                compared += 1
+                for f, a, b in zip(files, got[0][2], got[1][2]):
+                    if a != b:
+                        differ.append(f"{label}: {f} differs, first at {first_difference(a, b)}")
+                    elif any(str(t) in a or t.name in a for t in dirs):
+                        differ.append(f"{label}: {f} names the directory it was compiled in")
+            check(f"{compared} compiles in two temporary directories write the same Go, byte for byte",
+                  compared == len(cases) and not differ,
+                  f"{compared} of {len(cases)} compared\n" + "\n".join(differ[:12]))
+        finally:
+            for t in dirs:
+                shutil.rmtree(t, ignore_errors=True)
+
     def library_asm(self, src, tag, out):
         """The code Go makes of the library src: compiled with --target=go
         --library at -O2 and at -O0 into a module of its own, and by Go for
@@ -2770,9 +3118,10 @@ def main():
     bcegaps = sorted((HERE / "go" / "bce_gaps").glob("*.goose"))
     warnings = sorted((HERE / "go" / "warnings").glob("*.goose"))
     # The runtime's sections (issue #19): its package, a library of kernels,
-    # one compiled with --go-unexported, and two programs in one package.
+    # one compiled with --go-unexported, and two programs in one package;
+    # and what makes a generated file reproducible (issue #21).
     runtime_sections = {"runtime": r.runtime_package, "kernels": r.kernels, "unexported": r.unexported_library,
-                        "shared": r.shared}
+                        "shared": r.shared, "reproducible": r.reproducible}
     if args.names:
         runtime_sections = {k: v for k, v in runtime_sections.items() if k in args.names}
         programs = [p for p in programs if p.stem in args.names]
@@ -2787,7 +3136,7 @@ def main():
             ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
                      "test/go/build_only, test/stdlib, test/threads, test/go/export, "
                      "test/go/bce_gaps, test/go/warnings or samples, and no section runtime, kernels, "
-                     "unexported or shared")
+                     "unexported, shared or reproducible")
     if args.bless:
         # Their expected output is the C suite's (test/expected/), a
         # sample's its own, an export library's its Go tests, and a BCE

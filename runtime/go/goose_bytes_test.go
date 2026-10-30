@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -778,6 +779,110 @@ func TestMemory(t *testing.T) {
 			}
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Slices.
+
+// s[lo..hi] (GsSub) of a Go slice an export fn's entry point views in place
+// (GsSliceOf, GsBytesOf), which ends where its allocation on Go's heap ends:
+// an address one past that is no valid Go pointer, which -d=checkptr (and
+// -race, which turns it on) aborts on, and which Go's collector may take
+// for a bad pointer into its heap. So s[s.len..] and s[s.len..s.len] start
+// at gsSubEnd, where no slice of s does, and every other slice where its
+// elements are, empty ones included, as C's are: empty slices at different
+// places stay different slices (issue #39).
+func TestSubAtTheEnd(t *testing.T) {
+	end := unsafe.Pointer(&gsSubEnd)
+	b := make([]uint32, 4)
+	s := GsSliceOf(b[1:4:4]) // ends where b's allocation does
+	if s.Data != unsafe.Pointer(&b[1]) || s.Len != 3 {
+		t.Fatalf("GsSliceOf(b[1:4:4]) = %p, %d; want %p, 3", s.Data, s.Len, &b[1])
+	}
+	// s[s.len..] and s[s.len..s.len] are both this call in the generated
+	// code, whose omitted bound is the length.
+	e := GsSub(s.Data, s.Len, s.Len, s.Len, 4)
+	if e.Data != end || e.Len != 0 {
+		t.Errorf("s[3..3] = %p, %d; want %p (gsSubEnd), 0", e.Data, e.Len, end)
+	}
+	for lo := int64(0); lo <= s.Len; lo++ {
+		for hi := lo; hi <= s.Len; hi++ {
+			want := end
+			if lo < s.Len {
+				want = unsafe.Pointer(&b[1+lo])
+			}
+			if got := GsSub(s.Data, lo, hi, s.Len, 4); got.Data != want || got.Len != hi-lo {
+				t.Errorf("s[%d..%d] = %p, %d; want %p, %d", lo, hi, got.Data, got.Len, want, hi-lo)
+			}
+		}
+	}
+	// The empty slice at the end slices and converts as any empty one.
+	if again := GsSub(e.Data, 0, 0, e.Len, 4); again != e {
+		t.Errorf("s[3..][0..] = %p, %d; want %p, 0", again.Data, again.Len, e.Data)
+	}
+	if xs := GsSliceToSlice[uint32](e); len(xs) != 0 || unsafe.Pointer(unsafe.SliceData(xs)) != end {
+		t.Errorf("s[3..] as a []uint32: %p, %d", unsafe.SliceData(xs), len(xs))
+	}
+	if ss := GsSliceToSlice[GsSlice](e); len(ss) != 0 {
+		t.Errorf("s[3..] as a []GsSlice: %d", len(ss))
+	}
+
+	// The same of bytes: a []byte's, and a string's on Go's heap.
+	bs := make([]byte, 16)
+	u := GsSliceOf(bs[5:16:16])
+	if e := GsSub(u.Data, u.Len, u.Len, u.Len, 1); e.Data != end || e.Len != 0 {
+		t.Errorf("bytes[11..] = %p, %d; want %p, 0", e.Data, e.Len, end)
+	}
+	if e := GsSub(u.Data, 10, 10, u.Len, 1); e.Data != unsafe.Pointer(&bs[15]) || e.Len != 0 {
+		t.Errorf("bytes[10..10] = %p, %d; want %p, 0", e.Data, e.Len, &bs[15])
+	}
+	str := strings.Repeat("goose", 3)
+	v := GsBytesOf(str)
+	if e := GsSub(v.Data, v.Len, v.Len, v.Len, 1); e.Data != end || e.Len != 0 || GsSliceToString(e) != "" {
+		t.Errorf("str[15..] = %p, %d; want %p, 0", e.Data, e.Len, end)
+	}
+
+	// Where the slice would not move, it is where its run is: an empty
+	// run's, nil included, and a run of elements of no bytes.
+	if e := GsSub(nil, 0, 0, 0, 4); e != (GsSlice{}) {
+		t.Errorf("nil[0..0] = %p, %d", e.Data, e.Len)
+	}
+	if e := GsSub(s.Data, 0, 0, 0, 4); e.Data != s.Data || e.Len != 0 {
+		t.Errorf("an empty run's [0..0] = %p, %d; want %p, 0", e.Data, e.Len, s.Data)
+	}
+	if e := GsSub(s.Data, 3, 3, 3, 0); e.Data != s.Data || e.Len != 0 {
+		t.Errorf("zero-size elements' [3..3] = %p, %d; want %p, 0", e.Data, e.Len, s.Data)
+	}
+	runtime.KeepAlive(b)
+	runtime.KeepAlive(bs)
+	runtime.KeepAlive(str)
+}
+
+// subSinks hold slices where Go's collector looks, as variables of the
+// generated code may.
+var subSinks []GsSlice
+
+// Go's collector checks each pointer it finds into its heap, -d=checkptr or
+// not: one past the last object of a span whose objects stop short of its
+// end is a bad pointer to it, which ends the process. The slices at the
+// ends of objects filling several spans, the last of each among them, pass
+// a collection (issue #39).
+func TestSubAtTheEndOfSpans(t *testing.T) {
+	// 48-byte objects, which stop short of the end of their 8 KB spans.
+	objs := make([][]byte, 1000)
+	subSinks = make([]GsSlice, len(objs))
+	for i := range objs {
+		objs[i] = make([]byte, 48)
+		s := GsSliceOf(objs[i])
+		subSinks[i] = GsSub(s.Data, s.Len, s.Len, s.Len, 1)
+	}
+	runtime.GC()
+	for i, e := range subSinks {
+		if e.Data != unsafe.Pointer(&gsSubEnd) || e.Len != 0 {
+			t.Fatalf("object %d's [48..] = %p, %d; want %p, 0", i, e.Data, e.Len, &gsSubEnd)
+		}
+	}
+	subSinks = nil
 }
 
 // ---------------------------------------------------------------------------
