@@ -39,6 +39,11 @@ The compiler is a C++20 single-translation-unit binary (`src/main.cpp` includes 
    ```bash
    python3 test/run_tests.py
    ```
+4. **The command that runs a release's compiler (`cmd/goose`, a module of its own)**:
+   ```bash
+   cd cmd/goose && go vet ./... && go test ./...
+   ```
+   `test/run_go_tests.py release` runs these, and `go generate` through it with nothing but Go (issue #29). Releases themselves are made with `scripts/release.py` ([`docs/releasing.md`](docs/releasing.md)).
 
 ## Critical Go `unsafe` & Runtime Rules
 
