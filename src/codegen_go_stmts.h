@@ -1123,6 +1123,9 @@ inline void CodeGenGo::BindLocal(VarDef *d, Node *init, bool forlocal) {
         GenRelStore(AtVar(name, t), init, false);
         return;
     }
+    // An inlined call's reference parameter (forlocal false) handed a Go
+    // local by reference names the local's place (issue #24).
+    if (!forlocal && BindRefPlace(d, init)) return;
     // A construct or a call delivers into the variable itself, and so does
     // a literal holding relative references, whose offsets are measured from
     // where it stays.

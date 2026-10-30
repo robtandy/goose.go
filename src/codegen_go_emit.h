@@ -320,6 +320,8 @@ inline void CodeGenGo::ResetFnState() {
     fnnextsuffix.clear();
     vnames.clear();
     fvptr.clear();
+    refvars.clear();
+    refplaces.clear();
     scopes.clear();
     dead = false;
     dry = 0;
