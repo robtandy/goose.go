@@ -44,6 +44,15 @@ The programs of test/go/unsupported/ use what this version of the Go backend
 does not compile yet. Each must stop the compile with every `// error:`
 message its source names, where the C backend compiles it.
 
+The programs of test/go/warnings/ hold what the Go backend warns of where
+the C backend does not yet: a shift by a constant count outside its type's
+width (issue #27). Compiled to Go at -O2 and at -O0, and checked with
+`--check --target=go`, each must print the warnings its `// warning:`
+lines declare, one warning line each, in any order, and no other, as
+run_tests.py judges a fixture's; the C backend must check it
+(Runner.warnings). Step 6 leaves those warnings out of the two backends'
+`--check --stacks` reports, which must agree on the rest (GO_WARNING).
+
 The C suite's fixtures of test/stdlib/ and test/threads/ run through both
 backends as the suite's programs do, at -O2 and at -O0 (and with --debug
 where their first line asks run_tests.py for a GS_DEBUG run), with the -D
@@ -134,6 +143,14 @@ sys.path.insert(0, str(UPSTREAM / "scripts"))
 import toolchain as tc
 
 UNSUPPORTED = "is not supported by --target=go yet"
+
+# What the Go backend warns of where the C backend does not yet: a shift by a
+# constant count outside its type's width (issue #27, src/codegen_go_shifts.h),
+# which the C suite's fixtures of the masking do on purpose. The one line of
+# each is left out of the two backends' --stacks reports, which must agree on
+# the rest (Runner.stacks); test/go/warnings/ checks the warnings.
+GO_WARNING = re.compile(r"^\S.*?: warning: shift of [iu]\d+ by -?\d+ is a shift by \d+: .*\n",
+                        re.MULTILINE)
 
 # C suite fixtures --sweep counts as differing by design, with the reason: a
 # recursion that exhausts the native stack, which the C runtime reports as a
@@ -1114,10 +1131,12 @@ class Runner:
         """The data stack counts, from the analysis both backends share,
         which must agree at both levels; with unsupported, not at a level
         whose Go the backend refuses as not supported yet, which is counted
-        instead."""
+        instead. The warnings only the Go backend gives (GO_WARNING) are
+        not part of what they must agree on."""
         for level in ("2", "0"):
             c = self.goose(*flags, f"-O{level}", "--check", "--stacks", src)
             g = self.goose(*flags, f"-O{level}", "--check", "--stacks", "--target=go", src)
+            g = (g[0], g[1], GO_WARNING.sub("", g[2]))
             if unsupported and g[0] != 0 and UNSUPPORTED in g[2]:
                 out.append(("skip", f"--stacks {name} -O{level}", None))
             elif c != g or c[0] != 0:
@@ -1347,6 +1366,41 @@ class Runner:
                             f"--- c (exit {ref[0]}):\n{ref[2]}"))
             else:
                 out.append(("ok", f"overflow {name}{kind}", None))
+        return out
+
+    def warnings(self, src):
+        """A program the Go backend warns of where the C backend does not yet
+        (test/go/warnings/, issue #27): compiled to Go at -O2 and at -O0,
+        where nothing is inlined, and checked with --check --target=go, each
+        compile must succeed and print exactly the warnings its `// warning:`
+        lines declare, one warning line each, in any order, as run_tests.py
+        judges a fixture's; the C backend must check it."""
+        out = []
+        markers = warning_markers(src)
+        if not markers:
+            out.append(("fail", f"warnings {src.name}: no // warning: marker", None))
+            return out
+        for what in ("-O2", "-O0", "--check"):
+            label = f"warnings {src.name} {what}"
+            if what == "--check":
+                args = ["--check", "--target=go"]
+            else:
+                gofile = self.work / f"warnings-{src.stem}{what}.go"
+                gofile.unlink(missing_ok=True)
+                args = [what, "--target=go", "-o", gofile]
+            code, o, e = self.goose(*args, src)
+            missing, extra = unmatched_warnings(markers, warning_lines(o + e))
+            if code != 0 or (what != "--check" and not gofile.exists()):
+                out.append(("fail", f"{label} (exit {code})", o + e))
+            elif missing or extra:
+                out.append(("fail", label,
+                            "".join(f"no warning for marker: {m}\n" for m in missing) +
+                            "".join(f"no marker for warning: {w}\n" for w in extra) + o + e))
+            else:
+                out.append(("ok", label, None))
+        code, o, e = self.goose("--check", src)
+        if code != 0:
+            out.append(("fail", f"warnings {src.name}: the C backend's check fails", o + e))
         return out
 
     def unsupported(self, src):
@@ -2085,6 +2139,7 @@ def main():
     samples = parity_samples()
     exports = sorted(p for p in (HERE / "go" / "export").iterdir() if p.is_dir())
     bcegaps = sorted((HERE / "go" / "bce_gaps").glob("*.goose"))
+    warnings = sorted((HERE / "go" / "warnings").glob("*.goose"))
     if args.names:
         programs = [p for p in programs if p.stem in args.names]
         build_only = [p for p in build_only if p.stem in args.names]
@@ -2092,16 +2147,17 @@ def main():
         exports = [p for p in exports if p.name in args.names]
         samples = [p for p in samples if p.stem in args.names]
         bcegaps = [p for p in bcegaps if p.stem in args.names or "bce_gaps" in args.names]
+        warnings = [p for p in warnings if p.stem in args.names or "warnings" in args.names]
         if not programs and not build_only and not stdlib and not exports and not samples and \
-                not bcegaps:
+                not bcegaps and not warnings:
             ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
                      "test/go/build_only, test/stdlib, test/threads, test/go/export, "
-                     "test/go/bce_gaps or samples")
+                     "test/go/bce_gaps, test/go/warnings or samples")
     if args.bless:
         # Their expected output is the C suite's (test/expected/), a
         # sample's its own, an export library's its Go tests, and a BCE
-        # gap's its annotations.
-        stdlib, exports, samples, bcegaps = [], [], [], []
+        # gap's and a warnings program's their annotations.
+        stdlib, exports, samples, bcegaps, warnings = [], [], [], [], []
     unsupported = [] if args.names else sorted((HERE / "go" / "unsupported").glob("*.goose"))
     sweep = []
     if args.sweep:
@@ -2116,6 +2172,7 @@ def main():
         futures = [pool.submit(r.program, p) for p in programs]
         futures += [pool.submit(r.build_only, p) for p in build_only]
         futures += [pool.submit(r.unsupported, p) for p in unsupported]
+        futures += [pool.submit(r.warnings, p) for p in warnings]
         futures += [pool.submit(r.fixture, p) for p in stdlib]
         futures += [pool.submit(r.sample, p) for p in samples]
         futures += [pool.submit(r.export, p) for p in exports]

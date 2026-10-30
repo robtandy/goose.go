@@ -168,6 +168,14 @@ fn put_le64(o: u8[:], j: i64, v: u64) {
 
 The bytes can come in any order of the OR's operands, at any integer type wide enough, from any `u8` array or slice -- a local `u8[8]` too, which a function that fills and reads it a byte at a time keeps as a Go array, not in its frame -- and a store converts each byte with `as!` (or masks it to 255 first). Every byte's bounds check must be proven away and the index's arithmetic 64-bit; anything else is compiled as it is written, a byte at a time. [`DESIGN.md` §3.8](DESIGN.md#38-wide-loads-and-stores-issue-23) has the details.
 
+Cast each byte before it is shifted, as above: a shift computes at its left operand's type and masks its count to that type's width, so `c[1] << 8` of a `u8` is `c[1] << 0`, and `let v: u32 = b << 16;` stores `b` itself. `--target=go` warns of every shift by a constant count outside its type's width, with the cast that keeps the bits:
+
+```
+prog.goose:9: warning: shift of u8 by 16 is a shift by 0: at u8 the count is masked to 0..7 (§6.2); cast the operand first: `(b as u32) << 16`
+```
+
+The C backend does not warn of it yet: the front end both share lets such a shift pass, and [`docs/upstream/shift-diagnostic.md`](docs/upstream/shift-diagnostic.md) proposes the warning upstream. [`DESIGN.md` §3.10](DESIGN.md#310-shift-counts-issue-27) has the details.
+
 ## Choices without branches: `min`, `max`, `clamp`
 
 Under `--target=go`, std's `min` and `max` of two integers are Go's builtin `min` and `max` (Go 1.21), and any other body or `if` that only chooses among values it computes nothing for -- `clamp`, `abs`, `sign`, a function of your own written as guards or as an if's two returns -- is a temporary assigned each choice under its condition. Go makes a conditional select of each (`CSEL` on arm64, `CMOV` on amd64), so a choice on random data costs what it costs on sorted data, and one stored into an element is one store:
@@ -232,6 +240,7 @@ cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...
 - the code Go makes of the wide loads and stores of `test/go/export/wide/`, for arm64 and for amd64: one load or one store each, of the width its `// asm:` line names; and of the selects of `test/go/export/selects/`: a conditional select each, and no conditional branch but its loop's and its guard's;
 - the reproducers of the bounds-check elimination gaps of `test/go/bce_gaps/`, checked with `goose --check --bce-test`;
 - the frames of the export fns of `test/go/export/inline_refs/`, whose locals are handed to inlined functions by reference: as many slots on the fixed-frame stack as each one's `// frame:` line names, none at all for most;
+- the warnings the Go backend gives where the C backend does not yet, of a shift by a constant count outside its type's width (`test/go/warnings/`), each declared by a `// warning:` line as the C suite declares its own;
 - programs that never end, which it only builds (`test/go/build_only/`), data stack overflow, the constructs this version refuses (`test/go/unsupported/`), and the command line (`-o out.go`, `--go-package`, `--go-build`, `--library`, `--frame-reserve`, `--include` and the positions in what it splices in, `goose run`/`goose build --target=go`).
 
 `--sweep` puts the programs of the C suite's other categories (`test/codegen/`, `test/lifetimes/`, `test/optimizer/`, `test/runtime/`, `test/storage/`, `test/syntax/`, `test/typing/`: every fixture that runs, not the ones that must fail to compile) through the same checks, judged against `test/expected/`, aborts included. A fixture using what the Go backend does not compile yet is counted, not failed, and so is one of the few that differ by design (a recursion that exhausts the native stack, which C reports as an abort and Go as a fatal error). `--fuzz N`, `--fuzz-flow N` and `--fuzz-values N` add random programs of scalar arithmetic, control flow and fixed-size values. `-j N` sets the parallelism, `-v` lists every check, and names run only those programs. [`docs/testing.md`](docs/testing.md#the-go-backends-suite) has the details.

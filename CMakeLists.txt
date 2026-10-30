@@ -49,6 +49,7 @@ add_executable(goose
     src/codegen_go_format.h
     src/codegen_go_threads.h
     src/codegen_go_emit.h
+    src/codegen_go_shifts.h
 )
 
 # Put our src/ before vendor/goose/src so our modified headers (build.h,
