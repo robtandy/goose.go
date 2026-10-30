@@ -67,6 +67,12 @@ func TestKernels(t *testing.T) {
 	if got := TrimLeftBytes([]byte("   ")); len(got) != 0 {
 		t.Errorf("TrimLeftBytes = %q", got)
 	}
+	if got := TagsLen([]string{"ab", "", "cde"}); got != 5 {
+		t.Errorf("TagsLen = %d", got)
+	}
+	if got := TagsLenWithStack(nil, nil); got != 0 {
+		t.Errorf("TagsLenWithStack(nil) = %d", got)
+	}
 	ws := []int64{1, 2, 3, 4}
 	gs := AcquireStackBlock(1)
 	defer ReleaseStackBlock(gs)
@@ -147,6 +153,11 @@ func TestCallerArraysStay(t *testing.T) {
 			var a [8]int64
 			a[2] = 5
 			sink += WeightedSum(a[:], 1)
+		}},
+		{"TagsLen", func() {
+			var a [4]string
+			a[1], a[3] = "two", "four"
+			sink += TagsLen(a[:])
 		}},
 	}
 	for _, c := range stay {
@@ -261,6 +272,14 @@ func directTrimLeftBytes(b []byte) []byte {
 	return unsafe.Slice((*byte)(r.Data), r.Len)
 }
 
+//go:noinline
+func callTagsLen(tags []string) int64 { return TagsLen(tags) }
+
+//go:noinline
+func directTagsLen(tags []string) int64 {
+	return tags_len_g(GsSlice{Data: unsafe.Pointer(unsafe.SliceData(tags)), Len: int64(len(tags))})
+}
+
 func TestCalls(t *testing.T) {
 	xs := []uint32{1, 2, 3}
 	if callSum(xs) != directSum(xs) || callSumWithStack(xs) != directSumWithStack(xs) {
@@ -282,6 +301,9 @@ func TestCalls(t *testing.T) {
 	}
 	if string(callTrimLeftBytes([]byte(" a"))) != string(directTrimLeftBytes([]byte(" a"))) {
 		t.Error("TrimLeft")
+	}
+	if tags := []string{"a", "bc"}; callTagsLen(tags) != directTagsLen(tags) {
+		t.Error("TagsLen")
 	}
 }
 

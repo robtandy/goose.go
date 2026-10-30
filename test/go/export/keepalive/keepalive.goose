@@ -64,6 +64,22 @@ export fn kept_pt(p: const Pt&) -> i64 {
     kept[0].x - kept[0].y
 }
 
+// A Go []string (issue #42), kept on a data stack: the slice of the strings,
+// and each string.
+export fn kept_tags(tags: const (const u8[:])[:]) -> i64 {
+    var kept: (const (const u8[:])[:])[>..] = [];
+    kept.push(tags);
+    var each: (const u8[:])[>..] = [];
+    for t in tags { each.push(t); }
+    collect();
+    var s = 0;
+    for t in kept[0] {
+        for c in t { s += c; }
+    }
+    for t in each { s += t.len; }
+    s
+}
+
 // A slice, kept in a struct.
 export fn held_sum(xs: const i64[:]) -> i64 {
     let h = Held { n: 1, xs: xs };
