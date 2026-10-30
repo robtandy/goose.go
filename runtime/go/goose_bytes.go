@@ -309,19 +309,27 @@ func GsSub(p unsafe.Pointer, lo, hi, n, es int64) GsSlice {
 }
 
 // GsIdx is i, checked to be an index of an array of n elements (GS_IDX).
+// Go inlines it into its caller, where its failure is a panic statement:
+// the one call Go knows does not return, as C knows gs_idxfail does not
+// (GS_NORETURN). So nothing the caller keeps in registers is saved to its
+// stack for the failure, in a loop or not, and past the check Go knows the
+// index is in range (issue #40). A call of a function that panics, as the
+// failure was, Go takes to return.
 func GsIdx(i, n int64, file string, line int) int64 {
 	if uint64(i) >= uint64(n) {
-		GsIdxFail(i, n, file, line)
+		panic(gsIdxErr(i, n, file, line))
 	}
 	return i
 }
 
-// GsIdxFail is a failed bounds check of index i against length n.
+// gsIdxErr is the error of a failed bounds check of index i against length
+// n, which GsIdx panics with: built out of line, so that a check holds its
+// call alone and GsIdx stays within Go's inlining budget.
 //
-//goose:internal
-func GsIdxFail(i, n int64, file string, line int) {
-	panic(&GsError{Msg: "index " + strconv.FormatInt(i, 10) + " out of bounds (length " +
-		strconv.FormatInt(n, 10) + ")", File: file, Line: line})
+//go:noinline
+func gsIdxErr(i, n int64, file string, line int) *GsError {
+	return &GsError{Msg: "index " + strconv.FormatInt(i, 10) + " out of bounds (length " +
+		strconv.FormatInt(n, 10) + ")", File: file, Line: line}
 }
 
 // GsMemEq says whether the n bytes at a and b are the same.

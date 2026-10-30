@@ -56,7 +56,7 @@ func TestAbortMessages(t *testing.T) {
 		{func() { GsAbort(GsESliceLen, "t.goose", 7) }, "goose runtime error: invalid slice length" + at},
 		{func() { GsAbort(GsEPoolSlice, "t.goose", 7) }, "goose runtime error: slice not from this pool" + at},
 		{func() { GsAbort(GsEQBound, "t.goose", 7) }, "goose runtime error: queue limit of zero or less" + at},
-		{func() { GsIdxFail(5, 3, "t.goose", 7) }, "goose runtime error: index 5 out of bounds (length 3)" + at},
+		{func() { panic(gsIdxErr(5, 3, "t.goose", 7)) }, "goose runtime error: index 5 out of bounds (length 3)" + at},
 		{func() { GsIdx(-1, 3, "t.goose", 7) }, "goose runtime error: index -1 out of bounds (length 3)" + at},
 		{func() { GsIdx(3, 3, "t.goose", 7) }, "goose runtime error: index 3 out of bounds (length 3)" + at},
 		{func() { GsDivFail("t.goose", 7) }, "goose runtime error: division by zero" + at},
