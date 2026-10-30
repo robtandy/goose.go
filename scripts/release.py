@@ -257,8 +257,9 @@ def check_built(exe, platform, version, says):
 
 def build_linux(platform, version, work, jobs):
     """Builds the compiler for a Linux platform in an Alpine container of
-    its architecture, statically linked and stripped; returns it, and the
-    files of musl's license, which the archive holds with it."""
+    its architecture, statically linked and stripped, and compiles a
+    program to Go with it there, where it runs; returns it, and the files
+    of musl's license, which the archive holds with it."""
     out = work / platform.replace("/", "-")
     out.mkdir(parents=True, exist_ok=True)
     for f in ("goose", "version", "musl-COPYRIGHT", "build.log"):
@@ -269,6 +270,7 @@ cmake -S /src -B /tmp/build -DCMAKE_BUILD_TYPE=Release "-DGOOSE_VERSION=$GOOSE_V
 cmake --build /tmp/build --target goose -j "$JOBS"
 cp /tmp/build/goose /out/goose
 /out/goose version > /out/version
+/out/goose --target=go --stdlib /src/vendor/goose/stdlib -o /tmp/smoke.go /src/test/go/programs/print.goose
 musl=$(apk list -I musl 2>/dev/null | sed -n 's/^musl-\\([0-9.]*\\)-r.*/\\1/p')
 wget -q -O /out/musl-COPYRIGHT "{MUSL_COPYRIGHT}$musl"
 chown -R "$OWNER" /out || true
