@@ -168,6 +168,22 @@ fn put_le64(o: u8[:], j: i64, v: u64) {
 
 The bytes can come in any order of the OR's operands, at any integer type wide enough, from any `u8` array or slice -- a local `u8[8]` too, which a function that fills and reads it a byte at a time keeps as a Go array, not in its frame -- and a store converts each byte with `as!` (or masks it to 255 first). Every byte's bounds check must be proven away and the index's arithmetic 64-bit; anything else is compiled as it is written, a byte at a time. [`DESIGN.md` §3.8](DESIGN.md#38-wide-loads-and-stores-issue-23) has the details.
 
+## Locals handed to inlined functions by reference
+
+A function the optimizer inlines -- an `inline fn`, or a small helper -- binds each by-reference parameter at the start of its body. Under `--target=go`, one bound to a local, or to a field or an element of one, is that local: the body reads and writes it where it is, and the local stays a Go local, which Go keeps in a register, where a local whose address is taken moves into its function's frame on the fixed-frame stack:
+
+```goose
+inline fn bump(x: i64&) { x += 1; }
+
+fn count(n: i64) -> i64 {
+    var c = 0;
+    for i in n { bump(c); }   // c_g = c_g + 1, c_g a Go local
+    c
+}
+```
+
+Only where the body uses the reference as a value -- hands it to a call that is not inlined, stores or returns it, compares its identity -- is the local's address taken, and that local alone takes a slot in the frame. [`DESIGN.md` §3.6](DESIGN.md#36-the-fixed-frame-stack-gsframe) has the details.
+
 ## Testing
 
 ```bash
@@ -183,6 +199,7 @@ cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...
 - every sample in `samples/` but those using the C-only `gfx`, `ui`, `audio` and `physics` modules, run in a directory of their own with their arguments and stdin, against `samples/expected/`;
 - the `export fn` libraries of `test/go/export/`, whose Go tests call their entry points (with `testing.AllocsPerRun` checking that a call allocates nothing, and a `TestMain` checking that importing the package mapped nothing);
 - the code Go makes of the wide loads and stores of `test/go/export/wide/`, for arm64 and for amd64: one load or one store each, of the width its `// asm:` line names;
+- the frames of the export fns of `test/go/export/inline_refs/`, whose locals are handed to inlined functions by reference: as many slots on the fixed-frame stack as each one's `// frame:` line names, none at all for most;
 - programs that never end, which it only builds (`test/go/build_only/`), data stack overflow, the constructs this version refuses (`test/go/unsupported/`), and the command line (`-o out.go`, `--go-package`, `--go-build`, `--library`, `--frame-reserve`, `--include` and the positions in what it splices in, `goose run`/`goose build --target=go`).
 
 `--sweep` puts the programs of the C suite's other categories (`test/codegen/`, `test/lifetimes/`, `test/optimizer/`, `test/runtime/`, `test/storage/`, `test/syntax/`, `test/typing/`: every fixture that runs, not the ones that must fail to compile) through the same checks, judged against `test/expected/`, aborts included. A fixture using what the Go backend does not compile yet is counted, not failed, and so is one of the few that differ by design (a recursion that exhausts the native stack, which C reports as an abort and Go as a fatal error). `--fuzz N`, `--fuzz-flow N` and `--fuzz-values N` add random programs of scalar arithmetic, control flow and fixed-size values. `-j N` sets the parallelism, `-v` lists every check, and names run only those programs. [`docs/testing.md`](docs/testing.md#the-go-backends-suite) has the details.
