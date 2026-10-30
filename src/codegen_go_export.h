@@ -19,10 +19,13 @@
 //   and given back as it returns (ReleaseStackBlock). Both take Go's own
 //   values, which they view in place: a u8[:] as a []byte, a const u8[:] as
 //   a string or a []byte, any other T[:] as a []T, a T& as a *T, a scalar
-//   or a fixed-size value as its Go type. A const u8[:] result is a []byte
-//   viewing what the slice does. In a library, either starts the package at
-//   its first call (gsLibStart). A call on a block turns panic on fault on
-//   for itself only, on its caller's goroutine.
+//   or a fixed-size value as its Go type, and keep each argument viewing
+//   Go's memory alive until the call returns (runtime.KeepAlive), which the
+//   Goose code may hold only where the collector does not look. A const
+//   u8[:] result is a []byte viewing what the slice does. In a library,
+//   either starts the package at its first call (gsLibStart). A call on a
+//   block turns panic on fault on for itself only, on its caller's
+//   goroutine.
 // * An --include file is Go source: its package clause and build
 //   constraints are dropped, its imports join the generated file's, and the
 //   rest follows the program, each run of lines between blank ones under a
@@ -351,9 +354,10 @@ inline void CodeGenGo::EmitExports() {
             for (auto k : calleesof[f]) work.push_back(k);
         }
         // The parameters: the Go types the entry points take, and the Goose
-        // values they hand the function.
+        // values they hand the function; and those that view Go's memory,
+        // which the call keeps alive (kept).
         set<string> taken;
-        vector<string> tparams, params, fwd, args;
+        vector<string> tparams, params, fwd, args, kept;
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             auto pt = sp->argtypes[i];
             auto pn = GoExportParam(i < sf->params.size() ? sf->params[i].name : string_view(), taken);
@@ -363,13 +367,16 @@ inline void CodeGenGo::EmitExports() {
                 tparams.push_back(cat(tp, " GsBytes"));
                 gt = tp;
                 arg = cat("GsBytesOf(", pn, ")");
+                kept.push_back(pn);
             } else if (pt->kind == TY_SLICE) {
                 gt = IsU8(pt->sub) ? string("[]byte") : cat("[]", GoT(pt->sub, ln));
                 arg = cat("GsSliceOf(", pn, ")");
+                kept.push_back(pn);
             } else if (IsPlainRef(pt) && !pt->ref->optional && IsFix(pt->ref->sub)) {
                 auto st = GoT(pt->ref->sub, ln);
                 gt = cat("*", st);
                 arg = RefFromAddr(pt, cat("gsEscape(unsafe.Pointer(", pn, "))"));
+                kept.push_back(pn);
             } else if (IsFix(pt) && pt->kind != TY_REF) {
                 gt = GoT(pt, ln);
                 arg = pn;
@@ -400,6 +407,20 @@ inline void CodeGenGo::EmitExports() {
         auto ret = [&](const string &x) {
             if (rt.empty()) return x;
             return cat("return ", conv.empty() ? x : cat(conv, "(", x, ")"));
+        };
+        // The call x of the function, as the entry point's last statements.
+        // Go keeps a value alive only up to its last use, and a caller's last
+        // use of an argument may be the call itself, where the Goose code may
+        // keep what the argument views only where the collector does not
+        // look (a data stack, the fixed-frame stack, the bytes of a value):
+        // every argument viewing Go's memory is kept alive until the call
+        // returns (issue #30).
+        auto finish = [&](const string &x) {
+            if (kept.empty()) return cat("\t", ret(x), "\n");
+            auto s = rt.empty() ? cat("\t", x, "\n") : cat("\tgs_r := ", conv.empty() ? x : cat(conv, "(", x, ")"), "\n");
+            for (auto &k : kept) Append(s, "\truntime.KeepAlive(", k, ")\n");
+            if (!rt.empty()) s += "\treturn gs_r\n";
+            return s;
         };
         auto stacks = ProgramStacksOf(*this, { sp });
         auto takesgs = si.needssp || si.needsgs || (specnum.count(sp) && gsneeds[specnum[sp]]);
@@ -470,7 +491,7 @@ inline void CodeGenGo::EmitExports() {
         if (stacks) Append(xcode, "\tgs.EnsureStacks(", stacks, ")\n");
         else if (!takesgs) xcode += "\t_ = gs\n";
         if (inst) Append(xcode, "\tif gs.Gl == nil {\n\t\t", enterall, "(gs)\n\t}\n");
-        Append(xcode, "\t", ret(call), "\n}\n\n");
+        Append(xcode, finish(call), "}\n\n");
         Append(xcode, "// ", name, " runs ", where, "\n",
                !takesgs ? string("// with no data stacks.\n")
                         : string("// on a block of data stacks from the runtime's pool (AcquireStackBlock), which\n"
@@ -479,7 +500,7 @@ inline void CodeGenGo::EmitExports() {
                doc, "func ", name, tps, "(", join(params, ""), ")", retsig, " {\n", start);
         if (!takesgs) {
             // Nothing of the block's is used: the function is called itself.
-            Append(xcode, "\t", ret(cat(si.name, "(", join(args, ""), ")")), "\n}\n\n");
+            Append(xcode, finish(cat(si.name, "(", join(args, ""), ")")), "}\n\n");
             continue;
         }
         Append(xcode, "\tgs := AcquireStackBlock(", stacks, ")\n");
