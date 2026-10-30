@@ -258,6 +258,9 @@ inline void CodeGenGo::GenBlock(Block *b, const GoDst &d) {
 // Conditionals.
 
 inline void CodeGenGo::GenIf(IfExpr *fi, const GoDst &d) {
+    // A choice between values it computes nothing for: a select
+    // (codegen_go_select.h).
+    if (GenSelectIf(fi, d)) return;
     // A && or || condition, or an inlined bool call, as C branches on it
     // (IfExpr::CgAny), but where C hoists the arms' common check.
     auto c = BranchChain(fi->cond) && !HoistsCheck(fi) ? GenBranchTruth(fi->cond) : GenTruth(fi->cond);
@@ -446,6 +449,10 @@ inline void CodeGenGo::EmitIbBody(InlineBlock *ib, const GoDst &d) {
         }
         return GenUnreached([&] { GenInlineBlock(ib, d); });
     }
+    // A body that only chooses among values -- std's min, max, clamp --
+    // is Go's min or max, or assignments Go makes selects of, where the
+    // switch's exits would be branches (codegen_go_select.h).
+    if (!named && GenSelectIb(ib, d, first)) return;
     OpenLabeled(SC_IB);
     auto si = (int)scopes.size() - 1;
     scopes[si].ibsf = ib->sf;

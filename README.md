@@ -168,6 +168,37 @@ fn put_le64(o: u8[:], j: i64, v: u64) {
 
 The bytes can come in any order of the OR's operands, at any integer type wide enough, from any `u8` array or slice -- a local `u8[8]` too, which a function that fills and reads it a byte at a time keeps as a Go array, not in its frame -- and a store converts each byte with `as!` (or masks it to 255 first). Every byte's bounds check must be proven away and the index's arithmetic 64-bit; anything else is compiled as it is written, a byte at a time. [`DESIGN.md` §3.8](DESIGN.md#38-wide-loads-and-stores-issue-23) has the details.
 
+## Choices without branches: `min`, `max`, `clamp`
+
+Under `--target=go`, std's `min` and `max` of two integers are Go's builtin `min` and `max` (Go 1.21), and any other body or `if` that only chooses among values it computes nothing for -- `clamp`, `abs`, `sign`, a function of your own written as guards or as an if's two returns -- is a temporary assigned each choice under its condition. Go makes a conditional select of each (`CSEL` on arm64, `CMOV` on amd64), so a choice on random data costs what it costs on sorted data, and one stored into an element is one store:
+
+```goose
+// Branch-free: three conditional selects and one store an element.
+fn clamp_pairs(o: i64[:], a: const i64[:], b: const i64[:]) {
+    if o.len < a.len || b.len < a.len { return; }
+    for x, i in a { o[i] = clamp(max(x, b[i]), -1000, 1000); }
+}
+```
+
+```go
+// The loop's body in the Go, max's arguments bound first, then clamp's:
+var x_g_2 int64
+var a_g_2 int64 = x_g
+var t5 int64 = i_g
+var b_g_2 int64 = (*(*int64)(unsafe.Add(b_g.Data, t5*8)))
+x_g_2 = max(a_g_2, b_g_2)
+var t6 int64 = x_g_2
+if int64(1000) < x_g_2 {
+	t6 = int64(1000)
+}
+if x_g_2 < int64(-1000) {
+	t6 = int64(-1000)
+}
+(*t4) = t6
+```
+
+The conditions and values must be scalar variables and constants, comparisons of them, `!` and negations (but for an integer's under `--debug`, which can fail); a choice that calls or reads an element is compiled as it is written. Floats keep std's choice (`max(1, NaN)` is 1), which Go's builtins do not make, and Go compiles a float's choice to a branch. [`DESIGN.md` §3.9](DESIGN.md#39-selects-issue-26) has the details, and the bounds-check elimination gaps the same kernels showed are written up in [`test/go/bce_gaps/`](test/go/bce_gaps/README.md).
+
 ## Locals handed to inlined functions by reference
 
 A function the optimizer inlines -- an `inline fn`, or a small helper -- binds each by-reference parameter at the start of its body. Under `--target=go`, one bound to a local, or to a field or an element of one, is that local: the body reads and writes it where it is, and the local stays a Go local, which Go keeps in a register, where a local whose address is taken moves into its function's frame on the fixed-frame stack:
@@ -198,7 +229,8 @@ cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...
 - the C suite's `test/stdlib/` and `test/threads/` fixtures;
 - every sample in `samples/` but those using the C-only `gfx`, `ui`, `audio` and `physics` modules, run in a directory of their own with their arguments and stdin, against `samples/expected/`;
 - the `export fn` libraries of `test/go/export/`, whose Go tests call their entry points (with `testing.AllocsPerRun` checking that a call allocates nothing, and a `TestMain` checking that importing the package mapped nothing);
-- the code Go makes of the wide loads and stores of `test/go/export/wide/`, for arm64 and for amd64: one load or one store each, of the width its `// asm:` line names;
+- the code Go makes of the wide loads and stores of `test/go/export/wide/`, for arm64 and for amd64: one load or one store each, of the width its `// asm:` line names; and of the selects of `test/go/export/selects/`: a conditional select each, and no conditional branch but its loop's and its guard's;
+- the reproducers of the bounds-check elimination gaps of `test/go/bce_gaps/`, checked with `goose --check --bce-test`;
 - the frames of the export fns of `test/go/export/inline_refs/`, whose locals are handed to inlined functions by reference: as many slots on the fixed-frame stack as each one's `// frame:` line names, none at all for most;
 - programs that never end, which it only builds (`test/go/build_only/`), data stack overflow, the constructs this version refuses (`test/go/unsupported/`), and the command line (`-o out.go`, `--go-package`, `--go-build`, `--library`, `--frame-reserve`, `--include` and the positions in what it splices in, `goose run`/`goose build --target=go`).
 
