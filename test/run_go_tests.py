@@ -1871,6 +1871,32 @@ class Runner:
             same = files[("order", "geom")] == files[("order", "text")]
             out.append(("ok" if same else "fail", "shared: the runtime file is the same whichever program is first",
                         None if same else "geom then text, and text then geom, wrote other files"))
+        # --go-build constrains a program's own file, never the runtime's,
+        # which is built with whichever programs are: geom.go only with
+        # -tags goose_geom, text.go always, and the package vets either way.
+        mod = self.work / "shared-go-build"
+        shutil.rmtree(mod, ignore_errors=True)
+        mod.mkdir(parents=True)
+        ok, detail = True, ""
+        for prog, extra in (("geom", ["--go-build", "goose_geom"]), ("text", [])):
+            code, o, e = self.goose("--target=go", "--library", "--go-package", "shared", *extra, "--go-runtime-file",
+                                    mod / "goose_runtime.go", "-o", mod / f"{prog}.go", d / f"{prog}.goose")
+            ok, detail = ok and code == 0, detail + o + e
+        if ok:
+            rt = (mod / "goose_runtime.go").read_text(encoding="utf-8")
+            geom = (mod / "geom.go").read_text(encoding="utf-8")
+            ok = "//go:build" not in rt and geom.startswith("//go:build goose_geom\n\n")
+            detail = "the runtime file has a constraint, or geom.go has none"
+            r = subprocess.run([self.go, "mod", "init", "goosetest/sharedbuild"], cwd=mod, env=go_env(),
+                               capture_output=True)
+            for tags in ([], ["-tags=goose_geom"]):
+                if not ok:
+                    break
+                r = subprocess.run([self.go, "vet"] + tags + ["./..."], cwd=mod, env=go_env(), capture_output=True)
+                text = tc.decode(r.stdout) + tc.decode(r.stderr)
+                ok, detail = r.returncode == 0 and not text.strip(), f"go vet {' '.join(tags)}: {text}"
+        out.append(("ok" if ok else "fail", "shared: --go-build constrains a program's file, not the runtime's",
+                    None if ok else detail))
         # Settings of its own refused, and a package of its own, before any
         # file is written.
         mod = self.work / "shared-go-runtime-embed-geom"
