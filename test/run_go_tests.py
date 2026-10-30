@@ -2243,6 +2243,18 @@ class Runner:
         code, o, e, kept = checked("--target=go", "--check", "--go-package", "geese")
         check("--check: a file with \\r\\n line breaks is stale", code == 1 and kept and "line breaks" in e,
               f"exit {code}\n{o}{e}")
+        # The program checked as the compile that writes the file checks it:
+        # one with no fn main() and no export fn is refused, which a check
+        # of the program alone lets pass.
+        nomain = work / "nomain.goose"
+        tc.write_text(nomain, "fn helper() -> i64 { 1 }\n")
+        for args in (["--target=go"], ["--target=go", "--check"], ["check", "--target=go"]):
+            code, o, e = self.goose(*args, "-o", work / "nomain.go", nomain)
+            check(f"goose {' '.join(args)} -o nomain.go refuses a program with no fn main()",
+                  code == 1 and "needs exactly one global fn main()" in e, f"exit {code}\n{o}{e}")
+        code, o, e = self.goose("check", "--target=go", nomain)
+        check("goose check --target=go, with no -o, checks a file with no fn main() on its own",
+              code == 0 and not o and not e, f"exit {code}\n{o}{e}")
         # No file at all: stale, and still none.
         gofile.unlink()
         code, o, e, kept = checked("--target=go", "--check", "--go-package", "geese")
