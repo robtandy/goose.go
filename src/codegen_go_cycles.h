@@ -20,10 +20,12 @@
 //   size, use and nesting, so that a callee is inlined into a recursive fn
 //   where it would be into any other, and the copies are folded as any are.
 //   A callee in a cycle never is (its InlineInfo::noinline, which Scan
-//   gives every member of one); nor is a callee that takes a data stack
-//   (a nonfixed value, a value of more than NATIVE_VALUE_LIMIT bytes, which
-//   C holds on one, a print or a str, a spawn or a queue), which this pass
-//   marks so for its walk. So every activation of a cycle holds the stacks
+//   gives every member of one); nor is a callee that takes a data stack,
+//   by the rules the backends take one by (their CollectSpecs): a nonfixed
+//   value, a value or a slice literal's array of more than
+//   NATIVE_VALUE_LIMIT bytes, which C holds on one, a variable-mode ADT
+//   adapted to the fixed-mode one, a print or a str, a spawn or a queue.
+//   This pass marks those so for its walk. So every activation of a cycle holds the stacks
 //   it held, at the same indices: the static stack count of §10.3 is what
 //   it was, and the two backends report the same stacks (--stacks).
 // * Only the inlining is new: a self-call's base case was copied already
@@ -77,9 +79,11 @@ inline int64_t GoCycleValueBound(TypeExpr *t, int depth = 0) {
             return std::min(len + e * a->size, over);
         }
         case TY_STRUCT: {
+            // An empty struct takes a byte, as every slot does.
             auto si = t->struc->inst;
             if (!si || si->failed || si->sclass != SC_FIXED || si->frameobj) return -1;
-            return runs(RunsOf(si), 0);
+            auto b = runs(RunsOf(si), 0);
+            return b < 0 ? -1 : std::max<int64_t>(b, 1);
         }
         case TY_ENUM: {
             auto ei = t->enu->inst;
@@ -106,20 +110,36 @@ inline bool GoBuiltinTakesNoStack(int b) {
     }
 }
 
-// Whether nothing a call of sp runs takes a data stack: sp is in no cycle,
-// and its body, and those of the functions it calls, hold no value of a
-// type that is not fixed-size or is larger than NATIVE_VALUE_LIMIT -- no
-// parameter, result, local, binding or temporary -- and make no call of a
-// builtin that takes one. A function of no body is an extern fn, whose call
-// takes none. memo holds what is known: 1 while sp is being looked at, 2
-// for a function that takes none, 3 for one that may.
-inline bool GoTakesNoStack(FnSpec *sp, unordered_map<FnSpec *, int> &memo) {
+// Whether nothing a call of sp runs takes a data stack, by the rules the
+// backends take one by (a body's needssp: CodeGenGo::CollectSpecs, and C's
+// CodeGen::CollectSpecs, which this must keep up with). sp is in no cycle,
+// and neither its body nor those of the functions it calls hold a value of
+// a type that is not fixed-size or is larger than NATIVE_VALUE_LIMIT -- a
+// parameter, a result, a local, a binding, a temporary, a call's result as
+// the callee gives it -- nor a slice literal whose array is as large, nor a
+// value adapted to an ADT from one that is not fixed-size (AdtFrom); nor
+// do they call a builtin that takes one, or dispatch on a variable-mode ADT
+// to a case function taking its variant by value. A function of no body is
+// an extern fn, whose call takes none, but one binding the program's own
+// export fn, whose function it calls (ExportOfExtern). memo holds what is
+// known: 1 while sp is being looked at, 2 for a function that takes none,
+// 3 for one that may.
+inline bool GoTakesNoStack(Ast &ast, FnSpec *sp, unordered_map<FnSpec *, int> &memo) {
     if (auto it = memo.find(sp); it != memo.end()) return it->second == 2;
     memo[sp] = 1;
     auto small = [](TypeExpr *t) {
         if (!t) return true;
         auto b = GoCycleValueBound(t);
         return b >= 0 && b <= CodeGenGo::NATIVE_VALUE_LIMIT;
+    };
+    auto takesnone = [&](FnSpec *k) {
+        if (k->body) return GoTakesNoStack(ast, k, memo);
+        if (!k->sf->isextern) return false;
+        if (k->sf->dylib.empty())
+            for (auto sf : ast.functions)
+                if (sf->isexport && sf->cname == k->sf->cname && sf->specs.size() == 1)
+                    return GoTakesNoStack(ast, sf->specs[0], memo);
+        return true;
     };
     auto ok = sp->body && !sp->incycle && !sp->sf->isrec && !sp->sf->isthread;
     for (auto t : sp->argtypes) ok = ok && small(t);
@@ -136,15 +156,46 @@ inline bool GoTakesNoStack(FnSpec *sp, unordered_map<FnSpec *, int> &memo) {
             var(fl->idxdef);
         }
         if (auto m = Is<MatchExpr>(n)) for (auto &arm : m->arms) var(arm.binder);
+        // A slice literal still builds a fixed array to point at, which C
+        // holds on a data stack where it is larger than NATIVE_VALUE_LIMIT.
+        if (auto al = Is<ArrayLit>(n); al && al->exprtype && al->exprtype->kind == TY_SLICE) {
+            auto e = GoCycleValueBound(al->exprtype->sub);
+            ok = ok && e >= 0 && GoLitCount(al) <= CodeGenGo::NATIVE_VALUE_LIMIT / std::max<int64_t>(e, 1);
+        }
+        // A value adapted to an ADT it does not arrive as -- a call's result,
+        // an inlined body's, a reference's pointee included -- is built as
+        // the type it arrives as first.
+        if (n->exprtype && n->exprtype->kind == TY_ENUM) {
+            TypeExpr *from = nullptr;
+            if (auto c = Is<Call>(n)) {
+                if (c->fvbody) from = c->fvbody->exprtype;
+                else if (c->builtin != B_COPY && !c->rettypes.empty()) from = c->rettypes[0];
+            } else if (auto ib = Is<InlineBlock>(n)) {
+                if (ib->spec && !ib->spec->rets.empty()) from = ib->spec->rets[0];
+            }
+            if (from && IsPlainRef(from)) from = from->ref->sub;
+            if (from && (from->kind == TY_VARIANT || from->kind == TY_ENUM)) ok = ok && small(from);
+        }
         if (auto c = Is<Call>(n)) {
             for (auto t : c->rettypes) ok = ok && small(t);
             for (auto v : c->fvparams) var(v);
             if (!c->fmtspecs.empty()) ok = false;
             if (c->builtin >= 0) ok = ok && GoBuiltinTakesNoStack(c->builtin);
             else if (!c->spec) ok = ok && !c->dispatch.empty();
-            else if (c->spec->body) ok = ok && GoTakesNoStack(c->spec, memo);
-            else ok = ok && c->spec->sf->isextern;
-            for (auto k : c->dispatch) ok = ok && GoTakesNoStack(k, memo);
+            else ok = ok && takesnone(c->spec);
+            for (auto k : c->dispatch) ok = ok && takesnone(k);
+            // A variable-mode scrutinee is copied for the case functions that
+            // take their variant by value, even where it arrives by reference
+            // (C's CollectSpecs, EmitDispatch).
+            if (!c->dispatch.empty()) {
+                auto an = c->ArgNodes();
+                auto pos = c->dispatcharg;
+                auto st = pos >= 0 && pos < (int)an.size() ? an[pos]->exprtype : nullptr;
+                if (st && st->kind == TY_REF) st = st->ref->sub;
+                if (!st || (st->kind == TY_ENUM && st->enu->varmode))
+                    for (auto k : c->dispatch)
+                        ok = ok && pos >= 0 && pos < (int)k->argtypes.size() && k->argtypes[pos]->kind == TY_REF;
+            }
         }
         if (ok) RunChildren(n, walk);
     };
@@ -167,7 +218,7 @@ inline void InlineIntoCycles(Optimizer &o) {
     vector<pair<FnSpec *, Optimizer::InlineInfo>> kept;
     for (auto sp : o.postorder) {
         auto &info = o.inlineinfo[sp];
-        if (info.noinline || GoTakesNoStack(sp, memo)) continue;
+        if (info.noinline || GoTakesNoStack(o.ast, sp, memo)) continue;
         kept.push_back({ sp, info });
         info.noinline = true;
         info.c_inlinable = false;

@@ -17,7 +17,9 @@ namespace goose {
 // result built as a type of its own. It needs the block alone (needsgs)
 // wherever it reaches a stack through what it is handed: a fat or pool
 // reference, a global's stack. Either goes for a function that calls one
-// that does.
+// that does. GoTakesNoStack (codegen_go_cycles.h), which decides before
+// the backend runs which helpers it may inline into a recursive cycle,
+// follows the same rules for needssp, and must keep up with them.
 inline void CodeGenGo::CollectSpecs() {
     for (auto sp : ast.fnspecs)
         if (sp->live && sp->body) livespecs.push_back(sp);
