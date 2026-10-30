@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -53,7 +54,9 @@ func TestOneBlockForBoth(t *testing.T) {
 	}
 }
 
-// Calls from many goroutines at once, of both programs.
+// Calls from many goroutines at once, of both programs: of the entry points
+// that write no global, which every call shares (README.md), each on a
+// block of data stacks of its own where it takes one (PtTextLen).
 func TestConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
@@ -61,7 +64,8 @@ func TestConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 50; i++ {
-				if PathLen2([]int64{0, 0, 0, 2}) != 4 || Distinct("p q p") != 2 || LastPos("xy") != 1002 {
+				if PtTextLen(int64(i), 7) != int64(len(fmt.Sprintf("Pt { %d, 7 }", i))) || LastPos("xy") != 1002 ||
+					CheckedDiv(int64(i), 1) != int64(i) {
 					t.Error("a concurrent call went wrong")
 					return
 				}
