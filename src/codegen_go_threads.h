@@ -4,7 +4,8 @@
 // (goose_spec.md §11.2), and the program instances a program with workers
 // keeps its globals in (implementation.md §6.3, §6.8), as the C backend has
 // them (codegen_builtins.h, codegen_emit.h) and the Go runtime runs them
-// (go_runtime_threads, codegen_go_runtime.h).
+// (go_runtime_threads, codegen_go_runtime.h), as does a program whose export
+// fns' calls reach a global's own data stack (issue #25).
 //
 // * A worker is a goroutine running its thread program on a GsStackBlock of
 //   its own, its own data stacks, fixed-frame stack and program instance
@@ -14,18 +15,22 @@
 //   of the worker's own, and the worker's thunk (gsTmain_<worker>) unpacks
 //   it, the resizable values onto fresh stacks of its block, before it runs
 //   the body.
-// * In a program with workers, every global that is not read-only static
-//   data (CStaticInit) is a member of gsGlobals, of which each thread
-//   program has an instance of its own, and every function that names one
-//   reaches it through the block it is handed: gs_gl := (*gsGlobals)(gs.Gl),
-//   one load at its start. A global's dedicated stack is the stack of the
-//   block its instance names (gs_gl.gsGStk_<name>). Main's instance is the
-//   static gsGlobalsMain. A program without workers keeps its globals in
-//   package variables, as it always did.
-// * The export fns' entry points of a program with workers run each call on
-//   an instance of the block's own (EnsureInstanceFn), so that goroutines
-//   calling them at once share no globals: a copy of the package's instance
-//   of the globals the export's calls reach, taken as the call starts.
+// * In a program with instances -- one with workers, or one whose export
+//   fns' calls reach a global's own data stack (issue #25) -- every global
+//   that is not read-only static data (CStaticInit) is a member of
+//   gsGlobals, of which each thread program has an instance of its own, and
+//   every function that names one reaches it through the block it is
+//   handed: gs_gl := (*gsGlobals)(gs.Gl), one load at its start. A global's
+//   dedicated stack is the stack of the block its instance is on, at the
+//   index its instance names (gs_gl.gsGStk_<name>) in a program with
+//   workers, and at the main program's (gsGStk_<name>) in one without.
+//   Main's instance is the static gsGlobalsMain. Any other program keeps
+//   its globals in package variables, as it always did.
+// * The export fns' entry points of a program with instances run each call
+//   on an instance of the block's own (EnsureInstanceFn), so that
+//   goroutines calling them at once share no globals: a copy of the
+//   package's instance of the globals the export's calls reach, taken as
+//   the call starts.
 // * A queue is a GsQueue per element type, holding the image of each value
 //   put: a fixed-size value's bytes, a bytes value's image, a resizable's
 //   count, its frame object's fixed fields and its elements (EmitRzImage).
@@ -51,7 +56,7 @@ inline void CodeGenGo::FindWorkers() {
 // A finished body that names the instance reads it from its block first,
 // once: whether it does (the function then takes the block, ComputeGsNeeds).
 inline bool CodeGenGo::UsesGl(string &fb) {
-    if (!workers) return false;
+    if (!instances) return false;
     unordered_map<string, int> uses;
     for (size_t pos = 0; pos < fb.size();) {
         auto nl = fb.find('\n', pos);
@@ -623,16 +628,18 @@ inline vector<VarDef *> &CodeGenGo::InstanceGlobals(FnSpec *entry) {
     for (auto d : gl)
         if (PrefVar(d) || HoldsFatRef(d->type))
             Unsupported(entry->sf->line, cat("export fn ", entry->sf->name, ", whose calls reach the global ", d->name,
-                                             ", which holds a reference to a data stack, in a program with workers,"));
+                                             ", which holds a reference to a data stack, where each call runs on a "
+                                             "program instance of its block's own,"));
     return gl;
 }
 
 // The function giving a block a program instance of its own for a call of
 // the export fn sp (gsEnter_<export>), or of any export, where sp is null
 // (gsEnter): copies of the package's globals they reach, from the package's
-// instance on the block that main's program (or the package's init) runs,
+// instance on the block that main's program (or the library's start) runs,
 // a value on a stack of its own landing on the block's stack the main
-// program's layout gives it (gsGStk_<name>).
+// program's layout gives it (gsGStk_<name>), whose index the instance holds
+// too in a program with workers.
 inline string CodeGenGo::EnsureInstanceFn(FnSpec *sp) {
     if (auto it = instfns.find(sp); it != instfns.end()) return it->second;
     auto name = Unique(sp ? cat("gsEnter_", sinfo.at(sp).name) : string("gsEnter"));
@@ -651,8 +658,11 @@ inline string CodeGenGo::EnsureInstanceFn(FnSpec *sp) {
     // which the value there tops, onto the block's stack of it, newstart
     // pointing at them.
     auto copyrun = [&](const string &stkfield, const string &start, const string &newstart) {
-        auto k = stkfield.substr(6);   // The main program's index of it, a constant.
-        L(stkfield, " = ", k);
+        // The main program's index of it, a constant, which the instance's
+        // member is set to where it has one.
+        auto member = stkfield.compare(0, 6, "gs_gl.") == 0;
+        auto k = member ? stkfield.substr(6) : stkfield;
+        if (member) L(stkfield, " = ", k);
         L(Top(k), " = gs.Base[", k, "]");
         auto n = T();
         Decl(n, "int64", cat("int64(uintptr(gsMainBlock.Stks[", k, "]) - uintptr(", start, "))"));
