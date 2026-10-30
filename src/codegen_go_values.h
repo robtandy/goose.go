@@ -6,12 +6,23 @@
 namespace goose {
 
 // One string constant per source file, which an abort names with the line
-// (gs_file<N> in the C backend).
+// (gs_file<N> in the C backend): the file as the compile names it, but for
+// one of another package than the program's -- the standard library's, a
+// fetched package's -- which is named by its place in that package, after
+// the package's name (stdlib/std.goose), and so the same wherever the
+// package is: its path is this machine's, which the Go would otherwise hold
+// (issue #21). The C backend names such a file by its path.
 inline string CodeGenGo::FileRef(Line l) {
     auto it = filerefs.find(l.fileidx);
     if (it == filerefs.end()) {
         auto f = l.fileidx >= 0 && l.fileidx < (int)ast.sources.size()
                      ? ast.sources[l.fileidx].first : string("?");
+        auto pkg = l.fileidx >= 0 && l.fileidx < (int)ast.filepkg.size() ? ast.filepkg[l.fileidx] : 0;
+        if (pkg > 0 && pkg < (int)ast.packages.size()) {
+            auto &p = ast.packages[pkg];
+            if (!p.root.empty() && f.size() > p.root.size() && f.compare(0, p.root.size(), p.root) == 0)
+                f = cat(p.stdlib ? "stdlib" : p.name, "/", f.substr(p.root.size()));
+        }
         for (auto &c : f) if (c == '\\') c = '/';
         auto name = Unique(cat("gsFile", filerefs.size()));
         Append(filedecls, "const ", name, " = ", GoStr(f), "\n");

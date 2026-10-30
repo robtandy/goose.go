@@ -53,6 +53,7 @@
 #include "codegen_go_export.h"
 #include "codegen_go_format.h"
 #include "codegen_go_emit.h"
+#include "codegen_go_check.h"
 #include "codegen_go_threads.h"
 #include "codegen_go_shifts.h"
 #include "runtime_inline.h"
@@ -805,11 +806,17 @@ R"(  --cc name|path        The C compiler: msvc, clang-cl, clang, gcc, cc or a
 )");
     if (topic == "check") return cat(
 R"(usage: goose check file.goose [options]
+       goose check --target=go -o out.go file.goose [options]
 
 Parses and typechecks the program and what it imports, and writes and runs
-nothing.
+nothing. With --target=go and -o out.go it compiles the Go as well, and
+compares out.go with it, and the --go-runtime-file with the one it would
+write: a file that differs, or is missing, is stale, and the check exits
+with 1 and a diff of it. goose --check -o out.go does the same.
 
 Options:
+  -o out.go             With --target=go, the Go file to compare with what the
+                        compile would write.
 )", COMPILEOPTIONS);
     if (topic == "fetch") return
 R"(usage: goose fetch [--update] file.goose
@@ -925,7 +932,10 @@ Options for looking into what the compiler does, and for its test suite.
 Options:
   --tokens              Print the file's tokens.
   --parse               Stop after parsing.
-  --check               Stop after typechecking, as goose check does.
+  --check               Stop after typechecking, as goose check does: with
+                        --target=go and -o out.go, compare out.go with the
+                        Go the compile would write, and exit with 1 where
+                        it is stale.
   --dump                Print the parsed program back as source.
   --dump-docs           Print the documentation comments of the program's
                         declarations, fields and variants.
@@ -1683,6 +1693,10 @@ int Main(int argc, char **argv) {
     auto gotarget = target == "go" ||
                     (target.empty() && verb != "build" && outname.size() > 3 &&
                      outname.compare(outname.size() - 3, 3, ".go") == 0);
+    // --check (or goose check) with -o out.go: the Go compiled as the compile
+    // without it would compile it, and compared with the files there, of
+    // which it writes none (codegen_go_check.h, issue #21).
+    auto gocheck = gotarget && nocgen && !outname.empty();
     if (!gotarget && (!gopackage.empty() || !gobuild.empty() || golibrary || goframereserve)) {
         fprintf(stderr, "--go-package, --go-build, --library and --frame-reserve are for --target=go\n");
         return 1;
@@ -1827,7 +1841,7 @@ int Main(int argc, char **argv) {
         golib = gotarget && (golibrary || (!ast.DeclaresMain() &&
                                            any_of(ast.functions.begin(), ast.functions.end(),
                                                   [](SFunction *sf) { return sf->isexport; })));
-        TypeCheckProgram(ast, library, nocgen || golib);
+        TypeCheckProgram(ast, library, (nocgen && !gocheck) || golib);
         // The checker reported the errors it went on past, root by root.
         if (!ast.errors.empty()) return 1;
         // A shift by a constant count outside its type's width, which the
@@ -1874,8 +1888,9 @@ int Main(int argc, char **argv) {
             fprintf(msgs, "bce-test: all annotations verified\n");
         }
         // --stacks needs the generated program's bounds, so --check runs
-        // the backend for them and writes nothing.
-        if (nocgen && !stacks) return 0;
+        // the backend for them and writes nothing; and so does a --check of
+        // the Go -o names, for the Go to compare it with.
+        if (nocgen && !stacks && !gocheck) return 0;
         if (gotarget) {
             // The Go backend's runtime configuration is the C one's
             // (runtime.h, --stack-reserve and -D); the other -D are C's.
@@ -1913,6 +1928,10 @@ int Main(int argc, char **argv) {
             go.runtime = goruntime == "import" ? GO_RT_IMPORT : goruntime == "full" ? GO_RT_FULL : GO_RT_EMBED;
             go.unexported = gounexported;
             go.nowithstack = gonowithstack;
+            go.version = CompilerVersion();
+            go.optlevel = optlevel;
+            go.nobce = nobce;
+            go.defaults = StackConfigOf({});
             // The package's runtime file: beside the program's, in its
             // package, which its name in the program's header is relative
             // to; and what it holds where it is there already.
@@ -1955,8 +1974,23 @@ int Main(int argc, char **argv) {
             }
             CodeGenGo cg(ast, go);
             if (stacks) cg.StackReport(msgs, stackcfg);
-            if (!outfile.empty() && !nocgen) {
+            if (!outfile.empty() && (!nocgen || gocheck)) {
                 auto out = cg.Source(filename);
+                if (gocheck) {
+                    // What the compile would write, and the files there:
+                    // each that differs is stale, which fails the check.
+                    auto stale = GoCheckFile(outfile, out, filename);
+                    if (!goruntimefile.empty()) stale += GoCheckFile(goruntimefile, cg.runtimefiletext, filename);
+                    while (!stale.empty() && stale.back() == '\n') stale.pop_back();
+                    if (!stale.empty()) throw CompileError { stale };
+                    if (stats) {
+                        fprintf(msgs, "%s is up to date (%d bytes)\n", outfile.c_str(), (int)out.size());
+                        if (!goruntimefile.empty())
+                            fprintf(msgs, "%s is up to date (%d bytes)\n", goruntimefile.c_str(),
+                                    (int)cg.runtimefiletext.size());
+                    }
+                    return 0;
+                }
                 if (!WriteFileMakingDirs(outfile, out))
                     throw CompileError { cat("cannot write output file: ", outfile) };
                 if (stats) fprintf(msgs, "wrote %s (%d bytes)\n", outfile.c_str(), (int)out.size());

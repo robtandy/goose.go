@@ -153,6 +153,14 @@ struct GoOptions {
     // os.resource_dir's answer where it is not the executable's directory: the
     // entry source's, for goose run, as a JIT run has it.
     string resourcedir;
+    // What the header records of the compile besides the options above
+    // (issue #21, GoHeaderFlags): the compiler's version, the options that
+    // shaped the program before the backend saw it (-O, --no-bce), and the
+    // runtime's configuration by default, which the one above is told from.
+    string version;
+    int optlevel = 2;
+    bool nobce = false;
+    CodeGen::StackConfig defaults { 0, 0, 0, 0 };   // StackConfigOf with no -D.
 };
 
 struct CodeGenGo {
@@ -1197,9 +1205,8 @@ struct CodeGenGo {
     // host may hold a block for every goroutine calling it: its calls' frames
     // hold some of the locals C keeps on its host's native stack, of 8 MB by
     // default on Linux.
-    uint64_t FrameReserve() const {
-        return opts.framereserve ? opts.framereserve : opts.library ? 64ull << 20 : 1ull << 30;
-    }
+    uint64_t FrameReserve() const { return opts.framereserve ? opts.framereserve : DefaultFrameReserve(); }
+    uint64_t DefaultFrameReserve() const { return opts.library ? 64ull << 20 : 1ull << 30; }
     // Where gsInitGlobals is in `code`, and whether it does nothing: a
     // library whose globals need no initializing and that spawns no workers
     // has nothing to start (libstart false, issue #19), and its entry
