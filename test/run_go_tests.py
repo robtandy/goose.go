@@ -130,6 +130,18 @@ text forms (KERNEL_ABSENT), test/go/unexported/ one compiled with
 test/go/shared/ two programs compiled into one package with
 --go-runtime-file, whose tests pass together in each mode.
 
+The worked example of docs/go-integration.md (issue #28, the section
+example), examples/records/, is a module whose package runs its Go original
+by default and a Goose kernel with -tags goose: in a copy of it, the default
+build vets and passes its tests with nothing generated, `go generate -tags
+goose` writes the kernel's Go by the binding's //go:generate line, which
+`goose --check` with that line's options finds up to date and which holds
+what the guide says it does, both builds vet and pass the tests and run the
+benchmarks, the Goose build with -d=checkptr too and a short run of the
+fuzzer, and each of the guide's mutants of the example fails the tests that
+must catch it (Runner.example); the guide's excerpts of the example are the
+example's lines as they are.
+
 Reproducible files (issue #21, the section reproducible): a generated
 file's header keeps Go's `// Code generated ... DO NOT EDIT.` line and
 records the compiler's version, the runtime's revision and the options its
@@ -196,6 +208,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -256,6 +269,38 @@ KERNEL_MAX_LINES = 450
 # section's comment.
 THREADS_RUNTIME = RUNTIME / "goose_threads.go"
 THREADS_SECTION = "Workers and typed queues"
+# The worked example of docs/go-integration.md (issue #28): a module whose
+# package runs its Go original by default and a Goose kernel with -tags
+# goose, compiled by the //go:generate line of its binding (Runner.example).
+# The guide says what the generated file holds: one load of 4 bytes and one
+# of 8, nothing of a block, a pool, a library's start or an argument moved
+# off its caller's stack, and no exported name but the entry points.
+EXAMPLE = REPO / "examples" / "records"
+EXAMPLE_GUIDE = REPO / "docs" / "go-integration.md"
+# A fenced block of the guide that is an excerpt of the example's file,
+# which the line before it names: lines of the file as they are.
+EXAMPLE_EXCERPT = re.compile(r"^<!-- example: (\S+) -->\n```\w*\n(.*?)^```$", re.M | re.S)
+EXAMPLE_GENERATED = "records_goose.go"
+EXAMPLE_LOADS = {"binary.LittleEndian.Uint32(": 1, "binary.LittleEndian.Uint64(": 1}
+EXAMPLE_ABSENT = ["gsLibStart", "StackBlock", "gsEscape", "KeepAlive", '"sync"', '"syscall"']
+EXAMPLE_ENTRIES = {"CountRecords", "CountRecordsString", "CountRecordsBytes"}
+# The example's mutants, the guide's mutation checks, which its tests must
+# catch: what each breaks; the file; the text replaced, a regular expression
+# where the file is the generated Go, whose names the compiler chooses; its
+# replacement; the tests (go test -tags goose -run) that must fail, all of
+# them where None; and those that must still pass, where any must.
+EXAMPLE_MUTANTS = [
+    ("a lane of the checksum left unfolded", "_goose/records.goose", "    x ^= x >> 8;\n", "", None, None),
+    ("each record's checksum read as the next one's length", "_goose/records.goose",
+     "off += 5 + size;", "off += 4 + size;", None, None),
+    ("the original's recover, which takes no Goose abort for a failed bounds check", "bind_goose.go",
+     "r.(*gsError)", "r.(interface{ RuntimeError() })", "^TestCount$", None),
+    # Right, and reading 4 bytes past the span: only the guard page sees it.
+    ("a 4-byte load reading 8", EXAMPLE_GENERATED,
+     r"binary\.LittleEndian\.Uint32\(\(\*\[4\]byte\)\(([^()]+)\)\[:\]\)",
+     r"uint32(binary.LittleEndian.Uint64((*[8]byte)(\1)[:]))", "^TestKernelGuardPage$",
+     "^(TestKernelTable|TestKernelRandom|FuzzCountRecords|TestCount)$"),
+]
 # A top-level declaration of Go source as gofmt lays it out: a method's
 # receiver type and name, a func's, a type's or a var's name.
 GO_DECL = re.compile(r"^(?:func \(\w+ \*?(\w+)[^)]*\) (\w+)|func (\w+)|type (\w+)|var (\w+))", re.MULTILINE)
@@ -2518,6 +2563,146 @@ class Runner:
                         None if ok else f"exit {code}\n{o}{e}"))
         return out
 
+    # --- the worked example of docs/go-integration.md (issue #28) --------------
+
+    def example(self):
+        """The worked example of docs/go-integration.md (issue #28),
+        examples/records/: a module whose package runs its Go original by
+        default and a Goose kernel with -tags goose. In a copy of it, the
+        default build vets and passes its tests with no generated file and
+        no compiler; `go generate -tags goose`, with this compiler on PATH as
+        goose, writes the kernel's Go by the //go:generate line of its
+        binding, which gofmt finds laid out as it lays it out and `goose
+        --check` with that line's options up to date, and which holds what
+        the guide says it does (EXAMPLE_LOADS, EXAMPLE_ABSENT,
+        EXAMPLE_ENTRIES); both builds vet and pass the tests, the Goose one
+        with -d=checkptr too and a short run of the fuzzer, and run the
+        benchmarks; and each mutant of EXAMPLE_MUTANTS builds and fails the
+        tests it names, but those it names as passing. The guide's excerpts
+        of the example (EXAMPLE_EXCERPT) are its files' lines as they are,
+        and the README links the guide."""
+        out = []
+        label = "example records"
+
+        def check(what, ok, detail=""):
+            out.append(("ok" if ok else "fail", f"{label}: {what}", None if ok else detail))
+            return ok
+
+        if not check(f"{EXAMPLE.relative_to(REPO).as_posix()}/ and {EXAMPLE_GUIDE.relative_to(REPO).as_posix()}",
+                     EXAMPLE.is_dir() and EXAMPLE_GUIDE.exists(), "the worked example or its guide is missing"):
+            return out
+        excerpts = EXAMPLE_EXCERPT.findall(EXAMPLE_GUIDE.read_text(encoding="utf-8"))
+        check("the guide quotes the example", bool(excerpts), f"no <!-- example: file --> blocks in {EXAMPLE_GUIDE.name}")
+        for name, block in excerpts:
+            f = EXAMPLE / name
+            body = f.read_text(encoding="utf-8") if f.is_file() else None
+            check(f"the guide's excerpt of {name} is {name}'s", body is not None and ("\n" + block) in ("\n" + body),
+                  f"no such lines in {f}:\n{block}")
+        check("the README links the guide", "(docs/go-integration.md" in (REPO / "README.md").read_text(encoding="utf-8"),
+              "no link to docs/go-integration.md in README.md")
+        mod = self.work / "example-records"
+        shutil.rmtree(mod, ignore_errors=True)
+        # Without a records_goose.go a developer may have generated there:
+        # the copy's is go generate's.
+        shutil.copytree(EXAMPLE, mod, ignore=shutil.ignore_patterns(EXAMPLE_GENERATED))
+        # The //go:generate line runs goose: this compiler, found on PATH.
+        exe = Path(self.exe).resolve()
+        bindir = exe.parent
+        if exe.name != f"goose{tc.EXE_SUFFIX}":
+            bindir = self.work / "example-bin"
+            bindir.mkdir(parents=True, exist_ok=True)
+            goose = bindir / f"goose{tc.EXE_SUFFIX}"
+            if goose.is_symlink() or goose.exists():
+                goose.unlink()
+            goose.symlink_to(exe)
+        env = dict(go_env(), PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+
+        def go(d, *args):
+            r = subprocess.run([self.go] + list(args), cwd=d, env=env, capture_output=True)
+            return r.returncode, tc.decode(r.stdout) + tc.decode(r.stderr)
+
+        def builds(d, what, tags=()):
+            """go vet, which must find nothing, go test, and with -tags goose
+            go test -d=checkptr, each checked: whether all passed."""
+            t = [f"-tags={','.join(tags)}"] if tags else []
+            runs = [("go vet", ["vet"] + t + ["./..."]), ("go test", ["test", "-count=1"] + t + ["./..."])]
+            if tags:
+                runs.append(("go test -d=checkptr", ["test", "-count=1", "-gcflags=all=-d=checkptr"] + t + ["./..."]))
+            for name, cmd in runs:
+                code, text = go(d, *cmd)
+                if not check(f"{what}: {name}", code == 0 and (name != "go vet" or not text.strip()), text):
+                    return False
+            return True
+
+        if not builds(mod, "the default build, with nothing generated"):
+            return out
+        code, text = go(mod, "generate", "-tags=goose", "./...")
+        gofile = mod / EXAMPLE_GENERATED
+        if not check("go generate -tags goose", code == 0 and gofile.exists(), text):
+            return out
+        for f in sorted(mod.glob("*.go")):
+            diff = self.gofmt_clean(f)
+            check(f"gofmt -l {f.name}", diff is None, diff)
+        # CI's check that the file checked in is its source's: the
+        # //go:generate line's compile, with --check.
+        line = re.search(r"^//go:generate (.+)$", (mod / "bind_goose.go").read_text(encoding="utf-8"), re.M)
+        argv = shlex.split(line[1]) if line else []
+        if check("bind_goose.go's //go:generate line runs goose", argv[:1] == ["goose"], line[0] if line else ""):
+            code, o, e = run_capture([self.exe, "--check"] + argv[1:], cwd=mod)
+            check("goose --check of what go generate wrote", code == 0, f"exit {code}\n{o}{e}")
+            check("the kernel's compile warns of nothing", ": warning:" not in o + e, o + e)
+        text = gofile.read_text(encoding="utf-8")
+        counts = {k: text.count(k) for k in EXAMPLE_LOADS}
+        check("its loads", counts == EXAMPLE_LOADS, f"{counts}, where the guide says {EXAMPLE_LOADS}")
+        found = [a for a in EXAMPLE_ABSENT if a in text]
+        check("a kernel: no block, pool or start", not found, f"holds {found}")
+        exported, block = set(re.findall(r"^(?:func|type|var|const) ([A-Z]\w*)", text, re.M)), False
+        for ln in text.splitlines():
+            if re.match(r"^(?:const|var|type) \($", ln):
+                block = True
+            elif ln == ")":
+                block = False
+            elif block and re.match(r"^\t[A-Z]", ln):
+                exported.add(ln.split()[0])
+        check("exports the entry points alone", exported == EXAMPLE_ENTRIES,
+              f"exports {sorted(exported)}, where the guide says {sorted(EXAMPLE_ENTRIES)}")
+        if not builds(mod, "-tags goose", ("goose",)) or not builds(mod, "the default build"):
+            return out
+        code, text = go(mod, "test", "-tags=goose", "-run=^$", "-fuzz=^FuzzCountRecords$", "-fuzztime=2000x",
+                        "-parallel=2", ".")
+        check("-tags goose: go test -fuzz FuzzCountRecords", code == 0, text)
+        for tags in ([], ["-tags=goose"]):
+            code, text = go(mod, "test", "-count=1", *tags, "-run=^$", "-bench=.", "-benchtime=1x", "./...")
+            check(f"{' '.join(tags) or 'the default build'}: go test -bench", code == 0, text)
+        # The mutants, each in a copy of its own with the Go generated.
+        for k, (what, name, old, new, fails, passes) in enumerate(EXAMPLE_MUTANTS):
+            mut = self.work / f"example-records-mutant{k}"
+            shutil.rmtree(mut, ignore_errors=True)
+            shutil.copytree(mod, mut)
+            f = mut / name
+            src = f.read_text(encoding="utf-8")
+            if name == EXAMPLE_GENERATED:
+                src, n = re.subn(old, new, src)
+            else:
+                src, n = src.replace(old, new), src.count(old)
+            if not check(f"mutant {k}, {what}: its change", n == 1, f"{old!r} is in {name} {n} times"):
+                continue
+            f.write_text(src, encoding="utf-8")
+            if name.endswith(".goose"):
+                code, text = go(mut, "generate", "-tags=goose", "./...")
+                if not check(f"mutant {k}, {what}: go generate -tags goose", code == 0, text):
+                    continue
+            code, text = go(mut, "vet", "-tags=goose", "./...")
+            if not check(f"mutant {k}, {what}: builds", code == 0, text):
+                continue
+            code, text = go(mut, "test", "-count=1", "-tags=goose", *([f"-run={fails}"] if fails else []), "./...")
+            check(f"mutant {k}, {what}: go test -tags goose{f' -run {fails}' if fails else ''} fails",
+                  code != 0 and "--- FAIL" in text, text)
+            if passes:
+                code, text = go(mut, "test", "-count=1", "-tags=goose", f"-run={passes}", "./...")
+                check(f"mutant {k}, {what}: go test -tags goose -run {passes} passes", code == 0, text)
+        return out
+
     # --- reproducible files (issue #21) -----------------------------------------
 
     def reproducible(self):
@@ -3793,10 +3978,12 @@ def main():
     warnings = sorted((HERE / "go" / "warnings").glob("*.goose"))
     # The runtime's sections (issue #19): its package, a library of kernels,
     # one compiled with --go-unexported, and two programs in one package;
-    # what makes a generated file reproducible (issue #21); and the
-    # prebuilt compilers that `go run` runs (issue #29).
+    # what makes a generated file reproducible (issue #21); the worked
+    # example of docs/go-integration.md (issue #28); and the prebuilt
+    # compilers that `go run` runs (issue #29).
     runtime_sections = {"runtime": r.runtime_package, "kernels": r.kernels, "unexported": r.unexported_library,
-                        "shared": r.shared, "reproducible": r.reproducible, "release": r.release}
+                        "shared": r.shared, "reproducible": r.reproducible, "example": r.example,
+                        "release": r.release}
     if args.names:
         runtime_sections = {k: v for k, v in runtime_sections.items() if k in args.names}
         programs = [p for p in programs if p.stem in args.names]
@@ -3811,7 +3998,7 @@ def main():
             ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
                      "test/go/build_only, test/stdlib, test/threads, test/go/export, "
                      "test/go/bce_gaps, test/go/warnings or samples, and no section runtime, kernels, "
-                     "unexported, shared, reproducible or release")
+                     "unexported, shared, reproducible, example or release")
     if args.bless:
         # Their expected output is the C suite's (test/expected/), a
         # sample's its own, an export library's its Go tests, and a BCE
