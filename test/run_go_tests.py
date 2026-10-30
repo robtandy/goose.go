@@ -193,12 +193,14 @@ RUNTIME = REPO / "runtime" / "go"
 RUNTIME_MODULE = "github.com/robtandy/goose.go/runtime/go"
 RUNTIME_PACKAGE_ONLY = {"goose_package.go", "goose_extra.go"}
 # Runtime functions a library of kernels has no use for (issue #19): the
-# data stacks', the slice pools' and the text forms'.
+# data stacks', the slice pools' and the text forms'; and since its entry
+# points hand their arguments on as they are (issue #22), what moves them off
+# a caller's stack and keeps them alive.
 KERNEL_ABSENT = ["func NewStackBlock", "func AcquireStackBlock", "func ReleaseStackBlock",
                  "func gsNewBlock", "func gsReserveRegion", "func gsMap", "func (gs *GsStackBlock)",
                  "func GsSpans", "gsSpLeaf", "func GsFmt", "func GsPutStr", "func gsAppendFloat",
                  "func GsOut", "type gsProgram", "gsLibStart", "gsInitGlobals", '"syscall"', '"sync"',
-                 '"os"']
+                 '"os"', "gsEscape", "func GsSliceOf", "func GsBytesOf", "KeepAlive"]
 KERNEL_MAX_LINES = 450
 
 
@@ -1949,10 +1951,12 @@ class Runner:
     def kernels(self):
         """A library of kernels (test/go/kernels/, issue #19), pure functions
         over slices: the file the compiler writes holds none of the
-        runtime's data stacks, pools or text forms (KERNEL_ABSENT), and is
-        short (KERNEL_MAX_LINES); with --go-no-withstack, not even the block
-        type a NameWithStack entry point names. Its tests pass, vetted, and
-        with -d=checkptr, at -O2 and at -O0."""
+        runtime's data stacks, pools or text forms, nor, its entry points
+        handing their arguments on as they are (issue #22), GsEscape or
+        runtime.KeepAlive (KERNEL_ABSENT), and is short (KERNEL_MAX_LINES);
+        with --go-no-withstack, not even the block type a NameWithStack
+        entry point names. Its tests pass, vetted, and with -d=checkptr, at
+        -O2 and at -O0."""
         out = []
         d = HERE / "go" / "kernels"
         for level, extra in (("2", []), ("0", []), ("2", ["--go-no-withstack"])):
@@ -1995,11 +1999,13 @@ class Runner:
         issue #19): `go doc` lists its export fns' entry points, and for the
         NameWithStack ones StackBlock, AcquireStackBlock and
         ReleaseStackBlock, and nothing else; with --go-no-withstack too, the
-        Name entry points alone. Its tests pass, vetted, and with
+        Name entry points alone, and the NameString and NameBytes of those
+        taking a const u8[:] (issue #22). Its tests pass, vetted, and with
         -d=checkptr."""
         out = []
         d = HERE / "go" / "unexported"
         entries = {"Words", "Kept", "CallsSoFar", "Checked"}
+        forms = {"WordsString", "WordsBytes", "KeptString", "KeptBytes"}
         for extra in ([], ["--go-no-withstack"]):
             label = "--go-unexported" + "".join(f" {x}" for x in extra)
             mod = self.work / f"unexported{''.join(extra)}"
@@ -2029,8 +2035,8 @@ class Runner:
                 m = re.match(r"\s*(?:func|type|var|const)\s+(?:\([^)]*\)\s*)?(\w+)", line)
                 if m:
                     listed.add(m.group(1))
-            want = set(entries) if extra else \
-                entries | {f"{n}WithStack" for n in entries} | {"StackBlock", "AcquireStackBlock", "ReleaseStackBlock"}
+            want = entries | forms if extra else entries | forms | {f"{n}WithStack" for n in entries} | \
+                {"StackBlock", "AcquireStackBlock", "ReleaseStackBlock"}
             if r.returncode != 0 or listed != want:
                 out.append(("fail", f"{label}: go doc lists the entry points alone",
                             f"listed {sorted(listed)}, want {sorted(want)}\n{doc}"))
@@ -2533,12 +2539,25 @@ class Runner:
               code == 0 and "\npackage goose\n" in text and "\nfunc main()" not in text and
               "\nfunc Twice(x int64) int64 {" in text and
               "\nfunc TwiceWithStack(gs *GsStackBlock, x int64) int64 {" in text and
-              "\nfunc ParseCount[T0 ~string | ~[]byte](s T0) int64 {" in text, o + e)
+              "\nfunc ParseCount[T0 ~string | ~[]byte](s T0) int64 {" in text and
+              "\nfunc ParseCountString(s string) int64 {" in text and
+              "\nfunc ParseCountBytes(s []byte) int64 {" in text, o + e)
         if code == 0:
             vc, vo, ve = self.gotool("vet", gofile.name)
             check("the export library vets", vc == 0 and not (vo + ve).strip(), vo + ve)
             diff = self.gofmt_clean(gofile)
             check("the export library is laid out as gofmt lays it out", diff is None, diff or "")
+        # A NameString or NameBytes form whose name another export fn's entry
+        # point has is left out (issue #22): KeptBytes is kept_bytes's.
+        clashsrc = self.work / "cli-forms.goose"
+        tc.write_text(clashsrc, 'export fn kept(s: const u8[:], t: const u8[:]) -> i64 { s.len + t.len }\n'
+                                'export fn kept_bytes(n: i64) -> i64 { n }\n')
+        code, o, e = self.goose("--target=go", "-o", gofile, clashsrc)
+        text = gofile.read_text(encoding="utf-8") if code == 0 else ""
+        check("an export fn's NameBytes is left out where another export fn's entry point has its name",
+              code == 0 and "\nfunc KeptString(s string, t string) int64 {" in text and
+              "\nfunc KeptBytes(n int64) int64 {" in text and "func KeptBytes(s" not in text and
+              self.gotool("vet", gofile.name)[0] == 0, o + e)
         # --include with --target=go is Go: a file whose extern fn the
         # program calls, its imports merged, its errors named in its own
         # lines (//line).
@@ -2746,7 +2765,8 @@ class Runner:
         text = (self.work / "cli-unexported-lib.go").read_text(encoding="utf-8") if code == 0 else ""
         exported = sorted(set(re.findall(r"\n(?:func|type|var|const) ([A-Z]\w*)", text)))
         check("--go-unexported leaves the entry points the file's only exported names",
-              code == 0 and exported == ["ParseCount", "ParseCountWithStack", "StackBlock", "Twice", "TwiceWithStack"],
+              code == 0 and exported == ["ParseCount", "ParseCountBytes", "ParseCountString", "ParseCountWithStack",
+                                         "StackBlock", "Twice", "TwiceWithStack"],
               f"{exported}\n{o}{e}")
         # The options' checks.
         for args, why in ((["--target=go", "--go-runtime=static", hello], "--go-runtime takes embed, import or full"),

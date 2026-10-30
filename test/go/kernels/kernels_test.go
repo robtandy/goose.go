@@ -45,6 +45,13 @@ func TestKernels(t *testing.T) {
 	if got := CountDigits([]byte("2026")); got != 4 {
 		t.Errorf("CountDigits([]byte) = %d", got)
 	}
+	// Not generic: a string, and a []byte (issue #22).
+	if got := CountDigitsString("x9y8"); got != 2 {
+		t.Errorf("CountDigitsString = %d", got)
+	}
+	if got := CountDigitsBytes([]byte("77")); got != 2 {
+		t.Errorf("CountDigitsBytes = %d", got)
+	}
 }
 
 // An abort is a panic whose value is an error naming the check's place.
@@ -70,6 +77,23 @@ func TestZeroAllocs(t *testing.T) {
 		"Dot":         func() { sink += int64(Dot(fs, fs)) },
 		"PrefixSums":  func() { sink += PrefixSums(xs, out) },
 		"CountDigits": func() { sink += CountDigits("12ab") },
+		// A caller's arrays stay on its stack: the entry points hand them
+		// on as they are (issue #22).
+		"Sum of an array": func() {
+			var a [8]int64
+			a[1] = 2
+			sink += Sum(a[:])
+		},
+		"PrefixSums of arrays": func() {
+			var a, b [4]int64
+			a[0] = 1
+			sink += PrefixSums(a[:], b[:]) + b[3]
+		},
+		"CountDigitsBytes of an array": func() {
+			var a [4]byte
+			copy(a[:], "1a2b")
+			sink += CountDigitsBytes(a[:])
+		},
 	} {
 		if n := testing.AllocsPerRun(100, f); n != 0 {
 			t.Errorf("%s: %v allocs/op", name, n)

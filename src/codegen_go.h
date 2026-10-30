@@ -1122,6 +1122,12 @@ struct CodeGenGo {
     FnSpec *ExportOfExtern(FnSpec *sp);
     bool ExternTakesGs(FnSpec *sp);
     bool GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a, string &x);
+    // Whether a value of a type holds an address, and whether every address
+    // an export fn's entry points hand its function stays in Go's own
+    // variables while the call runs, which lets them hand it on as it is
+    // (issue #22).
+    bool HoldsAddr(TypeExpr *t);
+    bool ArgsStayInGo(FnSpec *sp);
     void EmitExports();
     // The specializations whose code names a global's own data stack
     // (gsGStk_), which an export's entry points cannot reach, and what each
