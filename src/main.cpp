@@ -1986,7 +1986,8 @@ int Main(int argc, char **argv) {
                 auto dir = ForwardSlashes(DirOf(AbsolutePath(filename)));
                 go.resourcedir = dir.empty() || dir.back() == '/' ? dir : dir + "/";
             }
-            CodeGenGo cg(ast, go);
+            auto cgp = GoBackend(ast, go);
+            auto &cg = *cgp;
             if (stacks) cg.StackReport(msgs, stackcfg);
             if (!outfile.empty() && (!nocgen || gocheck)) {
                 auto out = cg.Source(filename);

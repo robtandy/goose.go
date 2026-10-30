@@ -655,14 +655,15 @@ inline void CodeGenGo::EnsureFromChannels(FnSpec *t) {
     if (!fromemitted.insert(t).second) return;
     auto tid = fromids.at(t);
     auto &rets = t->rets;
-    // Package variables, or in a program with workers, whose thread
-    // programs each return on their own, members of the instance.
+    // Package variables, or in a program with instances, whose thread
+    // programs and export fns' calls each return on their own, members of
+    // the instance.
     string decls;
     auto var = [&](const string &name, const string &gt) {
-        if (workers) Append(decls, "\t", name, " ", gt, "\n");
+        if (instances) Append(decls, "\t", name, " ", gt, "\n");
         else Append(decls, "var ", name, " ", gt, "\n");
     };
-    Append(decls, workers ? "\t" : "", "// The result channels of a long-distance return to ", t->sf->qname, " (§7.9).\n");
+    Append(decls, instances ? "\t" : "", "// The result channels of a long-distance return to ", t->sf->qname, " (§7.9).\n");
     for (size_t i = 0; i < rets.size(); i++) {
         if (IsFix(rets[i])) {
             var(cat("gsLret_", tid, "_", i), GoT(rets[i], t->sf->line));
@@ -673,7 +674,7 @@ inline void CodeGenGo::EnsureFromChannels(FnSpec *t) {
         if (IsResz(rets[i]))
             var(cat("gsLret_", tid, "_", i), IsFrameObj(rets[i]) ? RzGoT(rets[i], t->sf->line) : string("int64"));
     }
-    if (workers) {
+    if (instances) {
         if (fromemitted.size() == 1)
             decls = cat("\t// The long-distance return in flight: its target's number, 0 for none.\n\tgsRf int32\n", decls);
         glfields += decls;

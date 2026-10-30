@@ -117,6 +117,14 @@ escape`) or all do (`escape`); and each callX function of its tests, a call
 of an entry point, must be the same instructions for arm64 and for amd64 as
 directX, the call of its function written by hand (Runner.entry_points).
 
+The library of test/go/export/arena/ (issue #25), whose export fns grow
+globals on data stacks of their own in a program without workers, keeps its
+globals in program instances, one of each block's own: compiled at -O2 and
+at -O0, its file must hold none of the workers' and queues' runtime
+(runtime/go/goose_threads.go), and its tests, which call the entry points
+from many goroutines at once, must pass under the race detector, where cgo
+builds (Runner.instances).
+
 The runtime (issue #19): every program (at -O2), fixture, sample, overflow
 case and export library is compiled again with --go-runtime=import, into a
 module that requires the runtime's package, runtime/go, and built with
@@ -229,6 +237,26 @@ KERNEL_ABSENT = ["func NewStackBlock", "func AcquireStackBlock", "func ReleaseSt
                  "func GsOut", "type gsProgram", "gsLibStart", "gsInitGlobals", '"syscall"', '"sync"',
                  '"os"', "gsEscape", "func GsSliceOf", "func GsBytesOf", "KeepAlive"]
 KERNEL_MAX_LINES = 450
+# The workers' and queues' runtime (§2.3), which a program that spawns no
+# workers and puts on no queue has no use for, though its globals be in
+# program instances (issue #25): every declaration of the file, and its
+# section's comment.
+THREADS_RUNTIME = RUNTIME / "goose_threads.go"
+THREADS_SECTION = "Workers and typed queues"
+# A top-level declaration of Go source as gofmt lays it out: a method's
+# receiver type and name, a func's, a type's or a var's name.
+GO_DECL = re.compile(r"^(?:func \(\w+ \*?(\w+)[^)]*\) (\w+)|func (\w+)|type (\w+)|var (\w+))", re.MULTILINE)
+
+
+def go_declared(text):
+    """The top-level declarations of Go source (GO_DECL): each name, a
+    method's as Type.Method, with its first letter lowercase, as a file
+    holding the runtime unexports some of the runtime's names and
+    --go-unexported every one."""
+    def low(n):
+        return n[:1].lower() + n[1:]
+    return {f"{low(recv)}.{method}" if recv else low(fn or ty or var)
+            for recv, method, fn, ty, var in GO_DECL.findall(text)}
 
 # The export libraries whose Go tests run under the race detector as well,
 # where cgo can build it (issue #42): those of a Go []string and of what the
@@ -2257,6 +2285,55 @@ class Runner:
             self.module_tests(mod, label, out)
         return out
 
+    def instances(self):
+        """A library whose export fns' calls grow globals on data stacks of
+        their own, and that spawns no workers (test/go/export/arena/, issue
+        #25), whose calls each run on a program instance of their block's
+        own: compiled at -O2 and at -O0, its file holds no declaration of the
+        workers' and queues' runtime (THREADS_RUNTIME), nor the comment of
+        its section, and its tests, which call the entry points from many
+        goroutines at once, each on a block of its own and on the pool's,
+        pass under the race detector, where cgo builds (Runner.export runs
+        them as every export library's otherwise)."""
+        out = []
+        d = HERE / "go" / "export" / "arena"
+        threads = go_declared(THREADS_RUNTIME.read_text(encoding="utf-8"))
+        for level in ("2", "0"):
+            label = f"arena -O{level}"
+            mod = self.work / f"arena-race-O{level}"
+            shutil.rmtree(mod, ignore_errors=True)
+            mod.mkdir(parents=True)
+            gofile = mod / "arena.go"
+            code, o, e = self.goose(f"-O{level}", "--target=go", "--library", "-o", gofile, d / "arena.goose")
+            if code != 0:
+                out.append(("fail", f"{label}: goose --target=go", o + e))
+                continue
+            text = gofile.read_text(encoding="utf-8")
+            found = sorted(go_declared(text) & threads) + ([THREADS_SECTION] if THREADS_SECTION in text else [])
+            if found or "type gsGlobals struct" not in text:
+                out.append(("fail", f"{label}: instances without the workers' runtime",
+                            f"holds {found} of {THREADS_RUNTIME.name}" if found else "no program instances"))
+            else:
+                out.append(("ok", f"{label}: instances without the workers' runtime", None))
+            for t in d.glob("*_test.go"):
+                shutil.copy(t, mod / t.name)
+            r = subprocess.run([self.go, "mod", "init", "goosetest/arena"], cwd=mod, env=go_env(),
+                               capture_output=True)
+            if r.returncode != 0:
+                out.append(("fail", f"{label}: go mod init", tc.decode(r.stderr)))
+                continue
+            r = subprocess.run([self.go, "test", "-count=1", "-race", "./..."], cwd=mod,
+                               env=dict(go_env(), CGO_ENABLED="1"), capture_output=True)
+            text = tc.decode(r.stdout) + tc.decode(r.stderr)
+            if r.returncode != 0 and ("cgo" in text or "C compiler" in text or "-race is not supported" in text):
+                # The race detector needs cgo, and a C compiler.
+                out.append(("skip", f"{label}: go test -race (no cgo here)", None))
+            elif r.returncode != 0:
+                out.append(("fail", f"{label}: go test -race", text))
+            else:
+                out.append(("ok", f"{label}: go test -race", None))
+        return out
+
     def unexported_library(self):
         """A library compiled with --go-unexported (test/go/unexported/,
         issue #19): `go doc` lists its export fns' entry points, and for the
@@ -3562,6 +3639,11 @@ def main():
         # beside their export library's own tests.
         if not args.bless and (not args.names or "inlining" in args.names):
             futures.append(pool.submit(r.entry_points))
+        # A library whose globals are in program instances without workers
+        # (issue #25), beside its export library's own tests: no workers'
+        # runtime, and race-clean.
+        if not args.bless and (not args.names or "arena" in args.names):
+            futures.append(pool.submit(r.instances))
         futures += [pool.submit(r.bce_gaps, p) for p in bcegaps]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
         futures += [pool.submit(r.fixture, p, True) for p in sweep]

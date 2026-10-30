@@ -133,7 +133,7 @@ func main() {
 }
 ```
 
-Goroutines may call `FuncName` at once: each call runs on a block of its own. In a program without workers the globals are the package's, shared by every call, so an export that writes one is not safe to call from two goroutines at once; in a program with workers each block is a program instance of its own ([`DESIGN.md` §3.5](DESIGN.md#35-export-fn-and-extern-fn-in-go-mode)).
+Goroutines may call `FuncName` at once: each call runs on a block of its own. In a program without workers the globals are the package's, shared by every call, so an export that writes one is not safe to call from two goroutines at once -- but where an export fn's calls grow a global on a data stack of its own (a growable arena, say), or hand on a reference to one, and in a program with workers, each block is a program instance of its own: a block a caller keeps keeps its globals across its calls, and a call on a pooled block starts from a copy of the package's, a slice it returns that views them handed back as a copy ([`DESIGN.md` §3.5](DESIGN.md#35-export-fn-and-extern-fn-in-go-mode)).
 
 ### Kernels: entry points that Go inlines
 

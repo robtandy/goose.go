@@ -163,17 +163,6 @@ func GsThreadWait(gs *GsStackBlock, id int64, take bool, file string, line int) 
 	return false, m
 }
 
-// GsKeep is s, or where it views memory of gs's own -- a global of the
-// program instance a call of an export fn ran on -- a copy of it on Go's
-// heap: an export's result crosses to its caller once the call's block is
-// back in the pool, where the next call takes its memory.
-func GsKeep[T any](gs *GsStackBlock, s []T) []T {
-	if len(s) == 0 || !gs.Owns(unsafe.Pointer(unsafe.SliceData(s))) {
-		return s
-	}
-	return append([]T(nil), s...)
-}
-
 // GsQueue is the queue of one element type (§11.2): the image of each value
 // put, in order, and how many there are. The zero GsQueue is an empty one
 // with no limit, which is how the program declares each of its queues.
