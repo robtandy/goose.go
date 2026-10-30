@@ -110,7 +110,8 @@ def logged(argv, log, cwd=REPO):
     """Runs argv in cwd, what it prints going to the file log; a failure
     ends the script, with the end of the log."""
     argv = [str(a) for a in argv]
-    print(f"+ {shlex.join(argv)}  (> {log})", flush=True)
+    shown = " ".join("<script>" if "\n" in a else shlex.quote(a) for a in argv)
+    print(f"+ {shown}  (> {log})", flush=True)
     with open(log, "ab") as f:
         try:
             code = subprocess.run(argv, cwd=cwd, stdout=f, stderr=subprocess.STDOUT).returncode
