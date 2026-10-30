@@ -73,10 +73,16 @@ and so what each activation of the cycle holds:
 
 A callee that takes no data stack at all -- whose code, and that of every
 function it calls, holds no value but fixed-size ones of at most
-`NATIVE_VALUE_LIMIT` bytes, and calls no builtin that takes one (`print`,
-`str`, `format`, `to_bytes`, `from_bytes`, the spawns, waits and queues) --
-changes none of it: every activation holds the stacks it held, at the same
-indices, and the report is the same. Those are exactly the helpers of §1.
+`NATIVE_VALUE_LIMIT` bytes, builds no slice literal's array as large, adapts
+no variable-mode ADT to the fixed-mode one (a call's result or a reference's
+pointee, built as what it arrives as first), dispatches on no variable-mode
+ADT to a case function taking its variant by value, and calls no builtin
+that takes a stack (`print`, `str`, `format`, `to_bytes`, `from_bytes`, the
+spawns, waits and queues) -- changes none of it. These are the places a
+function takes `gs_sp` for (`CodeGen::CollectSpecs`; goose.go's
+`CodeGenGo::CollectSpecs` follows the same rules), so every activation holds
+the stacks it held, at the same indices, and the report is the same. Those
+are exactly the helpers of §1.
 
 ## 3. The change
 
@@ -122,9 +128,11 @@ a local by reference, a base case calling a helper, an accumulator the tail
 pass makes a loop of, a cycle of two functions, a `recursive fn` that does
 not recurse, and a nested recursive fn reading its parent's local; beside
 them helpers that must stay calls -- one that prints, one that builds a
-`str`, one with a 4800-byte local, one calling into another cycle. Its
-output must not change, nor its `--stacks` report, since nothing inlined
-into a cycle takes a stack; `--specs` shows which calls are left. goose.go's
+`str`, one with a 4800-byte local, one handing a 4800-byte slice literal
+on, one reading a variable-mode ADT through a reference as the fixed-mode
+one, one calling into another cycle. Its output must not change, nor its
+`--stacks` report, since nothing inlined into a cycle takes a stack;
+`--specs` shows which calls are left. goose.go's
 `test/go/programs/cycle_inlining.goose` is that fixture, with its expected
 output in `test/go/expected/`; its `// inlined:` and `// calls:` lines say
 which calls the Go must have left (`run_go_tests.py`'s `Runner.cycles`).

@@ -366,7 +366,7 @@ recursive fn ordered(tags: const (const u8[:])[:], lo: i64, hi: i64) -> i64 {
 }
 ```
 
-So no thin `recursive fn` around an ordinary function is needed to get them inlined. A callee that takes a data stack -- one that prints, builds a `str`, or holds a resizable value or a fixed one of more than 4096 bytes -- stays a call, as in C, so that each activation of the cycle holds the stacks it holds there and both backends report the same (`--stacks`). [`DESIGN.md` §3.14](DESIGN.md#314-inlining-into-recursive-cycles-issue-42) has the details; the C backend keeps upstream's rule, and [`docs/upstream/recursive-inlining.md`](docs/upstream/recursive-inlining.md) proposes the change there.
+So no thin `recursive fn` around an ordinary function is needed to get them inlined. A callee that takes a data stack -- one that prints, builds a `str`, or holds a resizable value, a fixed one of more than 4096 bytes or a slice literal as large -- stays a call, as in C, so that each activation of the cycle holds the stacks it holds there and both backends report the same (`--stacks`). [`DESIGN.md` §3.14](DESIGN.md#314-inlining-into-recursive-cycles-issue-42) has the details; the C backend keeps upstream's rule, and [`docs/upstream/recursive-inlining.md`](docs/upstream/recursive-inlining.md) proposes the change there.
 
 ## Testing
 
