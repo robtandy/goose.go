@@ -16,19 +16,20 @@ import (
 //	benchstat go.txt goose.txt
 
 // countRecordsWords is countRecordsGo checksumming 8 bytes at a time, as the
-// kernel does: what the algorithm gains, without Goose.
+// kernel does: what the algorithm gains, without Goose. (Indexing the words,
+// p[i:i+8], is up to 20% slower.)
 func countRecordsWords(seg []byte) int64 {
 	var n int64
 	for off := 0; off < len(seg); {
 		size := int(binary.LittleEndian.Uint32(seg[off:]))
 		p := seg[off+4 : off+4+size]
 		var x uint64
-		i := 0
-		for ; i+8 <= len(p); i += 8 {
-			x ^= binary.LittleEndian.Uint64(p[i : i+8])
+		for len(p) >= 8 {
+			x ^= binary.LittleEndian.Uint64(p)
+			p = p[8:]
 		}
-		for ; i < len(p); i++ {
-			x ^= uint64(p[i])
+		for _, b := range p {
+			x ^= uint64(b)
 		}
 		x ^= x >> 32
 		x ^= x >> 16
