@@ -207,6 +207,22 @@ if x_g_2 < int64(-1000) {
 
 The conditions and values must be scalar variables and constants, comparisons of them, `!` and negations (but for an integer's under `--debug`, which can fail); a choice that calls or reads an element is compiled as it is written. Floats keep std's choice (`max(1, NaN)` is 1), which Go's builtins do not make, and Go compiles a float's choice to a branch. [`DESIGN.md` §3.9](DESIGN.md#39-selects-issue-26) has the details, and the bounds-check elimination gaps the same kernels showed are written up in [`test/go/bce_gaps/`](test/go/bce_gaps/README.md).
 
+## Locals handed to inlined functions by reference
+
+A function the optimizer inlines -- an `inline fn`, or a small helper -- binds each by-reference parameter at the start of its body. Under `--target=go`, one bound to a local, or to a field or an element of one, is that local: the body reads and writes it where it is, and the local stays a Go local, which Go keeps in a register, where a local whose address is taken moves into its function's frame on the fixed-frame stack:
+
+```goose
+inline fn bump(x: i64&) { x += 1; }
+
+fn count(n: i64) -> i64 {
+    var c = 0;
+    for i in n { bump(c); }   // c_g = c_g + 1, c_g a Go local
+    c
+}
+```
+
+Only where the body uses the reference as a value -- hands it to a call that is not inlined, stores or returns it, compares its identity -- is the local's address taken, and that local alone takes a slot in the frame. [`DESIGN.md` §3.6](DESIGN.md#36-the-fixed-frame-stack-gsframe) has the details.
+
 ## Testing
 
 ```bash
@@ -223,6 +239,7 @@ cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...
 - the `export fn` libraries of `test/go/export/`, whose Go tests call their entry points (with `testing.AllocsPerRun` checking that a call allocates nothing, and a `TestMain` checking that importing the package mapped nothing);
 - the code Go makes of the wide loads and stores of `test/go/export/wide/`, for arm64 and for amd64: one load or one store each, of the width its `// asm:` line names; and of the selects of `test/go/export/selects/`: a conditional select each, and no conditional branch but its loop's and its guard's;
 - the reproducers of the bounds-check elimination gaps of `test/go/bce_gaps/`, checked with `goose --check --bce-test`;
+- the frames of the export fns of `test/go/export/inline_refs/`, whose locals are handed to inlined functions by reference: as many slots on the fixed-frame stack as each one's `// frame:` line names, none at all for most;
 - the warnings the Go backend gives where the C backend does not yet, of a shift by a constant count outside its type's width (`test/go/warnings/`), each declared by a `// warning:` line as the C suite declares its own;
 - programs that never end, which it only builds (`test/go/build_only/`), data stack overflow, the constructs this version refuses (`test/go/unsupported/`), and the command line (`-o out.go`, `--go-package`, `--go-build`, `--library`, `--frame-reserve`, `--include` and the positions in what it splices in, `goose run`/`goose build --target=go`).
 

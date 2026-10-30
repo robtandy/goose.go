@@ -84,6 +84,12 @@ are checked with `goose --check --bce-test` at -O1 and -O2: each `//
 bce:keep` and `// bce:elide` line must have the outcome it names, so that
 the write-up says what BCE does (Runner.bce_gaps).
 
+The Go of the export fns of test/go/export/inline_refs/ (issue #24) is read
+at -O2, where the functions they call are inlined: each one a `// frame:`
+line annotates must take as many slots on the fixed-frame stack as it
+names, `none` none at all, a local handed to an inlined body by reference
+staying a Go local unless its address outlives the body (Runner.frames).
+
 --sweep also runs the C suite's own programs (test/<category>/*.goose) of
 its other categories through both backends as the test/stdlib/ fixtures
 run: at both levels, with --debug where they ask for it, vetted, built with
@@ -901,6 +907,36 @@ def select_counts(arch, asm, fn):
     return found
 
 
+# --- the frames of locals handed to inlined bodies by reference (issue #24) ---
+
+def frame_annotations(src):
+    """The export fns of src a `// frame:` comment line above names the frame
+    of at -O2: name -> the slots its Go function's frame on the fixed-frame
+    stack holds, 0 for `none`."""
+    want, pending = {}, None
+    for line in src.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^// frame: (?:(\d+)|(none))$", line)
+        if m:
+            pending = 0 if m[2] else int(m[1])
+            continue
+        m = re.match(r'^export (?:"\w+" )?fn (\w+)\(', line)
+        if m and pending is not None:
+            want[m[1]] = pending
+        if not line.startswith("//"):
+            pending = None
+    return want
+
+
+def frame_slots(gosrc, fn):
+    """The Go function fn of the generated Go gosrc, and the slots its frame
+    on the fixed-frame stack holds: the offsets FinishBody declares past
+    gs_fo0, one for each (DESIGN.md §3.6). None where fn is not there."""
+    m = re.search(rf"^func {re.escape(fn)}\(.*?^}}$", gosrc, re.M | re.S)
+    if not m:
+        return None
+    return m[0], len(re.findall(r"^\t\tgs_fo\d+ += gs_fo\d+ \+", m[0], re.M))
+
+
 def go_env():
     """The Go tool's environment: the module and build flags of whoever runs
     the suite play no part in building one generated file, which builds,
@@ -1669,6 +1705,38 @@ class Runner:
             out.append(("ok", label, None) if code == 0 else ("fail", label, o + e))
         return out
 
+    def frames(self):
+        """The frames of the export fns of
+        test/go/export/inline_refs/inline_refs.goose (issue #24): compiled
+        with --target=go --library at -O2, where its helpers are inlined,
+        each export fn a `// frame:` line annotates must take as many slots
+        on the fixed-frame stack as it says, `none` none at all: a local an
+        inlined body takes by reference stays a Go local unless its address
+        outlives the body."""
+        out = []
+        src = HERE / "go" / "export" / "inline_refs" / "inline_refs.goose"
+        want = frame_annotations(src)
+        if not want:
+            out.append(("fail", f"frames: no // frame: line in {src.name}", None))
+            return out
+        gofile = self.work / "frames-O2.go"
+        gofile.unlink(missing_ok=True)
+        code, o, e = self.goose("-O2", "--target=go", "--library", "-o", gofile, src)
+        if code != 0:
+            out.append(("fail", "frames -O2: goose --target=go", o + e))
+            return out
+        gosrc = gofile.read_text(encoding="utf-8")
+        for fn, n in sorted(want.items()):
+            label = f"frames {fn} -O2: {n or 'none'}"
+            got = frame_slots(gosrc, f"{fn}_g")
+            if got is None:
+                out.append(("fail", label, f"no func {fn}_g in {gofile.name}"))
+                continue
+            text, slots = got
+            out.append(("ok" if slots == n else "fail", label,
+                        None if slots == n else f"{slots} slot(s):\n" + "\n".join(text.splitlines()[:40])))
+        return out
+
     # --- the command line ----------------------------------------------------
 
     def cli(self):
@@ -2085,6 +2153,10 @@ def main():
             futures.append(pool.submit(r.wide_asm))
         if not args.bless and (not args.names or "selects" in args.names):
             futures.append(pool.submit(r.select_asm))
+        # The frames of locals handed to inlined bodies by reference (issue
+        # #24), beside their export library's own tests.
+        if not args.bless and (not args.names or "inline_refs" in args.names):
+            futures.append(pool.submit(r.frames))
         futures += [pool.submit(r.bce_gaps, p) for p in bcegaps]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
         futures += [pool.submit(r.fixture, p, True) for p in sweep]
