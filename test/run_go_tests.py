@@ -115,7 +115,10 @@ Go depends on, spelled one way whatever the compile's spelling; `--check
 -o out.go` passes a file that is what the compile would write and fails one
 that is stale or missing, with a short diff; and the same programs compiled
 in two temporary directories, each with a standard library of its own, are
-the same Go, byte for byte (Runner.reproducible, Runner.same_go).
+the same Go, byte for byte (Runner.reproducible, Runner.same_go). So the Go
+names a file of the standard library by its place in it, stdlib/std.goose,
+where an abort there names it, and C by its whole path: every C run's
+stderr is compared with the Go's so named (go_file_names).
 
 --sweep also runs the C suite's own programs (test/<category>/*.goose) of
 its other categories through both backends as the test/stdlib/ fixtures
@@ -221,6 +224,29 @@ def go_runtime_revision():
         for b in p.name.encode() + b"\0" + p.read_bytes().replace(b"\r", b"") + b"\0":
             h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
     return f"{h >> 16:012x}"
+
+
+# Where an abort's message names its place: (file:line), at its end.
+ABORT_PLACE = re.compile(r"\(([^()\n]+\.goose):(\d+)\)")
+
+
+def go_file_names(text):
+    """text, what a C run printed, with each place an abort names in a file
+    of the standard library named as the Go backend names it (issue #21):
+    by its place in the library, stdlib/std.goose, where the C backend
+    names it by its whole path, which is this machine's. A C run is
+    compared with the Go's so (Runner.c_run)."""
+    libs = [os.path.normpath(UPSTREAM / "stdlib")]
+    if os.environ.get("GOOSE_STDLIB"):
+        libs.append(os.path.normpath(os.path.abspath(os.environ["GOOSE_STDLIB"])))
+
+    def name(m):
+        path = os.path.normpath(m[1])
+        for lib in libs:
+            if os.path.isabs(m[1]) and path.startswith(lib + os.sep):
+                return f"(stdlib/{Path(path).relative_to(lib).as_posix()}:{m[2]})"
+        return m[0]
+    return ABORT_PLACE.sub(name, text)
 
 
 def first_difference(a, b):
@@ -1211,7 +1237,9 @@ class Runner:
         compiler's process does from the repository's root, where the
         messages name the source as the Go's do, or in cwd as well with
         jit_in_cwd (a sample reading its data, whose source is then named
-        by its whole path)."""
+        by its whole path). Its stderr names a file of the standard library
+        as the Go backend does, by its place in the library
+        (go_file_names)."""
         if self.cc is None:
             # TinyCC in the compiler's process: what the compile itself
             # prints to stderr (its warnings) comes before the program's.
@@ -1232,10 +1260,12 @@ class Runner:
             _, _, warnings = compiler(*flags, "--check", src)
             if warnings and e.startswith(warnings):
                 e = e[len(warnings):]
-            return code, o, e
+            return code, o, go_file_names(e)
         exe = self.c_build(src, name, flags, out)
-        return None if exe is None else run_capture([exe] + list(args), cwd=cwd, timeout=timeout,
-                                                    stdin_path=stdin)
+        if exe is None:
+            return None
+        code, o, e = run_capture([exe] + list(args), cwd=cwd, timeout=timeout, stdin_path=stdin)
+        return code, o, go_file_names(e)
 
     def c_build(self, src, name, flags, out):
         """The C backend's executable for src, at the Goose level flags name
