@@ -95,7 +95,7 @@ Goose specifies exact byte layouts (`FixedSize`, `LayoutFields` in `src/codegen_
       Len  int64
   }
   ```
-  (with zero-copy conversion helpers to/from Go `[]T`, `[]byte`, and `string` via `unsafe.Slice` and `unsafe.String`).
+  (with zero-copy conversion helpers to/from Go `[]T`, `[]byte`, and `string` via `unsafe.Slice` and `unsafe.String`). `a[lo..hi]` is `GsSub(data, lo, hi, n, esize)` once its bounds are checked: the address of element `lo`, an empty slice's too, so that empty slices at different places are different slices as members of a compared composite, as C's are (`goose_spec.md` §4.5), but for one at the end of the run (`lo == n`: `s[s.len..]`, `s[s.len..s.len]`), whose address in C is one past the run's last byte. The run may be an export fn's argument that ends where its allocation on Go's heap does, and an address one past that is no valid Go pointer: `-d=checkptr`, which `-race` turns on, aborts on one, and Go's collector may take one for a bad pointer into its heap (issue #39). Such a slice starts at a word of the runtime's own instead (`gsSubEnd`, outside Go's heap), where no slice of the run, nor the nil one, starts, so that it still differs from all of them; every such slice starts there, as Go's zero-size allocations all start at one address.
 - **Resizable Headers (`GsRhdr`)**:
   ```go
   type GsRhdr struct {
