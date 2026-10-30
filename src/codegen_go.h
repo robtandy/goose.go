@@ -79,7 +79,9 @@
 //   a goroutine running its thread program on a block of its own; in a
 //   program with workers each thread program has an instance of its own of
 //   the globals (gsGlobals), which its functions reach through the block
-//   (gs_gl), and a queue is a GsQueue per element type.
+//   (gs_gl), and a queue is a GsQueue per element type. An export fn's call
+//   runs on an instance of its block's own, there and in a program whose
+//   export fns' calls reach a global's own data stack (issue #25).
 //
 // This version covers scalars and their operators and conversions,
 // fixed-size values, the values on data stacks (codegen_go_rz.h,
@@ -732,28 +734,44 @@ struct CodeGenGo {
     // ------------------------------------------------------------------
     // Workers, queues and program instances (codegen_go_threads.h, §11.2).
 
-    // The program spawns workers: every global that is not read-only static
-    // data is a member of a program instance (gsGlobals), which a function
-    // reaches through its block's (gs_gl, from gs.Gl), main's instance being
-    // the static gsGlobalsMain and a worker's a copy taken at its spawn.
-    // Without workers the globals are package variables, as they always were.
+    // The program spawns workers (thread_spawn, §11.2).
     bool workers = false;
+    // The program keeps its globals in program instances: every global that
+    // is not read-only static data is a member of gsGlobals, which a
+    // function reaches through its block's (gs_gl, from gs.Gl), main's
+    // instance being the static gsGlobalsMain. So it is where the program
+    // spawns workers, a worker's instance a copy its spawn takes, and where
+    // an export fn's calls reach a global's own data stack, growing it or
+    // handing on a reference to it (issue #25), an export's call's instance
+    // a copy of the package's whose globals' stacks are its block's
+    // (EnsureInstanceFn). Without instances the globals are package
+    // variables, as they always were.
+    bool instances = false;
+    // Whether an export fn's calls reach a global's own data stack, which
+    // only the functions' Go tells, where the program is generated without
+    // instances: GoBackend generates it again, with them.
+    bool again = false;
+    bool ExportsReachGlobalStacks();
     bool usesthreads = false;   // The runtime's workers and queues are written in.
     string glfields;            // gsGlobals's members.
     string qdecls;              // The queues, one per element type.
     // The specializations whose bodies name the instance, which take the
     // block for it (ComputeGsNeeds).
     set<FnSpec *> glusers;
-    // A global's stack index field, as the instance names it, by the
-    // expression a stack takes (gs_gl.gsGStk_<name>), in gstkorder's order.
+    // The constant index of each global's stack in the main program's
+    // layout (gsGStk_<name>), in gstkorder's order. In a program with
+    // workers, whose blocks each lay their stacks out their own way, the
+    // instance has a field of the name too, the expression the stack takes
+    // (gs_gl.gsGStk_<name>); in one without, every block has main's layout,
+    // and the stack takes the constant.
     vector<string> gstkfields;
     unordered_map<string, string> queues;   // Element type mangle -> queue.
     unordered_map<FnSpec *, string> thunks;  // A worker's entry -> its thunk.
     unordered_map<FnSpec *, vector<VarDef *>> threadglobals;
     void FindWorkers();
-    // `name` as a member of the instance where the program has workers, as a
-    // package variable otherwise.
-    string GlName(const string &name) { return workers ? cat("gs_gl.", name) : name; }
+    // `name` as a member of the instance where the program has instances, as
+    // a package variable otherwise.
+    string GlName(const string &name) { return instances ? cat("gs_gl.", name) : name; }
     // A finished body's text, with the instance read from the block where
     // it names it: whether it does.
     bool UsesGl(string &fb);
@@ -770,13 +788,19 @@ struct CodeGenGo {
     void EmitGlobalRecv(VarDef *d, const string &img, const string &sz, const string &stkidx);
     string EmitQPut(Call *c, vector<Node *> &an);
     vector<string> EmitQGet(Call *c, const GoDst &d0);
-    // The export fns' entry points' instances in a program with workers:
+    // The export fns' entry points' instances in a program with instances:
     // the functions copying the globals an export's calls reach (or any
     // export's) from the package's instance into a block's (gsEnter_<fn>,
     // gsEnter).
     unordered_map<FnSpec *, string> instfns;
     string EnsureInstanceFn(FnSpec *sp);
     vector<VarDef *> &InstanceGlobals(FnSpec *entry);
+    // Whether the copy of a global that an export's call takes into its
+    // instance may go on pointing into the package's storage, and the
+    // globals the program's start names, which may leave one so.
+    bool CopyShares(VarDef *d);
+    set<const VarDef *> startnamed;
+    bool startwalked = false;
 
     // ------------------------------------------------------------------
     // Per-specialization interface. A function's Go parameters are the data
@@ -1134,7 +1158,7 @@ struct CodeGenGo {
     // an export fn's entry points hand its function stays in Go's own
     // variables while the call runs, which lets them hand it on as it is
     // (issue #22).
-    bool HoldsAddr(TypeExpr *t);
+    bool HoldsAddr(TypeExpr *t, bool relative = true);
     bool ArgsStayInGo(FnSpec *sp);
     void EmitExports();
     // The specializations whose code names a global's own data stack
@@ -1228,7 +1252,9 @@ struct CodeGenGo {
     // Source() writes as it writes the program's file.
     string runtimefiletext;
 
-    CodeGenGo(Ast &_ast, const GoOptions &o) : ast(_ast), opts(o) {
+    // The program generated; with inst, with its globals in instances
+    // whether or not it spawns workers (GoBackend).
+    CodeGenGo(Ast &_ast, const GoOptions &o, bool inst = false) : ast(_ast), opts(o), instances(inst) {
         debug = opts.debug;
         maxstacks = opts.stacks.maxstacks;
         for (auto &inc : opts.includes) {
@@ -1239,6 +1265,7 @@ struct CodeGenGo {
         }
         CollectSpecs();
         FindWorkers();
+        instances = instances || workers;
         ComputeRelRootMax();
         EmitGlobalDecls();
         for (auto sp : livespecs) EmitSpec(sp);
@@ -1246,11 +1273,31 @@ struct CodeGenGo {
         // The element-run twins last: the globals' initializers can ask for
         // one too, and a twin for another.
         for (size_t i = 0; i < erqueue.size(); i++) EmitSpec(erqueue[i], true);
+        // An export fn whose calls reach a global's own data stack runs on an
+        // instance of its block's own, which the Go of every function naming
+        // a global has to read (issue #25): the program is generated again,
+        // with instances.
+        if (!instances && ExportsReachGlobalStacks()) {
+            again = true;
+            return;
+        }
         EmitProgram();
         EmitRenderFns();
         EmitTypeDecls();
         ResolveGsArgs();
     }
 };
+
+// The Go of the checked program (CodeGenGo). An export fn whose calls reach
+// a global's own data stack, growing it or handing on a reference to it,
+// needs the program's globals in instances, of which each block it runs on
+// has its own (issue #25), and only the functions' Go tells whether one
+// does (ExportsReachGlobalStacks): such a program is generated twice, the
+// second time with instances. Every other is generated once, as it was.
+inline unique_ptr<CodeGenGo> GoBackend(Ast &ast, const GoOptions &o) {
+    auto cg = make_unique<CodeGenGo>(ast, o);
+    if (cg->again) cg = make_unique<CodeGenGo>(ast, o, true);
+    return cg;
+}
 
 }  // namespace goose

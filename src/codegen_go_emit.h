@@ -806,12 +806,14 @@ inline void CodeGenGo::EmitGlobalDecls() {
                 cstatic[d] = g->inits[di];
         }
     FindUsedGlobals();
-    // A global of a program with workers is a member of the program
+    // A global of a program with instances is a member of the program
     // instance (gsGlobals), but for read-only static data, which every
-    // instance shares (§6.3); a dedicated stack is the instance's too, the
-    // index of the block's stack it is (codegen_go_threads.h).
+    // instance shares (§6.3); a dedicated stack is the stack of the block
+    // the instance is on, whose index is the instance's too where the program
+    // has workers, whose blocks lay their stacks out each its own way
+    // (codegen_go_threads.h).
     auto var = [&](const VarDef *d, const string &name, const string &gt) {
-        if (workers && !cstatic.count(d)) {
+        if (instances && !cstatic.count(d)) {
             Append(glfields, "\t", name, " ", gt, "\n");
             return GlName(name);
         }
@@ -973,27 +975,27 @@ inline void CodeGenGo::EmitProgram() {
     }
     // The globals' dedicated stacks follow the main program's in its block,
     // where main's instance has them (and an export's call's, in a program
-    // with workers).
+    // with instances).
     if (!gstkfields.empty()) {
         Append(gdecls, "\n// The dedicated data stacks of the globals that live on one, which follow\n"
                        "// the main program's own in its block.\nconst (\n");
         for (size_t i = 0; i < gstkfields.size(); i++)
             Append(gdecls, "\t", gstkfields[i], " = ", mainstacks + (int64_t)i, "\n");
-        if (workers) Append(gdecls, "\tgsGStkEnd = ", mainstacks + globalregions, "\n");
+        if (instances) Append(gdecls, "\tgsGStkEnd = ", mainstacks + globalregions, "\n");
         Append(gdecls, ")\n");
     }
     // Under GS_STACK_STATS the program reports, as it ends, the stacks it
     // took, as C's gs_stack_stats does.
     string stats;
     if (opts.stackstats && !opts.library) stats = cat("\tgsProg.StackStats(gs, ", mainstacks, ")\n");
-    // In a program with workers, main's block runs main's instance, which
+    // In a program with instances, main's block runs main's instance, which
     // the export fns' entry points copy their globals from.
     string inst;
-    if (workers) inst = "\tgs.Gl = unsafe.Pointer(&gsGlobalsMain)\n\tgsMainBlock = gs\n";
+    if (instances) inst = "\tgs.Gl = unsafe.Pointer(&gsGlobalsMain)\n\tgsMainBlock = gs\n";
     auto start = cat("\tgsProg.Start(", opts.stacks.budget, ", ", mainstacks + globalregions, ", ", workerregions, ")\n"
                      "\tgs := gsProg.NewStackBlock(", mainstacks + globalregions, ", gsStackReserve, gsStackGap)\n",
                      inst, "\tgsInitGlobals(gs)\n");
-    libstart = opts.library && (workers || !initempty || globalregions > 0);
+    libstart = opts.library && (instances || !initempty || globalregions > 0);
     if (opts.library && !libstart) {
         // Nothing to start, and no gsInitGlobals for a start to call.
         code.erase(initat, initlen);
@@ -1443,15 +1445,22 @@ inline string CodeGenGo::Source(const string &srcname) {
         return s;
     };
     string name = ascii(srcname);
-    // A program with workers keeps its globals in program instances.
+    // A program with instances keeps its globals in them: one with workers,
+    // and one whose export fns' calls reach a global's own data stack.
     string inst;
     if (workers)
-        inst = cat("// The globals of a program instance (§11.1, §11.2), which every thread program has\n"
-                   "// of its own: main's is gsGlobalsMain, a worker's the copy its spawn took. Read-only\n"
-                   "// static data is not among them, which every instance shares as it is.\n"
-                   "type gsGlobals struct {\n", glfields, "}\n\nvar gsGlobalsMain gsGlobals\n\n"
-                   "// The block main's program runs, whose stacks hold main's instance's values.\n"
-                   "var gsMainBlock *GsStackBlock\n\n");
+        inst = "// The globals of a program instance (§11.1, §11.2), which every thread program has\n"
+               "// of its own: main's is gsGlobalsMain, a worker's the copy its spawn took. Read-only\n"
+               "// static data is not among them, which every instance shares as it is.\n";
+    else if (instances)
+        inst = "// The globals of a program instance (§11.1), which every block an export fn's call\n"
+               "// runs on has of its own, a copy of the package's, whose values on data stacks are on\n"
+               "// the block's: main's is gsGlobalsMain, on gsMainBlock. Read-only static data is not\n"
+               "// among them, which every instance shares as it is.\n";
+    if (instances)
+        inst += cat("type gsGlobals struct {\n", glfields, "}\n\nvar gsGlobalsMain gsGlobals\n\n"
+                    "// The block main's program runs, whose stacks hold main's instance's values.\n"
+                    "var gsMainBlock *GsStackBlock\n\n");
     if (!qdecls.empty()) inst += cat("// The queues (§11.2), one per element type.\n", qdecls, "\n");
     if (usesos)
         inst += cat("// os.resource_dir's directory where it is not the executable's: the entry\n"

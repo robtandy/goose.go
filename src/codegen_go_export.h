@@ -29,7 +29,12 @@
 //   and as a []byte. A const u8[:] result is a []byte viewing what the
 //   slice does. In a library, each starts the package at its first call
 //   (gsLibStart). A call on a block turns panic on fault on for itself
-//   only, on its caller's goroutine.
+//   only, on its caller's goroutine. In a program with instances -- one
+//   with workers, or one whose export fns' calls reach a global's own data
+//   stack (issue #25) -- a call runs on a program instance of its block's
+//   own (EnsureInstanceFn): a block the caller keeps keeps its globals
+//   across calls, and a pooled call starts from a copy of the package's,
+//   its result crossing as a copy where it views the block (GsKeep).
 // * An --include file is Go source: its package clause and build
 //   constraints are dropped, its imports join the generated file's, and the
 //   rest follows the program, each run of lines between blank ones under a
@@ -323,12 +328,15 @@ static string GoExportParam(string_view name, set<string> &taken) {
 
 // Whether a value of type t holds an address in its own bytes: it is a
 // reference or a slice, or has a field or an element at any depth that is
-// one (whatever what it points at holds).
-inline bool CodeGenGo::HoldsAddr(TypeExpr *t) {
+// one (whatever what it points at holds). Without relative, a relative
+// reference is none: an offset within its root, which a copy of the root
+// moves with.
+inline bool CodeGenGo::HoldsAddr(TypeExpr *t, bool relative) {
     set<const void *> open;
     function<bool(TypeExpr *)> rec = [&](TypeExpr *x) -> bool {
         switch (x->kind) {
-            case TY_REF: case TY_SLICE: return true;
+            case TY_REF: return relative || !IsRelRef(x);
+            case TY_SLICE: return true;
             case TY_ARRAY: return rec(x->arr->sub);
             case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
                 for (auto &run : FieldRuns(x)) {
@@ -435,12 +443,35 @@ static void GoTypeNames(const string &gt, set<string> &names) {
     }
 }
 
+// Whether an export fn's calls, its own body included, reach a global's own
+// data stack (gstkusers), growing it or handing on a reference to it: the
+// program's block holds that stack, where an entry point runs on another.
+// Such an export runs on a program instance of its block's own, whose
+// globals' stacks are the block's (issue #25), so the program needs
+// instances, workers or not (GoBackend).
+inline bool CodeGenGo::ExportsReachGlobalStacks() {
+    for (auto sf : ast.functions) {
+        if (!sf->isexport || sf->specs.size() != 1 || !sinfo.count(sf->specs[0])) continue;
+        set<FnSpec *> seen;
+        vector<FnSpec *> work = { sf->specs[0] };
+        while (!work.empty()) {
+            auto f = work.back();
+            work.pop_back();
+            if (!seen.insert(f).second) continue;
+            if (gstkusers.count(f)) return true;
+            for (auto k : calleesof[f]) work.push_back(k);
+        }
+    }
+    return false;
+}
+
 // The Go entry points of the program's export fns (DESIGN.md §3.5), into
 // xcode, once the program's data stack counts are known and which
 // functions take the block: the export fn's own count is what its
-// entry points make sure the block has. An export's calls may not reach a
-// global's own data stack, which the program's block holds (its index is
-// one there), where an entry point runs on another.
+// entry points make sure the block has. In a program with instances, an
+// export's call that takes the block runs on an instance of the block's
+// own, whose globals' stacks are the block's; in any other, an export's
+// calls reach no global's own data stack (ExportsReachGlobalStacks).
 inline void CodeGenGo::EmitExports() {
     set<string> names;
     // Every export fn's Name and NameWithStack, which no NameString or
@@ -473,21 +504,6 @@ inline void CodeGenGo::EmitExports() {
         // through a function of the program's own, gsWithStack_Name.
         if (opts.nowithstack) with = cat("gsWithStack_", name);
         else entrynames.insert(with);
-        // What its calls reach, its own body included. In a program with
-        // workers a call runs on an instance of its block's own, whose
-        // globals' stacks are the block's (codegen_go_threads.h).
-        set<FnSpec *> seen;
-        vector<FnSpec *> work = { sp };
-        while (!work.empty() && !workers) {
-            auto f = work.back();
-            work.pop_back();
-            if (!seen.insert(f).second) continue;
-            if (gstkusers.count(f))
-                Unsupported(ln, cat("export fn ", sf->name, ", whose calls reach the data stack of a global that "
-                                    "lives on one of its own (growing it, or handing on a reference to it), which "
-                                    "the program's block holds,"));
-            for (auto k : calleesof[f]) work.push_back(k);
-        }
         auto stacks = ProgramStacksOf(*this, { sp });
         auto takesgs = si.needssp || si.needsgs || (specnum.count(sp) && gsneeds[specnum[sp]]);
         // Where every address the function is handed stays in Go's own
@@ -583,11 +599,11 @@ inline void CodeGenGo::EmitExports() {
             if (!rt.empty()) s += "\treturn gs_r\n";
             return s;
         };
-        // In a program with workers, a call that takes the block runs on its
-        // program instance (§11.2): one of the block's own, which a block a
-        // caller keeps keeps across its calls, and one copied for the call
-        // from the package's where the block comes from the pool.
-        auto inst = workers && takesgs;
+        // In a program with instances, a call that takes the block runs on
+        // its program instance (§11.1, §11.2): one of the block's own, which
+        // a block a caller keeps keeps across its calls, and one copied for
+        // the call from the package's where the block comes from the pool.
+        auto inst = instances && takesgs;
         // The functions filling the instance, emitted before the entry points.
         auto enterall = inst ? EnsureInstanceFn(nullptr) : string();
         auto enter = inst ? EnsureInstanceFn(sp) : string();

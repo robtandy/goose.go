@@ -4,7 +4,8 @@
 // (goose_spec.md §11.2), and the program instances a program with workers
 // keeps its globals in (implementation.md §6.3, §6.8), as the C backend has
 // them (codegen_builtins.h, codegen_emit.h) and the Go runtime runs them
-// (go_runtime_threads, codegen_go_runtime.h).
+// (go_runtime_threads, codegen_go_runtime.h), as does a program whose export
+// fns' calls reach a global's own data stack (issue #25).
 //
 // * A worker is a goroutine running its thread program on a GsStackBlock of
 //   its own, its own data stacks, fixed-frame stack and program instance
@@ -14,18 +15,22 @@
 //   of the worker's own, and the worker's thunk (gsTmain_<worker>) unpacks
 //   it, the resizable values onto fresh stacks of its block, before it runs
 //   the body.
-// * In a program with workers, every global that is not read-only static
-//   data (CStaticInit) is a member of gsGlobals, of which each thread
-//   program has an instance of its own, and every function that names one
-//   reaches it through the block it is handed: gs_gl := (*gsGlobals)(gs.Gl),
-//   one load at its start. A global's dedicated stack is the stack of the
-//   block its instance names (gs_gl.gsGStk_<name>). Main's instance is the
-//   static gsGlobalsMain. A program without workers keeps its globals in
-//   package variables, as it always did.
-// * The export fns' entry points of a program with workers run each call on
-//   an instance of the block's own (EnsureInstanceFn), so that goroutines
-//   calling them at once share no globals: a copy of the package's instance
-//   of the globals the export's calls reach, taken as the call starts.
+// * In a program with instances -- one with workers, or one whose export
+//   fns' calls reach a global's own data stack (issue #25) -- every global
+//   that is not read-only static data (CStaticInit) is a member of
+//   gsGlobals, of which each thread program has an instance of its own, and
+//   every function that names one reaches it through the block it is
+//   handed: gs_gl := (*gsGlobals)(gs.Gl), one load at its start. A global's
+//   dedicated stack is the stack of the block its instance is on, at the
+//   index its instance names (gs_gl.gsGStk_<name>) in a program with
+//   workers, and at the main program's (gsGStk_<name>) in one without.
+//   Main's instance is the static gsGlobalsMain. Any other program keeps
+//   its globals in package variables, as it always did.
+// * The export fns' entry points of a program with instances run each call
+//   on an instance of the block's own (EnsureInstanceFn), so that
+//   goroutines calling them at once share no globals: a copy of the
+//   package's instance of the globals the export's calls reach, taken as
+//   the call starts.
 // * A queue is a GsQueue per element type, holding the image of each value
 //   put: a fixed-size value's bytes, a bytes value's image, a resizable's
 //   count, its frame object's fixed fields and its elements (EmitRzImage).
@@ -51,7 +56,7 @@ inline void CodeGenGo::FindWorkers() {
 // A finished body that names the instance reads it from its block first,
 // once: whether it does (the function then takes the block, ComputeGsNeeds).
 inline bool CodeGenGo::UsesGl(string &fb) {
-    if (!workers) return false;
+    if (!instances) return false;
     unordered_map<string, int> uses;
     for (size_t pos = 0; pos < fb.size();) {
         auto nl = fb.find('\n', pos);
@@ -614,25 +619,97 @@ inline vector<string> CodeGenGo::EmitQGet(Call *c, const GoDst &d0) {
 // ------------------------------------------------------------------
 // The export fns' instances.
 
+// Whether the copy of the global d that an export's call takes into its
+// instance (EnsureInstanceFn) may go on pointing into the package's storage,
+// which every call shares: the package's data stacks, or its instance. So
+// may a reference to a data stack (a fat or a pool reference), and any
+// other reference or slice d holds (a relative one aside, an offset within
+// its root, which moves with the copy) where the program's start may leave
+// it pointing anywhere but at static data -- the start is all that ever
+// writes the package's instance but for a fn main(), which runs on it. It
+// cannot where d is a `let` whose references all lead into static data, as
+// the checker lets a worker copy one (TypeCheck::StaticViewsOnly, §11.2);
+// nor where d's initializer holds static data's alone -- a null, a literal,
+// a string -- and nothing else of the start names d: no other global's
+// initializer, no function one calls, and in a program, none fn main()
+// reaches.
+inline bool CodeGenGo::CopyShares(VarDef *d) {
+    if (PrefVar(d) || HoldsFatRef(d->type)) return true;
+    if (!HoldsAddr(d->type, false)) return false;
+    if (!d->isvar) {
+        auto statics = [](const Roots &r) {
+            return !r.unknown && r.All([](const RootAlt &a) { return !a.root && a.exact; });
+        };
+        auto k = d->type->kind;
+        if (k == TY_REF || k == TY_SLICE ? statics(d->ref) : statics(d->contents)) return false;
+    }
+    // The globals the start names, every one the code it runs does.
+    if (!startwalked) {
+        startwalked = true;
+        set<FnSpec *> seen;
+        function<void(Node *)> walk = [&](Node *n) {
+            if (!n) return;
+            if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->isglobal) startnamed.insert(id->vdef);
+            if (auto c = Is<Call>(n)) {
+                vector<FnSpec *> ks = { c->spec, ExportOfExtern(c->spec) };
+                ks.insert(ks.end(), c->dispatch.begin(), c->dispatch.end());
+                for (auto &fs : c->fmtspecs) ks.push_back(fs.second);
+                for (auto k : ks)
+                    if (k && k->body && seen.insert(k).second) walk(k->body);
+            }
+            RunChildren(n, walk);
+        };
+        for (auto g : ast.globals)
+            for (auto i : g->inits) walk(i);
+        auto mainsf = ast.MainFunction();
+        if (!opts.library && mainsf && !mainsf->specs.empty() && seen.insert(mainsf->specs[0]).second)
+            walk(mainsf->specs[0]->body);
+    }
+    if (startnamed.count(d)) return true;
+    // What its initializer leaves in it: a literal of no address but static
+    // data's, or with none, the default value of its type, which holds none.
+    function<bool(Node *)> literal = [&](Node *n) -> bool {
+        if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) || Is<NullLit>(n)) return true;
+        if (auto u = Is<Unary>(n)) return u->op == T_MINUS && literal(u->child);
+        if (!Is<ArrayLit>(n) && !Is<StructLit>(n)) return false;
+        auto all = true;
+        RunChildren(n, [&](Node *c) { all = all && literal(c); });
+        return all;
+    };
+    for (auto g : ast.globals)
+        for (size_t i = 0; i < g->defs.size(); i++)
+            if (g->defs[i] == d) return i < g->inits.size() && !literal(g->inits[i]);
+    return true;
+}
+
 // The globals an export's calls reach, of the instance (ThreadGlobals): what
-// its entry points copy for it. One holding a reference to a data stack
-// cannot be copied into another block: the copy would reach the package's
-// instance's storage, which it shares with every other call.
+// its entry points copy for it. One whose copy would go on pointing into
+// the package's storage cannot be copied into another block (CopyShares):
+// the copy would reach the package's instance's storage, which it shares
+// with every other call.
 inline vector<VarDef *> &CodeGenGo::InstanceGlobals(FnSpec *entry) {
     auto &gl = ThreadGlobals(entry);
-    for (auto d : gl)
+    for (auto d : gl) {
+        if (!CopyShares(d)) continue;
         if (PrefVar(d) || HoldsFatRef(d->type))
             Unsupported(entry->sf->line, cat("export fn ", entry->sf->name, ", whose calls reach the global ", d->name,
-                                             ", which holds a reference to a data stack, in a program with workers,"));
+                                             ", which holds a reference to a data stack, where each call runs on a "
+                                             "program instance of its block's own,"));
+        Unsupported(entry->sf->line, cat("export fn ", entry->sf->name, ", whose calls reach the global ", d->name,
+                                         ", which may hold a reference or a slice into the package's storage as "
+                                         "the program starts, where each call runs on a copy of it in a program "
+                                         "instance of its block's own,"));
+    }
     return gl;
 }
 
 // The function giving a block a program instance of its own for a call of
 // the export fn sp (gsEnter_<export>), or of any export, where sp is null
 // (gsEnter): copies of the package's globals they reach, from the package's
-// instance on the block that main's program (or the package's init) runs,
+// instance on the block that main's program (or the library's start) runs,
 // a value on a stack of its own landing on the block's stack the main
-// program's layout gives it (gsGStk_<name>).
+// program's layout gives it (gsGStk_<name>), whose index the instance holds
+// too in a program with workers.
 inline string CodeGenGo::EnsureInstanceFn(FnSpec *sp) {
     if (auto it = instfns.find(sp); it != instfns.end()) return it->second;
     auto name = Unique(sp ? cat("gsEnter_", sinfo.at(sp).name) : string("gsEnter"));
@@ -651,8 +728,11 @@ inline string CodeGenGo::EnsureInstanceFn(FnSpec *sp) {
     // which the value there tops, onto the block's stack of it, newstart
     // pointing at them.
     auto copyrun = [&](const string &stkfield, const string &start, const string &newstart) {
-        auto k = stkfield.substr(6);   // The main program's index of it, a constant.
-        L(stkfield, " = ", k);
+        // The main program's index of it, a constant, which the instance's
+        // member is set to where it has one.
+        auto member = stkfield.compare(0, 6, "gs_gl.") == 0;
+        auto k = member ? stkfield.substr(6) : stkfield;
+        if (member) L(stkfield, " = ", k);
         L(Top(k), " = gs.Base[", k, "]");
         auto n = T();
         Decl(n, "int64", cat("int64(uintptr(gsMainBlock.Stks[", k, "]) - uintptr(", start, "))"));
@@ -663,7 +743,7 @@ inline string CodeGenGo::EnsureInstanceFn(FnSpec *sp) {
     auto stacks = false;
     for (auto d : sp ? InstanceGlobals(sp) : ThreadGlobals(nullptr)) {
         auto t = d->type;
-        if (!sp && (PrefVar(d) || HoldsFatRef(t))) continue;   // No export reaches it.
+        if (!sp && CopyShares(d)) continue;   // No export reaches it.
         auto gn = gnames.at(d);
         if (!IsBytesT(t)) {
             if (TI(t, d->line).size) L(gn, " = ", src(gn));

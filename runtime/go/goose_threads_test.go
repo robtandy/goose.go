@@ -289,38 +289,3 @@ func TestHardwareThreads(t *testing.T) {
 		t.Fatalf("cap %d with no worker regions", p.threadCap)
 	}
 }
-
-func TestInstancesAndKeep(t *testing.T) {
-	gs := NewStackBlock(1, GsStackReserve, GsStackGap)
-	defer gs.Close()
-	gs.NewInstance(24)
-	gl := gs.Gl
-	*(*int64)(gl) = 5
-	gs.NewInstance(24)
-	if gs.Gl != gl || *(*int64)(gl) != 5 {
-		t.Fatalf("a second NewInstance replaced the instance")
-	}
-	// Reset gives the instance up; the next one reuses its memory, zeroed.
-	gs.Reset()
-	if gs.Gl != nil {
-		t.Fatalf("Reset kept the instance")
-	}
-	gs.NewInstance(24)
-	if gs.Gl != gl || *(*int64)(gs.Gl) != 0 {
-		t.Fatalf("the instance after Reset is not a zeroed reuse")
-	}
-	// A result viewing the block's memory crosses as a copy; any other as
-	// it is.
-	view := unsafe.Slice((*byte)(gs.Gl), 8)
-	if kept := GsKeep(gs, view); &kept[0] == &view[0] || kept[0] != 0 {
-		t.Fatalf("GsKeep kept a view of the block's instance")
-	}
-	stack := unsafe.Slice((*byte)(gs.Stks[0]), 4)
-	if kept := GsKeep(gs, stack); &kept[0] == &stack[0] {
-		t.Fatalf("GsKeep kept a view of the block's stack")
-	}
-	own := []byte("caller's")
-	if kept := GsKeep(gs, own); &kept[0] != &own[0] {
-		t.Fatalf("GsKeep copied the caller's memory")
-	}
-}

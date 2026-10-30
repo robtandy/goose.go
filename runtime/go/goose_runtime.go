@@ -70,11 +70,13 @@ type GsStackBlock struct {
 	Frame     unsafe.Pointer
 	FrameBase unsafe.Pointer
 	FrameEnd  unsafe.Pointer
-	// The program instance the block runs (§11.2), in a program with
-	// workers: its globals, which the generated code lays out (gsGlobals).
-	// Main's is a static one; a worker's, and an export's caller's, is in
-	// memory of the block's own (inst), outside the Go heap, as the data
-	// stacks are. nil where the block has none yet.
+	// The program instance the block runs (§11.1, §11.2), in a program
+	// that keeps its globals in instances -- one with workers, or one whose
+	// export fns grow a global on a data stack of its own: its globals,
+	// which the generated code lays out (gsGlobals). Main's is a static one;
+	// a worker's, and an export's caller's, is in memory of the block's own
+	// (inst), outside the Go heap, as the data stacks are. nil where the
+	// block has none yet.
 	Gl      unsafe.Pointer
 	inst    []byte
 	worker  int64 // The worker running on the block, its id plus one; 0 for none.
@@ -337,6 +339,17 @@ func (gs *GsStackBlock) Owns(p unsafe.Pointer) bool {
 		}
 	}
 	return in(gs.frame) || in(gs.inst)
+}
+
+// GsKeep is s, or where it views memory of gs's own -- a global of the
+// program instance a call of an export fn ran on -- a copy of it on Go's
+// heap: an export's result crosses to its caller once the call's block is
+// back in the pool, where the next call takes its memory.
+func GsKeep[T any](gs *GsStackBlock, s []T) []T {
+	if len(s) == 0 || !gs.Owns(unsafe.Pointer(unsafe.SliceData(s))) {
+		return s
+	}
+	return append([]T(nil), s...)
 }
 
 // ---------------------------------------------------------------------------
