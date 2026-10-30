@@ -45,7 +45,9 @@
 //   slice a GsSlice, so that the Go collector sees every address into memory
 //   it manages. A place -- a variable, field, element or pointee -- is a Go
 //   lvalue (GoLoc, codegen_go_places.h). A fixed array that is a Go local's
-//   own is indexed as Go indexes it, which leaves the local a Go value.
+//   own is indexed as Go indexes it, which leaves the local a Go value, and
+//   an inlined body's reference parameter bound to a place of a Go local's
+//   own is that place, which leaves the local a Go value too (BindRefPlace).
 //
 // * An integer assembled from the bytes of consecutive elements of a u8
 //   array or slice, or taken apart into them, whose bounds BCE proved, is one
@@ -377,6 +379,23 @@ struct CodeGenGo {
     GoLoc VarLoc(const VarDef *vd, Line ln);
     void DerefLoc(GoLoc &l);
     string RelLoad(const GoLoc &slot);
+    // By-reference parameters of inlined bodies (issue #24, DESIGN.md
+    // §3.6). An inlined call's reference parameter bound to a place of a Go
+    // local's own (GoLoc::golocal) is no Go variable: the reference it holds
+    // is that place's address, which never changes, and a dereference of it
+    // is the place itself, so the body reads and writes the local where it
+    // is and takes no address of it, which would move the local into the
+    // function's frame (FinishBody). refvars holds each such parameter's
+    // reference value, `&lv` as RefOfLoc spells it, and refplaces the place
+    // each such value names, by its text, which every dereference of a
+    // reference value looks up (RefPlace). Only a use of the reference as a
+    // value -- handed to a call that stays a call, stored, returned, compared
+    // for identity -- spells the address, and the local then takes the frame
+    // as it did.
+    unordered_map<const VarDef *, string> refvars;
+    unordered_map<string, GoLoc> refplaces;
+    bool BindRefPlace(VarDef *d, Node *init);
+    const GoLoc *RefPlace(const string &x, TypeExpr *rt);
     // A fill's value, evaluated once for all its repetitions (FreezeFill).
     unordered_map<Node *, GoLoc> fillvalues;
     GoLoc GenLoc(Node *n);
@@ -386,6 +405,7 @@ struct CodeGenGo {
     string AdaptToLimited(const GoLoc &l, TypeExpr *et, Line ln);
     void CopyIntoLimited(const GoLoc &l, TypeExpr *et, Line ln, const GoLoc &dst);
     string GenRefVal(Node *child, Line ln);
+    string RefValOf(const GoLoc &l, Line ln);
     string CoerceVal(const string &x, TypeExpr *from, TypeExpr *to, Line ln);
     // The widest fixed-size value holding relative references (§3.9).
     int64_t relrootmax = 0;
@@ -885,6 +905,8 @@ struct CodeGenGo {
         unordered_map<string, int> fnnextsuffix;
         unordered_map<const VarDef *, string> vnames;
         set<const VarDef *> fvptr;
+        unordered_map<const VarDef *, string> refvars;
+        unordered_map<string, GoLoc> refplaces;
         vector<GoScope> scopes;
         bool dead = false;
         int dry = 0;
