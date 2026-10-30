@@ -95,6 +95,14 @@ line annotates must take as many slots on the fixed-frame stack as it
 names, `none` none at all, a local handed to an inlined body by reference
 staying a Go local unless its address outlives the body (Runner.frames).
 
+The entry points of the kernels of test/go/export/inlining/ (issue #22) are
+read as Go compiles them, at -O2 and at -O0 (`go test -c -gcflags=-m=2`):
+each export fn an `// entry:` line annotates must have entry points Go can
+inline (`inline`), and whose slice and pointer parameters do not escape (`no
+escape`) or all do (`escape`); and each callX function of its tests, a call
+of an entry point, must be the same instructions for arm64 and for amd64 as
+directX, the call of its function written by hand (Runner.entry_points).
+
 The runtime (issue #19): every program (at -O2), fixture, sample, overflow
 case and export library is compiled again with --go-runtime=import, into a
 module that requires the runtime's package, runtime/go, and built with
@@ -139,6 +147,7 @@ backend's runs instead of comparing with it.
 import argparse
 import concurrent.futures
 import contextlib
+import difflib
 import os
 import random
 import re
@@ -968,6 +977,107 @@ def frame_slots(gosrc, fn):
     if not m:
         return None
     return m[0], len(re.findall(r"^\t\tgs_fo\d+ += gs_fo\d+ \+", m[0], re.M))
+
+
+# --- the entry points of pure kernels (issue #22) -----------------------------
+
+# What an `// entry:` line can say of an export fn's entry points: Go can
+# inline each; none lets a parameter viewing its caller's memory escape; each
+# lets every one escape.
+ENTRY_PROPS = {"inline", "no escape", "escape"}
+
+
+def go_export_name(sym):
+    """The Go name of an export fn's symbol (GoExportName): its words
+    between the underscores, each capitalized."""
+    return "".join(w[:1].upper() + w[1:] for w in sym.split("_"))
+
+
+def entry_annotations(src):
+    """The export fns of src an `// entry:` comment line above names what Go
+    makes of their entry points: the Go name of each -> the set of what its
+    line lists, of ENTRY_PROPS."""
+    want, pending = {}, None
+    for line in src.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^// entry: (.+)$", line)
+        if m:
+            pending = set(m[1].split(", "))
+            continue
+        m = re.match(r'^export (?:"(\w+)" )?fn (\w+)\(', line)
+        if m and pending is not None:
+            want[go_export_name(m[1] or m[2])] = pending
+        if not line.startswith("//"):
+            pending = None
+    return want
+
+
+def go_entry_points(gosrc, name):
+    """The entry points of the export fn whose Go name is name in the
+    generated Go gosrc -- Name, NameWithStack, NameString and NameBytes, those
+    it has -- each as (its name, its line, its parameters that view a
+    caller's memory: slices, strings, pointers and the type parameters that
+    stand for a string or a []byte, and whether it is generic)."""
+    found = []
+    for n, line in enumerate(gosrc.splitlines(), 1):
+        m = re.match(rf"^func ({re.escape(name)}(?:WithStack|String|Bytes)?)(\[.*?\])?\((.*?)\)[^()]* \{{$", line)
+        if not m:
+            continue
+        tparams = set(re.findall(r"(\w+) ~", m[2] or ""))
+        views = []
+        for p in m[3].split(", ") if m[3] else []:
+            pn, _, pt = p.partition(" ")
+            if pn != "gs" and (pt.startswith(("[]", "*")) or pt == "string" or pt in tparams):
+                views.append(pn)
+        found.append((m[1], n, views, bool(tparams)))
+    return found
+
+
+def call_pairs(testsrc):
+    """The names X of the test source's functions callX that a directX
+    follows: a call of an entry point, and the call of its function that
+    entry point makes, which Runner.entry_points compares."""
+    calls = re.findall(r"^func call(\w+)\(", testsrc, re.M)
+    return [x for x in calls if re.search(rf"^func direct{x}\(", testsrc, re.M)]
+
+
+def asm_instructions(asm, fn):
+    """The instructions of the function fn in the output of `go build
+    -gcflags=-S`, as text naming nothing of the function's own: without the
+    TEXT line, the collector's data and the inline marks (NOP, arm64's HINT
+    $0, amd64's XCHGL AX, AX), with each branch's target the index of the
+    instruction it goes to, and the compiler's temporaries unnumbered. None
+    where fn is not there."""
+    insts, on = [], False
+    for line in asm.splitlines():
+        m = re.match(r"^(\S+) STEXT", line)
+        if m:
+            if on:
+                break
+            on = m[1].endswith("." + fn)
+            continue
+        if not on:
+            continue
+        parts = line.split("\t")
+        if not line.startswith("\t0x") or len(parts) < 3:
+            if line and not line.startswith("\t"):
+                break
+            continue
+        op, args = parts[2].strip(), "\t".join(parts[3:]).strip()
+        if op in ("TEXT", "PCDATA", "FUNCDATA", "NOP") or (op, args) in (("HINT", "$0"), ("XCHGL", "AX, AX")):
+            continue
+        insts.append((int(parts[1].split()[1]), op, re.sub(r"autotmp_\d+", "autotmp", args)))
+    if not on:
+        return None
+    pcs = [pc for pc, _, _ in insts]
+    out = []
+    for _, op, args in insts:
+        # A branch's target, a PC, is its last operand, a bare number.
+        head, sep, last = args.rpartition(", ")
+        if re.fullmatch(r"\d+", last):
+            at = next((i for i, pc in enumerate(pcs) if pc >= int(last)), len(pcs))
+            args = f"{head}{sep}->{at}"
+        out.append(f"{op} {args}")
+    return out
 
 
 def go_env():
@@ -2167,6 +2277,107 @@ class Runner:
                         None if slots == n else f"{slots} slot(s):\n" + "\n".join(text.splitlines()[:40])))
         return out
 
+    def entry_points(self):
+        """The entry points of the export fns of
+        test/go/export/inlining/inlining.goose (issue #22), compiled with
+        --target=go --library at -O2 and at -O0, the directory's other .go
+        files --include'd, into a module with its tests. Of each export fn
+        an `// entry:` line annotates, as `go test -c -gcflags=-m=2` reports:
+        `inline`, Go can inline every entry point (and every instantiation
+        by shape of a generic one that the tests make); `no escape`, no parameter of
+        them that views a caller's memory escapes (`does not escape`, or it
+        leaks to the result alone); `escape`, each one does (`leaking
+        param`). Go reports no escapes of a generic function's own, whose
+        callers' arrays inlining_test.go follows instead (AllocsPerRun).
+        Then, for each of WIDE_ARCHES (`go test -c -gcflags=-S`),
+        each callX function of the tests must be the same instructions as
+        directX: a call of an entry point is the call of its function that
+        a caller could write by hand."""
+        out = []
+        d = HERE / "go" / "export" / "inlining"
+        src = d / "inlining.goose"
+        want = entry_annotations(src)
+        tests = sorted(d.glob("*_test.go"))
+        includes = sorted(p for p in d.glob("*.go") if not p.name.endswith("_test.go"))
+        pairs = call_pairs("".join(t.read_text(encoding="utf-8") for t in tests))
+        if not want or not pairs:
+            out.append(("fail", f"entry points: no // entry: line in {src.name}, or no callX and directX in "
+                                "its tests", None))
+            return out
+        for name, props in sorted(want.items()):
+            if not props <= ENTRY_PROPS or {"escape", "no escape"} <= props:
+                out.append(("fail", f"entry points {name}: // entry: {', '.join(sorted(props))}",
+                            f"an // entry: line lists some of {', '.join(sorted(ENTRY_PROPS))}, not both escapes"))
+        for level in ("2", "0"):
+            mod = self.work / f"entries-O{level}"
+            shutil.rmtree(mod, ignore_errors=True)
+            mod.mkdir(parents=True)
+            gofile = mod / f"{src.stem}.go"
+            args = [f"-O{level}", "--target=go", "--library", "-o", gofile]
+            for inc in includes:
+                args += ["--include", inc]
+            code, o, e = self.goose(*args, src)
+            if code != 0:
+                out.append(("fail", f"entry points -O{level}: goose --target=go", o + e))
+                continue
+            for t in tests:
+                shutil.copy(t, mod / t.name)
+            r = subprocess.run([self.go, "mod", "init", "goosetest/entries"], cwd=mod, env=go_env(),
+                               capture_output=True)
+            if r.returncode != 0:
+                out.append(("fail", f"entry points -O{level}: go mod init", tc.decode(r.stderr)))
+                continue
+            r = subprocess.run([self.go, "test", "-c", "-o", os.devnull, "-gcflags=-m=2", "."], cwd=mod,
+                               env=go_env(), capture_output=True)
+            report = tc.decode(r.stdout) + tc.decode(r.stderr)
+            if r.returncode != 0:
+                out.append(("fail", f"entry points -O{level}: go test -c -gcflags=-m=2", report[-2000:]))
+                continue
+            gosrc = gofile.read_text(encoding="utf-8")
+            for name, props in sorted(want.items()):
+                eps = go_entry_points(gosrc, name)
+                if not eps:
+                    out.append(("fail", f"entry points {name} -O{level}", f"no func {name} in {gofile.name}"))
+                    continue
+                for ep, line, views, generic in eps:
+                    at = f"./{gofile.name}:{line}:"
+                    said = [x[len(at):].partition(": ")[2] for x in report.splitlines() if x.startswith(at)]
+                    if "inline" in props:
+                        # A generic one's calls are of its instantiations by
+                        # shape, which its dictionary's wrappers (ep[string])
+                        # are not.
+                        costs = [x for x in said if re.match(rf"(?:can|cannot) inline {ep}" +
+                                                             (r"\[go\.shape\." if generic else r"\b"), x)]
+                        ok = costs and all(x.startswith("can ") for x in costs)
+                        out.append(("ok" if ok else "fail", f"entry points {ep} -O{level}: Go inlines it",
+                                    None if ok else "\n".join(costs) or "no cost reported"))
+                    for p in [] if generic else views:
+                        about = [x for x in said if re.fullmatch(rf"{p} does not escape|leaking param(?: content)?: "
+                                                                 rf"{p}(?: to result .*)?", x)]
+                        heap = [x for x in about if re.fullmatch(rf"leaking param(?: content)?: {p}", x)]
+                        for prop, ok in (("no escape", about and not heap), ("escape", heap)):
+                            if prop in props:
+                                out.append(("ok" if ok else "fail", f"entry points {ep} -O{level}: {p}: {prop}",
+                                            None if ok else "\n".join(about) or "nothing reported"))
+            # The calls, as Go compiles them for each target.
+            for arch in WIDE_ARCHES:
+                env = go_env()
+                env["GOARCH"] = arch
+                r = subprocess.run([self.go, "test", "-c", "-o", os.devnull, "-gcflags=-S", "."], cwd=mod, env=env,
+                                   capture_output=True)
+                asm = tc.decode(r.stdout) + tc.decode(r.stderr)
+                if r.returncode != 0:
+                    out.append(("fail", f"entry points -O{level} {arch}: go test -c -gcflags=-S", asm[-2000:]))
+                    continue
+                for x in pairs:
+                    label = f"entry points -O{level} {arch}: call{x} is direct{x}"
+                    a, b = asm_instructions(asm, f"call{x}"), asm_instructions(asm, f"direct{x}")
+                    ok = a is not None and a == b
+                    detail = None if ok else "\n".join(difflib.unified_diff(a or [], b or [], f"call{x}", f"direct{x}",
+                                                                            lineterm=""))
+                    out.append(("ok" if ok else "fail", label, detail))
+        return out
+
     # --- the command line ----------------------------------------------------
 
     def cli(self):
@@ -2662,6 +2873,10 @@ def main():
         # #24), beside their export library's own tests.
         if not args.bless and (not args.names or "inline_refs" in args.names):
             futures.append(pool.submit(r.frames))
+        # What Go makes of the entry points of pure kernels (issue #22),
+        # beside their export library's own tests.
+        if not args.bless and (not args.names or "inlining" in args.names):
+            futures.append(pool.submit(r.entry_points))
         futures += [pool.submit(r.bce_gaps, p) for p in bcegaps]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
         futures += [pool.submit(r.fixture, p, True) for p in sweep]

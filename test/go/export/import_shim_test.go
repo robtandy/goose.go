@@ -14,6 +14,7 @@ import gsrt "github.com/robtandy/goose.go/runtime/go"
 
 type (
 	GsError      = gsrt.GsError
+	GsSlice      = gsrt.GsSlice
 	GsStackBlock = gsrt.GsStackBlock
 )
 
