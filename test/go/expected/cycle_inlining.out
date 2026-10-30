@@ -7,4 +7,6 @@ even_turn 70 -20
 once 4507997675665100
 count_nodes 199
 spread_sum 105
+zero_sums 6
+areas 74
 nested_sum 65 141

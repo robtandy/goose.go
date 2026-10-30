@@ -3,7 +3,8 @@
 // into a function of a cycle as into any other function, an inline fn
 // included, where the optimizer inlines nothing into one. A helper that takes
 // a data stack -- a print, a str, a value of more than 4096 bytes, which C
-// holds on one -- stays a call, as in C, and so does one calling into a
+// holds on one, a slice literal's array as large, a variable-mode ADT read as
+// the fixed-mode one -- stays a call, as in C, and so does one calling into a
 // cycle: each activation holds the stacks it does in C, and the two backends
 // report the same (--stacks). run_go_tests.py checks at -O2 that the Go
 // function of each function an `// inlined:` line annotates calls none of
@@ -60,6 +61,22 @@ fn spread(x: i64) -> i64 {
 
 // Calls into a cycle of its own.
 fn fib_mod(n: i64) -> i64 { fib(n) % 7 }
+
+// A slice literal of more than 4096 bytes, whose array C builds on a data
+// stack outside a recursive cycle, where its type is the slice's.
+fn zeros_sum(k: i64) -> i64 { k + sum([0; 600]) }
+
+enum Shape { Circle { r: i64 }, Square { s: i64 }, Dot }
+
+fn pick(a: Shape..&) -> Shape..& { a }
+
+// The shape a reference leads to, read as the fixed-mode ADT: the
+// variable-mode one is adapted to it on a data stack, where the value's type
+// is the fixed one's.
+fn area_at(a: Shape..&) -> i64 {
+    let s: Shape = pick(a);
+    match s { Circle c => 3 * c.r * c.r, Square q => q.s * q.s, Dot => 0 }
+}
 
 // Halves of a range, a leaf's helpers at the bottom.
 // inlined: mix, square, floor0, max
@@ -127,6 +144,18 @@ recursive fn spread_sum(n: i64) -> i64 {
     spread(n * 7) + spread_sum(n - 1)
 }
 
+// calls: zeros_sum
+recursive fn zero_sums(n: i64) -> i64 {
+    if n == 0 { return 0; }
+    zeros_sum(n) + zero_sums(n - 1)
+}
+
+// calls: area_at
+recursive fn areas(s: Shape..&, n: i64) -> i64 {
+    if n == 0 { return 0; }
+    area_at(s) + areas(s, n - 1)
+}
+
 // A nested recursive fn, reading a local of the function it is in.
 fn nested_sum(n: i64) -> i64 {
     let k = n % 3 + 1;
@@ -146,5 +175,13 @@ fn main() {
     print("once ", once(4096));
     print("count_nodes ", count_nodes(0, 100));
     print("spread_sum ", spread_sum(5));
+    print("zero_sums ", zero_sums(3));
+    var shapes: Shape..[>..] = [];
+    shapes.push(Shape.Circle { r: 2 });
+    shapes.push(Shape.Square { s: 5 });
+    shapes.push(Shape.Dot);
+    var total = 0;
+    for sh in shapes { total += areas(sh, 2); }
+    print("areas ", total);
     print("nested_sum ", nested_sum(10), " ", nested_sum(11));
 }
