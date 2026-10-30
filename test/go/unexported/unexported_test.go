@@ -15,6 +15,20 @@ func TestEntryPoints(t *testing.T) {
 	if got := Kept([]byte("a b c")); got != 3 {
 		t.Errorf("Kept = %d", got)
 	}
+	// The forms of an entry point taking a const u8[:] as a string and as
+	// a []byte, not generic.
+	if got := WordsString("one two"); got != 2 {
+		t.Errorf("WordsString = %d", got)
+	}
+	if got := WordsBytes([]byte("one two three")); got != 3 {
+		t.Errorf("WordsBytes = %d", got)
+	}
+	if got := KeptString("a b"); got != 2 {
+		t.Errorf("KeptString = %d", got)
+	}
+	if got := KeptBytes([]byte("abc")); got != 3 {
+		t.Errorf("KeptBytes = %d", got)
+	}
 	if got := CallsSoFar(); got < 1 {
 		t.Errorf("CallsSoFar = %d", got)
 	}

@@ -220,7 +220,8 @@ type GsBytes interface{ ~string | ~[]byte }
 // GsEscape makes the Go compiler keep it off them, on the heap, where
 // nothing moves (its condition never holds). The collector does not see it
 // there either, so the entry point keeps the argument alive until the call
-// returns (runtime.KeepAlive).
+// returns (runtime.KeepAlive). One whose function keeps what it is handed
+// in Go's own variables alone hands it on as it is (DESIGN.md §3.5).
 var gsEscapeSink struct {
 	b bool
 	p unsafe.Pointer
