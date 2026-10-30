@@ -108,6 +108,15 @@ text forms (KERNEL_ABSENT), test/go/unexported/ one compiled with
 test/go/shared/ two programs compiled into one package with
 --go-runtime-file, whose tests pass together in each mode.
 
+Reproducible files (issue #21, the section reproducible): a generated
+file's header keeps Go's `// Code generated ... DO NOT EDIT.` line and
+records the compiler's version, the runtime's revision and the options its
+Go depends on, spelled one way whatever the compile's spelling; `--check
+-o out.go` passes a file that is what the compile would write and fails one
+that is stale or missing, with a short diff; and the same programs compiled
+in two temporary directories, each with a standard library of its own, are
+the same Go, byte for byte (Runner.reproducible, Runner.same_go).
+
 --sweep also runs the C suite's own programs (test/<category>/*.goose) of
 its other categories through both backends as the test/stdlib/ fixtures
 run: at both levels, with --debug where they ask for it, vetted, built with
