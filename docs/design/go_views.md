@@ -454,9 +454,11 @@ Two things in the backend's code decide the outcome:
   at 16. A view's slices are where Go aligns them, so `*(*GsSlice)(p)` is
   safe there and passes `checkptr`.
 
-The layout check costs nothing measurable at these sizes. Go's own loop
-varies by about 10% between test binaries with code layout alone, which is
-why every figure is a ratio within one binary.
+The two ways of reading in place, `let ts = recs[i].tags` and `for &r in
+recs`, ran alike with either kind of load. The layout check costs nothing
+measurable at these sizes. Go's own loop varies by about 10% between test
+binaries with code layout alone, which is why every figure is a ratio
+within one binary.
 
 ## 9. The follow-up issue
 
