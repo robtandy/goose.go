@@ -29,6 +29,8 @@ cmake --build build -j$(nproc)
 
 The Go backend needs a Go toolchain, 1.21 or later: `go` on `PATH`, or the one `GOOSE_GO` names. The Go it writes uses nothing but Go's standard library and builds with `CGO_ENABLED=0`, on 64-bit Linux and macOS.
 
+To write Go without building the compiler, `go generate` runs a release's, prebuilt ([below](#prebuilt-compilers-go-generate-with-nothing-but-go)).
+
 ## Compiling a program to Go
 
 ```bash
@@ -69,6 +71,22 @@ host/stats/stats.go is stale: compiling stats.goose writes it otherwise, in 1 pl
 ```
 
 (`stats.goose` having gained `|| c == '\r'` since the file was written.)
+
+### Prebuilt compilers: `go generate` with nothing but Go
+
+A release of `goose.go` holds the compiler prebuilt for linux/amd64 and linux/arm64 (linked statically: any Linux) and darwin/arm64 (macOS 13.3 and later), each with its standard library, and [`cmd/goose`](cmd/goose) runs it: a Go command, which a module that checks generated Go in runs from `go generate`, so that regenerating the Go takes Go and nothing else -- no CMake, no C++ toolchain, no `vendor/goose`:
+
+```go
+//go:generate go run github.com/robtandy/goose.go/cmd/goose@v0.2.0 --target=go --go-package stats -o stats.go stats.goose
+```
+
+`go run` builds the command of that version, which runs the compiler of the release of that version on the arguments that follow, in the directory `go generate` runs it in, and exits as the compiler does. The first run on a machine downloads the release's archive for its platform, checks it against the release's `SHA256SUMS` and keeps the compiler and its standard library in the user's cache directory (`~/.cache/goose.go/v0.2.0/linux-amd64/` on Linux, `~/Library/Caches/goose.go/...` on macOS); every later run takes it from there, and downloads nothing. The version pins the compiler, which the header records (`// goose-version: v0.2.0 (runtime/go ...)`), so a file regenerated so is the one a compiler built from the tag `v0.2.0` writes, byte for byte, on any machine, and the CI check above is
+
+```bash
+go run github.com/robtandy/goose.go/cmd/goose@v0.2.0 --target=go --check --go-package stats -o stats.go stats.goose
+```
+
+The environment can say where the compiler comes from: `GOOSE_RELEASE` names another release to run, `GOOSE_RELEASE_URL` a mirror of the releases, each in a directory named after it (an http, https or file URL, or a directory), and `GOOSE_CACHE` where to keep them. While the repository is private, `go` fetches the command with git (`GOPRIVATE=github.com/robtandy/goose.go`, with git's credentials for GitHub), and the command downloads the release through GitHub's API, with a token that can read the repository in `GH_TOKEN` (or `GITHUB_TOKEN`). A prebuilt compiler does all that one built from source does but run a program's C in its own process (`goose run` without `--target=go`), which takes the machine's C library: `goose build` and `-o out.c` work. [`docs/releasing.md`](docs/releasing.md) is how a release is made, with `scripts/release.py`.
 
 ## Calling Goose from Go: `export fn`, `--library`, `--go-package`
 
@@ -184,7 +202,7 @@ Both depths must be `const`, as Go's strings are read-only: a `(const u8[:])[:]`
 The runtime the Go uses -- data stacks, aborts, slice pools, text forms, the OS layer, workers -- is the package [`runtime/go`](runtime/go), `github.com/robtandy/goose.go/runtime/go`, whose source the compiler embeds as it is built, so there is one copy of it. A file holds the part of it that its program uses: a library of kernels, pure functions over slices, holds none of the data stacks, pools or text forms (`test/go/kernels/`). `--go-runtime` names where else the runtime can come from:
 
 - `--go-runtime=full` writes all of it, for debugging.
-- `--go-runtime=import` writes none of it: the file imports the package, as `gsrt`, which the module requires at the commit of the compiler that writes the file (`goose version` names it): `go get github.com/robtandy/goose.go/runtime/go@<commit>`, or for a checkout `go mod edit -require=github.com/robtandy/goose.go/runtime/go@v0.0.0 -replace=github.com/robtandy/goose.go/runtime/go=/path/to/goose.go/runtime/go`. Every package compiled so shares that one runtime, each with its own configuration and its own pool of blocks. Its `...WithStack` entry points take a `*gsrt.GsStackBlock`, from `gsrt.AcquireStackBlock`.
+- `--go-runtime=import` writes none of it: the file imports the package, as `gsrt`, which the module requires at the commit of the compiler that writes the file (`goose version` names it): `go get github.com/robtandy/goose.go/runtime/go@<commit>` (a release's version for a release's compiler: `@v0.2.0`), or for a checkout `go mod edit -require=github.com/robtandy/goose.go/runtime/go@v0.0.0 -replace=github.com/robtandy/goose.go/runtime/go=/path/to/goose.go/runtime/go`. Every package compiled so shares that one runtime, each with its own configuration and its own pool of blocks. Its `...WithStack` entry points take a `*gsrt.GsStackBlock`, from `gsrt.AcquireStackBlock`.
 
 `--go-runtime-file goose_runtime.go` writes the runtime, and the package's configuration, to a file of its own beside the `-o` file, which every program compiled into the package then shares: compile each with the same `--go-runtime-file`, and the file holds what all of them use. Each program's own names carry its file's name (`Pt_geom_g`, from `-o geom.go`), so two programs can declare the same ones; their entry points are the package's. A package's programs share its settings -- `--go-runtime`, `--go-unexported`, `--stack-reserve` and `-DGS_STACK_RESERVE`, `-DGS_STACK_GAP`, `--frame-reserve` -- which the file records: a compile with others is refused, and removing the file starts over. `--go-build` constrains a program's own file only: the runtime file has no build constraint, so that it is built with whichever of the package's programs are, whatever theirs.
 
@@ -373,7 +391,8 @@ So no thin `recursive fn` around an ordinary function is needed to get them inli
 ```bash
 python3 test/run_go_tests.py              # the Go backend against the C backend
 python3 test/run_go_tests.py --sweep      # and every fixture of the C suite's own categories
-cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...
+(cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...)
+(cd cmd/goose && go vet ./... && go test ./...)    # the command that runs a release's compiler
 ```
 
 `test/run_go_tests.py` compiles each program with both backends, at `-O2` and at `-O0` (and with `--debug` where a fixture asks for it), and requires the Go to pass `go vet` (with `CGO_ENABLED=0`) and `gofmt -l` (every file it writes, `--include`s and libraries too) and to run as the C does: the same stdout, stderr and exit code (a sample's stderr, its timings, with the numbers masked), also when built with `-gcflags=all=-d=checkptr`, Go's checks of every `unsafe.Pointer` conversion and of the arithmetic on one. The two backends must report the same data stacks (`--stacks`), and the output must be what the expected files hold. It covers:
@@ -391,7 +410,8 @@ cd runtime/go && CGO_ENABLED=0 go vet ./... && go test -race ./...
 - the warnings the Go backend gives where the C backend does not yet, of a shift by a constant count outside its type's width (`test/go/warnings/`), each declared by a `// warning:` line as the C suite declares its own;
 - programs that never end, which it only builds (`test/go/build_only/`), data stack overflow, the constructs this version refuses (`test/go/unsupported/`), and the command line (`-o out.go`, `--go-package`, `--go-build`, `--library`, `--frame-reserve`, `--include` and the positions in what it splices in, `goose run`/`goose build --target=go`, `--go-runtime`);
 - the runtime (issue #19): every program, fixture, sample, overflow case and export library again with `--go-runtime=import`, in a module that requires `runtime/go`, also with `-d=checkptr`, and every program with `--go-unexported`, all of which must run as the C does; `runtime/go`'s own tests (`go vet`, `go test`, `-race` where cgo builds, `-d=checkptr`), and that the runtime the compiler embeds is `runtime/go`'s as it is; a library of kernels (`test/go/kernels/`) whose file holds no data stacks, pools or text forms, nor anything moving an argument off its caller's stack (`GsEscape`); a library compiled with `--go-unexported` (`test/go/unexported/`), whose `go doc` lists its entry points alone; and two programs compiled into one package with `--go-runtime-file` (`test/go/shared/`), which declare the same names and pass their tests together, in each mode;
-- reproducible files (issue #21): the header's version, runtime revision and options, the same file from two command lines that say the same, `--check` of an up-to-date, a stale and a missing file and of a `--go-runtime-file`, and every program of `test/go/programs/` and fixture of `test/stdlib/`, and the runtime's modes, an `--include` and a shared runtime file, compiled in two temporary directories, each with a standard library of its own, to the same bytes.
+- reproducible files (issue #21): the header's version, runtime revision and options, the same file from two command lines that say the same, `--check` of an up-to-date, a stale and a missing file and of a `--go-runtime-file`, and every program of `test/go/programs/` and fixture of `test/stdlib/`, and the runtime's modes, an `--include` and a shared runtime file, compiled in two temporary directories, each with a standard library of its own, to the same bytes;
+- prebuilt compilers (issue #29): `scripts/release.py`'s archive of the compiler under test, the same bytes each time it is packaged, and its `SHA256SUMS`; `cmd/goose`'s own tests; and `go generate` with `go run github.com/robtandy/goose.go/cmd/goose@<version>`, served from a module proxy of the suite's, with nothing but Go on `PATH`: the command downloads that release from a local server, once, checks it and keeps it, and the Go it writes is the compiler under test's, byte for byte, as for every sample, while a release that is not what its `SHA256SUMS` says is refused. With `--release-dist dist/<version>`, the release it runs is the one `scripts/release.py build` made there.
 
 `--sweep` puts the programs of the C suite's other categories (`test/codegen/`, `test/lifetimes/`, `test/optimizer/`, `test/runtime/`, `test/storage/`, `test/syntax/`, `test/typing/`: every fixture that runs, not the ones that must fail to compile) through the same checks, judged against `test/expected/`, aborts included. A fixture using what the Go backend does not compile yet is counted, not failed, and so is one of the few that differ by design (a recursion that exhausts the native stack, which C reports as an abort and Go as a fatal error). `--fuzz N`, `--fuzz-flow N` and `--fuzz-values N` add random programs of scalar arithmetic, control flow and fixed-size values. `-j N` sets the parallelism, `-v` lists every check, and names run only those programs. [`docs/testing.md`](docs/testing.md#the-go-backends-suite) has the details.
 
