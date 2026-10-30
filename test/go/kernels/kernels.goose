@@ -2,8 +2,10 @@
 // no data stack, hold no global and spawn no worker. Its Go needs nothing
 // of the runtime's data stacks, pools or text forms, and test/run_go_tests.py
 // checks that the file the compiler writes holds none of them (the runtime's
-// functions it names are absent, and the file is short); kernels_test.go
-// calls the entry points.
+// functions it names are absent, and the file is short); nor, since the
+// kernels keep what they are handed in their own variables, does it move
+// an argument off its caller's stack or keep one alive (issue #22).
+// kernels_test.go calls the entry points.
 
 // The dot product of a and b, over the elements they both have.
 export fn dot(a: const f64[:], b: const f64[:]) -> f64 {

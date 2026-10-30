@@ -20,12 +20,16 @@
 //   values, which they view in place: a u8[:] as a []byte, a const u8[:] as
 //   a string or a []byte, any other T[:] as a []T, a T& as a *T, a scalar
 //   or a fixed-size value as its Go type, and keep each argument viewing
-//   Go's memory alive until the call returns (runtime.KeepAlive), which the
-//   Goose code may hold only where the collector does not look. A const
-//   u8[:] result is a []byte viewing what the slice does. In a library,
-//   either starts the package at its first call (gsLibStart). A call on a
-//   block turns panic on fault on for itself only, on its caller's
-//   goroutine.
+//   Go's memory off Go's moving stacks (GsEscape) and alive until the call
+//   returns (runtime.KeepAlive), which the Goose code may hold only where
+//   the collector does not look -- but where it holds them in Go's own
+//   variables alone, a kernel's, which they hand on as they are, for Go to
+//   inline (ArgsStayInGo, issue #22). Where a const u8[:] makes Name
+//   generic, NameString(...) and NameBytes(...) take each one as a string
+//   and as a []byte. A const u8[:] result is a []byte viewing what the
+//   slice does. In a library, each starts the package at its first call
+//   (gsLibStart). A call on a block turns panic on fault on for itself
+//   only, on its caller's goroutine.
 // * An --include file is Go source: its package clause and build
 //   constraints are dropped, its imports join the generated file's, and the
 //   rest follows the program, each run of lines between blank ones under a
@@ -317,6 +321,105 @@ static string GoExportParam(string_view name, set<string> &taken) {
     return s;
 }
 
+// Whether a value of type t holds an address in its own bytes: it is a
+// reference or a slice, or has a field or an element at any depth that is
+// one (whatever what it points at holds).
+inline bool CodeGenGo::HoldsAddr(TypeExpr *t) {
+    set<const void *> open;
+    function<bool(TypeExpr *)> rec = [&](TypeExpr *x) -> bool {
+        switch (x->kind) {
+            case TY_REF: case TY_SLICE: return true;
+            case TY_ARRAY: return rec(x->arr->sub);
+            case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
+                for (auto &run : FieldRuns(x)) {
+                    if (!open.insert(run.ftypes).second) continue;
+                    for (auto ft : *run.ftypes) if (ft && rec(ft)) return true;
+                }
+                return false;
+            default: return false;
+        }
+    };
+    return rec(t);
+}
+
+// Whether every address an export fn's entry points hand its function stays
+// in Go's own variables while the call runs (issue #22): its parameters and
+// locals of slice and pointer types, and those of the functions it calls,
+// whose flows Go's escape analysis follows, whose pointers its collector
+// keeps alive and which it moves with a goroutine's stack. The entry points
+// then hand Go's slices and pointers on as they are: no GsEscape, which
+// would keep a caller's array off its stack for nothing, and no
+// runtime.KeepAlive, which would keep alive what Go's own copies do; and Go
+// can inline each into its caller as the call of the function. So it is
+// where nothing the export's calls reach, its own body included, can put
+// an address anywhere else, or hand it to code that may:
+// * none takes the block: there is no data stack, fixed-frame stack or
+//   program instance, which the block holds, Go's collector does not scan
+//   and Go does not move;
+// * none has a value of a type holding an address but a plain or optional
+//   reference or a slice of what holds none: no struct, ADT or array
+//   holding one (a struct's Go value is then its bytes, which hide it), no
+//   reference to one;
+// * none names a global var that can hold one;
+// * none hands one to an extern fn, but to the runtime's own that only
+//   read it (std's find_any and its pair, frexp, os's files): the Go of
+//   another may keep it anywhere;
+// * none takes free variables, a caller's own locals, or returns from
+//   another function (§7.9), whose values wait in globals.
+// Anything else is taken to put it where Go does not see it, and the entry
+// points move the arguments off a caller's stack and keep them alive, as
+// they always have.
+inline bool CodeGenGo::ArgsStayInGo(FnSpec *sp) {
+    auto ok = [&](TypeExpr *t) {
+        if (!t || t->kind == TY_VOID || t->kind == TY_FN || t->kind == TY_GENERIC || !HoldsAddr(t)) return true;
+        if (t->kind == TY_SLICE) return !HoldsAddr(t->sub);
+        return t->kind == TY_REF && !IsRelRef(t) && !IsFatRef(t) && !CarriesPool(t) && !HoldsAddr(t->ref->sub);
+    };
+    set<FnSpec *> seen;
+    vector<FnSpec *> work = { sp };
+    while (!work.empty()) {
+        auto f = work.back();
+        work.pop_back();
+        if (!seen.insert(f).second) continue;
+        if (!sinfo.count(f) || !f->body) return false;
+        auto &fi = sinfo[f];
+        auto takesgs = fi.needssp || fi.needsgs || !specnum.count(f) || gsneeds.size() != numspec.size() ||
+                       gsneeds[specnum[f]];
+        if (takesgs || !fi.freevars.empty() || fi.hasrf || fromids.count(f)) return false;
+        for (auto t : f->argtypes) if (!ok(t)) return false;
+        for (auto t : f->rets) if (!ok(t)) return false;
+        auto stays = true;
+        function<void(Node *)> walk = [&](Node *n) {
+            if (!n || !stays) return;
+            stays = ok(n->exprtype);
+            auto var = [&](VarDef *v) {
+                if (v && (!ok(v->type) || (v->isglobal && v->isvar && HoldsAddr(v->type)))) stays = false;
+            };
+            if (auto id = Is<Ident>(n)) var(id->vdef);
+            if (auto d = Is<VarDecl>(n)) for (auto v : d->defs) var(v);
+            if (auto fl = Is<ForLoop>(n)) {
+                var(fl->vdef);
+                var(fl->idxdef);
+            }
+            if (auto m = Is<MatchExpr>(n)) for (auto &arm : m->arms) var(arm.binder);
+            if (auto c = Is<Call>(n)) {
+                for (auto t : c->rettypes) stays = stays && ok(t);
+                for (auto v : c->fvparams) var(v);
+                if (c->builtin < 0 && c->spec && c->spec->sf->isextern && !ExportOfExtern(c->spec)) {
+                    auto &name = c->spec->sf->cname;
+                    auto reads = name == "gs_find_any" || name == "gs_find_pair" || name == "frexp" || GoOsFn(name);
+                    for (auto t : c->spec->argtypes) stays = stays && (reads || !HoldsAddr(t));
+                }
+            }
+            if (stays) RunChildren(n, walk);
+        };
+        walk(f->body);
+        if (!stays) return false;
+        for (auto k : calleesof[f]) work.push_back(k);
+    }
+    return true;
+}
+
 // The names of the types the Go type gt names (its identifiers): a host
 // names them too.
 static void GoTypeNames(const string &gt, set<string> &names) {
@@ -340,6 +443,14 @@ static void GoTypeNames(const string &gt, set<string> &names) {
 // one there), where an entry point runs on another.
 inline void CodeGenGo::EmitExports() {
     set<string> names;
+    // Every export fn's Name and NameWithStack, which no NameString or
+    // NameBytes of another's may take.
+    set<string> primary;
+    for (auto sf : ast.functions) {
+        if (!sf->isexport) continue;
+        primary.insert(GoExportName(sf->cname));
+        primary.insert(cat(GoExportName(sf->cname), "WithStack"));
+    }
     for (auto sf : ast.functions) {
         if (!sf->isexport) continue;
         if (sf->specs.size() != 1 || !sinfo.count(sf->specs[0]))
@@ -377,29 +488,47 @@ inline void CodeGenGo::EmitExports() {
                                     "the program's block holds,"));
             for (auto k : calleesof[f]) work.push_back(k);
         }
+        auto stacks = ProgramStacksOf(*this, { sp });
+        auto takesgs = si.needssp || si.needsgs || (specnum.count(sp) && gsneeds[specnum[sp]]);
+        // Where every address the function is handed stays in Go's own
+        // variables, the entry points hand the arguments on as they are
+        // (ArgsStayInGo, issue #22). Elsewhere they keep what the arguments
+        // view off Go's moving goroutine stacks (GsEscape: a caller's array
+        // is on the heap, or static) and alive until the call returns.
+        auto stay = !takesgs && ArgsStayInGo(sp);
         // The parameters: the Go types the entry points take, and the Goose
         // values they hand the function; and those that view Go's memory,
-        // which the call keeps alive (kept).
+        // which the call keeps alive (kept). NameString and NameBytes take
+        // each const u8[:] as a string (sparams, sargs) and as a []byte
+        // (bparams, bargs), where Name takes either (a type parameter).
         set<string> taken;
-        vector<string> tparams, params, fwd, args, kept;
+        vector<string> tparams, params, fwd, args, kept, sparams, sargs, bparams, bargs, bytesnames;
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             auto pt = sp->argtypes[i];
             auto pn = GoExportParam(i < sf->params.size() ? sf->params[i].name : string_view(), taken);
-            string gt, arg;
+            // The slice of what a Go value views, from its data's address.
+            auto view = [&](const string &data) { return cat("GsSlice{Data: ", data, ", Len: int64(len(", pn, "))}"); };
+            string gt, arg, sarg, barg;
             if (pt->kind == TY_SLICE && IsU8(pt->sub) && pt->cq) {
                 auto tp = cat("T", tparams.size());
                 tparams.push_back(cat(tp, " ~string | ~[]byte"));
                 gt = tp;
-                arg = cat("GsBytesOf(", pn, ")");
+                // A string's header begins as a slice's does, with its data:
+                // a type parameter's is read through its address.
+                arg = stay ? view(cat("*(*unsafe.Pointer)(unsafe.Pointer(&", pn, "))")) : cat("GsBytesOf(", pn, ")");
+                sarg = stay ? view(cat("unsafe.Pointer(unsafe.StringData(", pn, "))")) : cat("GsSliceFromString(", pn, ")");
+                barg = stay ? view(cat("unsafe.Pointer(unsafe.SliceData(", pn, "))")) : cat("GsSliceFromBytes(", pn, ")");
+                bytesnames.push_back(pn);
                 kept.push_back(pn);
             } else if (pt->kind == TY_SLICE) {
                 gt = IsU8(pt->sub) ? string("[]byte") : cat("[]", GoT(pt->sub, ln));
-                arg = cat("GsSliceOf(", pn, ")");
+                arg = stay ? view(cat("unsafe.Pointer(unsafe.SliceData(", pn, "))")) : cat("GsSliceOf(", pn, ")");
                 kept.push_back(pn);
             } else if (IsPlainRef(pt) && !pt->ref->optional && IsFix(pt->ref->sub)) {
                 auto st = GoT(pt->ref->sub, ln);
                 gt = cat("*", st);
-                arg = RefFromAddr(pt, cat("GsEscape(unsafe.Pointer(", pn, "))"));
+                arg = stay && !RefIsAddr(pt) ? pn
+                      : RefFromAddr(pt, stay ? cat("unsafe.Pointer(", pn, ")") : cat("GsEscape(unsafe.Pointer(", pn, "))"));
                 kept.push_back(pn);
             } else if (IsFix(pt) && pt->kind != TY_REF) {
                 gt = GoT(pt, ln);
@@ -408,10 +537,16 @@ inline void CodeGenGo::EmitExports() {
                 Fail(ln, cat("internal: export fn ", sf->name, " takes ", TypeText(pt)));
             }
             params.push_back(cat(pn, " ", gt));
+            sparams.push_back(cat(pn, " ", sarg.empty() ? gt : string("string")));
+            bparams.push_back(cat(pn, " ", barg.empty() ? gt : string("[]byte")));
             GoTypeNames(gt, sigtypes);
             fwd.push_back(pn);
             args.push_back(arg);
+            sargs.push_back(sarg.empty() ? arg : sarg);
+            bargs.push_back(barg.empty() ? arg : barg);
         }
+        // What stays in Go's variables Go keeps alive.
+        if (stay) kept.clear();
         // The result, and what makes the function's the Go one.
         string rt, conv;
         if (sp->rets.size() > 1) Fail(ln, cat("internal: export fn ", sf->name, " returns more than one value"));
@@ -448,8 +583,6 @@ inline void CodeGenGo::EmitExports() {
             if (!rt.empty()) s += "\treturn gs_r\n";
             return s;
         };
-        auto stacks = ProgramStacksOf(*this, { sp });
-        auto takesgs = si.needssp || si.needsgs || (specnum.count(sp) && gsneeds[specnum[sp]]);
         // In a program with workers, a call that takes the block runs on its
         // program instance (§11.2): one of the block's own, which a block a
         // caller keeps keeps across its calls, and one copied for the call
@@ -537,19 +670,44 @@ inline void CodeGenGo::EmitExports() {
         if (!takesgs) {
             // Nothing of the block's is used: the function is called itself.
             Append(xcode, finish(cat(si.name, "(", join(args, ""), ")")), "}\n\n");
-            continue;
-        }
-        Append(xcode, "\tgs := gsProg.AcquireStackBlock(", stacks, ")\n");
-        if (inst) Append(xcode, "\t", enter, "(gs)\n");
-        auto fcall = cat(with, "(", join(fwd, "gs"), ")");
-        if (rt.empty()) {
-            Append(xcode, "\t", fcall, "\n\tgsProg.ReleaseStackBlock(gs)\n}\n\n");
         } else {
-            // A slice of the call's instance's globals is gone with it: it
-            // crosses as a copy.
-            auto keep = inst && rt[0] == '[';
-            Append(xcode, "\tgs_r := ", fcall, "\n", keep ? "\tgs_r = GsKeep(gs, gs_r)\n" : "",
-                   "\tgsProg.ReleaseStackBlock(gs)\n\treturn gs_r\n}\n\n");
+            Append(xcode, "\tgs := gsProg.AcquireStackBlock(", stacks, ")\n");
+            if (inst) Append(xcode, "\t", enter, "(gs)\n");
+            auto fcall = cat(with, "(", join(fwd, "gs"), ")");
+            if (rt.empty()) {
+                Append(xcode, "\t", fcall, "\n\tgsProg.ReleaseStackBlock(gs)\n}\n\n");
+            } else {
+                // A slice of the call's instance's globals is gone with it: it
+                // crosses as a copy.
+                auto keep = inst && rt[0] == '[';
+                Append(xcode, "\tgs_r := ", fcall, "\n", keep ? "\tgs_r = GsKeep(gs, gs_r)\n" : "",
+                       "\tgsProg.ReleaseStackBlock(gs)\n\treturn gs_r\n}\n\n");
+            }
+        }
+        // Where a const u8[:] makes Name generic, NameString and NameBytes
+        // are Name taking each one as a string and as a []byte (issue #22).
+        // Go makes of a call of either, where the function takes no block,
+        // the call of the function itself, which it cannot of Name's: Name
+        // reads its type parameter's data through its address, which takes a
+        // frame. One taking a block is Name's own call. A form whose name
+        // another export fn's Name or NameWithStack has is left out.
+        if (!bytesnames.empty()) {
+            string list;
+            for (size_t i = 0; i < bytesnames.size(); i++)
+                Append(list, i == 0 ? "" : i + 1 == bytesnames.size() ? " and " : ", ", bytesnames[i]);
+            auto plural = bytesnames.size() > 1;
+            for (auto bytes : { false, true }) {
+                auto vname = cat(name, bytes ? "Bytes" : "String");
+                if (primary.count(vname) || !names.insert(vname).second) continue;
+                entrynames.insert(vname);
+                Append(xcode, "// ", vname, " runs ", where, "\n// as ", name, " does, taking ", list, " as ",
+                       bytes ? (plural ? "[]bytes" : "a []byte") : (plural ? "strings" : "a string"), ".\n",
+                       doc, "func ", vname, "(", join(bytes ? bparams : sparams, ""), ")", retsig, " {\n");
+                if (!takesgs)
+                    Append(xcode, start, finish(cat(si.name, "(", join(bytes ? bargs : sargs, ""), ")")), "}\n\n");
+                else
+                    Append(xcode, "\t", rt.empty() ? "" : "return ", name, "(", join(fwd, ""), ")\n}\n\n");
+            }
         }
     }
 }
