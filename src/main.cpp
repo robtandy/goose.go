@@ -56,6 +56,7 @@
 #include "codegen_go_check.h"
 #include "codegen_go_threads.h"
 #include "codegen_go_shifts.h"
+#include "codegen_go_cycles.h"
 #include "runtime_inline.h"
 #include "process.h"
 #include "jit.h"
@@ -1849,6 +1850,9 @@ int Main(int argc, char **argv) {
         // before anything is folded or inlined (issue #27).
         if (gotarget) WarnShiftCounts(ast);
         Optimizer opt(ast, optlevel);
+        // The optimizer inlines nothing into a recursive fn: --target=go
+        // inlines there what takes no data stack (issue #42).
+        if (gotarget) InlineIntoCycles(opt);
         if (specs) {
             string s;
             opt.DumpSpecs(s);
