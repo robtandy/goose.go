@@ -328,12 +328,15 @@ static string GoExportParam(string_view name, set<string> &taken) {
 
 // Whether a value of type t holds an address in its own bytes: it is a
 // reference or a slice, or has a field or an element at any depth that is
-// one (whatever what it points at holds).
-inline bool CodeGenGo::HoldsAddr(TypeExpr *t) {
+// one (whatever what it points at holds). Without relative, a relative
+// reference is none: an offset within its root, which a copy of the root
+// moves with.
+inline bool CodeGenGo::HoldsAddr(TypeExpr *t, bool relative) {
     set<const void *> open;
     function<bool(TypeExpr *)> rec = [&](TypeExpr *x) -> bool {
         switch (x->kind) {
-            case TY_REF: case TY_SLICE: return true;
+            case TY_REF: return relative || !IsRelRef(x);
+            case TY_SLICE: return true;
             case TY_ARRAY: return rec(x->arr->sub);
             case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
                 for (auto &run : FieldRuns(x)) {

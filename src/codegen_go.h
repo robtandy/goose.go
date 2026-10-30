@@ -795,6 +795,12 @@ struct CodeGenGo {
     unordered_map<FnSpec *, string> instfns;
     string EnsureInstanceFn(FnSpec *sp);
     vector<VarDef *> &InstanceGlobals(FnSpec *entry);
+    // Whether the copy of a global that an export's call takes into its
+    // instance may go on pointing into the package's storage, and the
+    // globals the program's start names, which may leave one so.
+    bool CopyShares(VarDef *d);
+    set<const VarDef *> startnamed;
+    bool startwalked = false;
 
     // ------------------------------------------------------------------
     // Per-specialization interface. A function's Go parameters are the data
@@ -1152,7 +1158,7 @@ struct CodeGenGo {
     // an export fn's entry points hand its function stays in Go's own
     // variables while the call runs, which lets them hand it on as it is
     // (issue #22).
-    bool HoldsAddr(TypeExpr *t);
+    bool HoldsAddr(TypeExpr *t, bool relative = true);
     bool ArgsStayInGo(FnSpec *sp);
     void EmitExports();
     // The specializations whose code names a global's own data stack
