@@ -137,6 +137,14 @@ examples/records/           module example.com/records, go 1.21 or later
 - `--go-unexported` unexports the runtime's names (`gsSlice`, `gsError`), which are otherwise part of the package's API wherever the file is built. The entry points stay exported: with `-tags goose` the package also exports `CountRecords`, `CountRecordsString` and `CountRecordsBytes`. A package whose API must not change at all generates its kernels into an internal package (`internal/kernels`), without `--go-unexported`, and binds to that, a panic's `*kernels.GsError` included.
 - `--go-no-withstack` leaves out the `...WithStack` entry points, which take a block of data stacks that a kernel over slices never uses, and the block's type with them.
 
+**Pin the compiler.** `goose` on `PATH` is whichever compiler a machine has, and the header of what it writes says which. A module runs a release's instead, prebuilt, with `go run`: that needs nothing but Go, and writes the same file on every machine, whose header names the version the line does (the README's [Prebuilt compilers](../README.md#prebuilt-compilers-go-generate-with-nothing-but-go)):
+
+```go
+//go:generate go run github.com/robtandy/goose.go/cmd/goose@v0.2.0 --target=go --go-build goose --go-package records --go-unexported --go-no-withstack -o records_goose.go _goose/records.goose
+```
+
+The example's line runs `goose` from `PATH`, since the test suite runs it with the compiler under test.
+
 **`extern fn`s.** The Go functions a kernel's `extern fn`s call can be a normal Go file of the package, with the generated file's constraint (`extern_goose.go`, `//go:build goose`), which `gofmt`, `go vet` and gopls see as it is, and whose changes compile nothing again.
 
 - It names the runtime's types as the generated file declares them: `gsSlice` under `--go-unexported`, `GsSlice` without.
@@ -478,12 +486,13 @@ Two programs in one package share one runtime with `--go-runtime-file`, and ever
 # The default build: the Go original, as it always was.
 go vet ./... && go test ./...
 
-# The checked-in Go is its source's, by the compiler the header names (a
-# --check by another compiler finds every file stale: pin the version), and
-# the compile warns of nothing.
+# The checked-in Go is its source's, by the compiler the //go:generate line
+# pins (a --check by another compiler finds every file stale), and the
+# compile warns of nothing.
 set -o pipefail
-goose --target=go --check --go-build goose --go-package records --go-unexported --go-no-withstack \
-    -o records_goose.go _goose/records.goose 2>&1 | tee goose-check.txt
+go run github.com/robtandy/goose.go/cmd/goose@v0.2.0 --target=go --check --go-build goose \
+    --go-package records --go-unexported --go-no-withstack -o records_goose.go _goose/records.goose \
+    2>&1 | tee goose-check.txt
 ! grep ': warning:' goose-check.txt
 
 # The Goose build: every test, with Go's pointer checks too, and some fuzzing.
@@ -492,4 +501,4 @@ go test -tags goose -gcflags=all=-d=checkptr ./...
 go test -tags goose -run '^$' -fuzz '^FuzzCountRecords$' -fuzztime 30s
 ```
 
-The `--check` takes the `//go:generate` line's options; `go generate -tags goose ./... && git diff --exit-code` checks the same with the line itself. `test/run_go_tests.py` runs all of this on the example (but fuzzing 2,000 inputs, not 30 seconds' worth), and the mutation checks of [§4](#4-proving-equivalence). It writes the example's generated file with `go generate`, rather than finding it checked in: the compiler is built from each commit here, and the header of a file checked in would name the commit before.
+The `--check` takes the `//go:generate` line's version and options; `go generate -tags goose ./... && git diff --exit-code` checks the same with the line itself. `test/run_go_tests.py` runs all of this on the example (with the compiler under test as `goose`, and fuzzing 2,000 inputs, not 30 seconds' worth), and the mutation checks of [§4](#4-proving-equivalence). It writes the example's generated file with `go generate`, rather than finding it checked in: the compiler is built from each commit here, and the header of a file checked in would name the commit before.
