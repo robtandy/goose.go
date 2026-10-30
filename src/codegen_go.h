@@ -5,7 +5,7 @@
 // embeds: codegen_go_runtime.h) that the program uses, then the program --
 // or with --go-runtime=import, the program alone, importing the runtime's
 // package, and with --go-runtime-file, the runtime in a file of the
-// package's own (DESIGN.md §3.9).
+// package's own (DESIGN.md §3.10).
 //
 // Representation (DESIGN.md §3):
 // * Scalars are Go's own types: i8..i64 int8..int64, u8..u64 uint8..uint64,
@@ -54,6 +54,13 @@
 //   array or slice, or taken apart into them, whose bounds BCE proved, is one
 //   load or one store (codegen_go_wide.h), as a C compiler makes it.
 //
+// * A body that only chooses among values it computes nothing for -- std's
+//   min, max and clamp, inlined or not, an if choosing between values -- is
+//   Go's builtin min or max of two integers, or a temporary assigned each
+//   choice under its condition (codegen_go_select.h), which Go makes
+//   conditional selects of, where the labeled switch an inlined body is
+//   otherwise is branches.
+//
 // * The foreign boundary (codegen_go_export.h, DESIGN.md §3.5): an extern
 //   fn calls the Go runtime's function its C symbol names (std's, math's
 //   and os's), Go's math, or a Go function of the package that an
@@ -80,10 +87,11 @@
 //
 // The members are declared here in the order they are defined across
 // codegen_go_values.h, codegen_go_types.h, codegen_go_places.h,
-// codegen_go_aggr.h, codegen_go_wide.h, codegen_go_rz.h, codegen_go_stmts.h,
-// codegen_go_calls.h, codegen_go_export.h, codegen_go_emit.h and
-// codegen_go_threads.h; codegen_go_rz.h is included after
-// codegen_go_calls.h, whose helpers it uses.
+// codegen_go_aggr.h, codegen_go_wide.h, codegen_go_select.h,
+// codegen_go_rz.h, codegen_go_stmts.h, codegen_go_calls.h,
+// codegen_go_export.h, codegen_go_emit.h and codegen_go_threads.h;
+// codegen_go_rz.h is included after codegen_go_calls.h, whose helpers it
+// uses.
 #pragma once
 
 namespace goose {
@@ -491,6 +499,29 @@ struct CodeGenGo {
     bool GenWideStoreLoop(ForLoop *f);
     size_t GenWideStoreRun(const vector<Node *> &stmts, size_t i);
     void GenStmts(const vector<Node *> &stmts, size_t first = 0);
+
+    // ------------------------------------------------------------------
+    // Selects (codegen_go_select.h): a body that only chooses among values
+    // it computes nothing for -- std's min, max, clamp, abs and sign, an if
+    // choosing between values -- as Go's builtin min or max, or as
+    // assignments of a temporary, which Go makes conditional selects of.
+
+    // A choice: the value, and the condition picking it where it holds (or,
+    // neg, where it does not: a guard's); the last one's is nullptr, the
+    // value none picks.
+    struct SelArm {
+        Node *cond = nullptr;
+        bool neg = false;
+        Node *val = nullptr;
+    };
+    bool SelPure(Node *n);
+    bool SelChain(Block *b, size_t first, SFunction *target, bool valued, vector<SelArm> &arms);
+    bool SelEnd(Node *n, SFunction *target, bool valued, vector<SelArm> &arms);
+    string SelMinMax(const vector<SelArm> &arms, TypeExpr *t);
+    bool GenSelect(const vector<SelArm> &arms, TypeExpr *t, Line ln, string &x);
+    bool GenSelectIb(InlineBlock *ib, const GoDst &d, size_t first);
+    bool GenSelectIf(IfExpr *fi, const GoDst &d);
+    bool GenSelectReturn(FnSpec *sp);
 
     // ------------------------------------------------------------------
     // Values on data stacks (codegen_go_rz.h): resizable values and their

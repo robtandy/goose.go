@@ -62,7 +62,18 @@ The code Go makes of the wide loads and stores of test/go/export/wide/
 (issue #23) is read for arm64 and for amd64, which Go cross-compiles to with
 nothing but its toolchain (`go build -gcflags=-S`): each export fn an `//
 asm:` line annotates must reach memory through a pointer as it names, with
-one load or one store of its width, or not at all (Runner.wide_asm).
+one load or one store of its width, or not at all (Runner.wide_asm). So is
+the code of the selects of test/go/export/selects/ (issue #26): each export
+fn an `// asm: select, branches m` line annotates must have a conditional
+select (CSEL and its kin on arm64, CMOV on amd64) and exactly m conditional
+branches, those of its loop and its guard, so that no choice it makes is a
+branch (Runner.select_asm).
+
+The reproducers of the gaps in the front end's bounds-check elimination
+that issue #26 found, test/go/bce_gaps/ (whose README.md writes them up),
+are checked with `goose --check --bce-test` at -O1 and -O2: each `//
+bce:keep` and `// bce:elide` line must have the outcome it names, so that
+the write-up says what BCE does (Runner.bce_gaps).
 
 The runtime (issue #19): every program (at -O2), fixture, sample, overflow
 case and export library is compiled again with --go-runtime=import, into a
@@ -797,6 +808,68 @@ def wide_accesses(arch, asm, fn):
         operands.append(cur.strip())
         kind = "store" if len(operands) > 1 and mem.search(operands[-1]) else "load"
         found.append((kind, WIDE_WIDTHS[arch].get(op.split(".")[0], 0), f"{op} {args}"))
+    return found
+
+
+# --- the code Go makes of selects (issue #26) ---------------------------------
+
+# A target's conditional selects, which Runner.select_asm counts: arm64's
+# CSEL and its kin, which choose between two registers on the flags (CSINC,
+# CSINV and CSNEG take the second one stepped, inverted or negated; CSET,
+# CSETM, CINC, CINV and CNEG are their aliases), and amd64's CMOVs.
+SELECT_OPS = {
+    "arm64": re.compile(r"^(?:(?:CSEL|CSINC|CSINV|CSNEG|CSET|CSETM|CINC|CINV|CNEG)W?|FCSEL[SD])$"),
+    "amd64": re.compile(r"^CMOV[QLW]"),
+}
+# Its conditional branches: on the flags, or on a register's zero or bit.
+BRANCH_OPS = {
+    "arm64": re.compile(r"^(?:B(?:EQ|NE|CS|HS|CC|LO|MI|PL|VS|VC|HI|LS|GE|LT|GT|LE)|CBN?ZW?|TBN?Z)$"),
+    "amd64": re.compile(r"^J(?:CC|CS|CXZ[LQ]|EQ|GE|GT|HI|LE|LS|LT|MI|NE|OC|OS|PC|PL|PS)$"),
+}
+
+
+def select_annotations(src):
+    """The export fns of src an `// asm: select, branches m` comment line above
+    names: name -> m."""
+    want, pending = {}, None
+    for line in src.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^// asm: select, branches (\d+)$", line)
+        if m:
+            pending = int(m[1])
+            continue
+        m = re.match(r'^export (?:"\w+" )?fn (\w+)\(', line)
+        if m and pending is not None:
+            want[m[1]] = pending
+        if not line.startswith("//"):
+            pending = None
+    return want
+
+
+def select_counts(arch, asm, fn):
+    """The conditional selects and the conditional branches of the function
+    fn in the output of `go build -gcflags=-S` for arch, each a list of its
+    instructions, or None where fn is not there."""
+    found = None
+    for line in asm.splitlines():
+        m = re.match(r"^(\S+) STEXT", line)
+        if m:
+            if found is not None:
+                break
+            if m[1].endswith("." + fn):
+                found = ([], [])
+            continue
+        if found is None:
+            continue
+        parts = line.split("\t")
+        if not line.startswith("\t0x") or len(parts) < 3:
+            if line and not line.startswith("\t"):
+                break
+            continue
+        op, args = parts[2].strip(), "\t".join(parts[3:]).strip()
+        if SELECT_OPS[arch].match(op):
+            found[0].append(f"{op} {args}")
+        elif BRANCH_OPS[arch].match(op):
+            found[1].append(f"{op} {args}")
     return found
 
 
@@ -1779,33 +1852,26 @@ class Runner:
                         None if ok else f"exit {code}\n{o}{e}"))
         return out
 
-    def wide_asm(self):
-        """The code Go makes of the wide loads and stores of
-        test/go/export/wide/wide.goose (issue #23): compiled with --target=go
-        --library at -O2 and at -O0, and by Go for each of WIDE_ARCHES
-        (`go build -gcflags=-S`, which prints the code of every function),
-        each export fn an `// asm:` line annotates must reach memory through
-        a pointer as it says: `load n`, once, with one n-byte load; `store
-        n`, once, with one n-byte store; `none`, never, as a local array on
-        Go's own stack does (one on the fixed-frame stack would not)."""
-        out = []
-        src = HERE / "go" / "export" / "wide" / "wide.goose"
-        want = wide_annotations(src)
-        if not want:
-            out.append(("fail", f"wide asm: no // asm: line in {src.name}", None))
-            return out
+    def library_asm(self, src, tag, out):
+        """The code Go makes of the library src: compiled with --target=go
+        --library at -O2 and at -O0 into a module of its own, and by Go for
+        each of WIDE_ARCHES (`go build -gcflags=-S`, which prints the code of
+        every function, and cross-compiles with nothing but the toolchain).
+        Yields (level, arch, that code) for each build, after a failure in
+        out for each step that failed."""
         for level in ("2", "0"):
-            mod = self.work / f"wide-asm-O{level}"
+            mod = self.work / f"{tag}-asm-O{level}"
             shutil.rmtree(mod, ignore_errors=True)
             mod.mkdir(parents=True)
-            code, o, e = self.goose(f"-O{level}", "--target=go", "--library", "-o", mod / "wide.go", src)
+            code, o, e = self.goose(f"-O{level}", "--target=go", "--library", "-o",
+                                    mod / f"{src.stem}.go", src)
             if code != 0:
-                out.append(("fail", f"wide asm -O{level}: goose --target=go", o + e))
+                out.append(("fail", f"{tag} asm -O{level}: goose --target=go", o + e))
                 continue
-            r = subprocess.run([self.go, "mod", "init", "goosetest/wideasm"], cwd=mod, env=go_env(),
+            r = subprocess.run([self.go, "mod", "init", f"goosetest/{tag}asm"], cwd=mod, env=go_env(),
                                capture_output=True)
             if r.returncode != 0:
-                out.append(("fail", f"wide asm -O{level}: go mod init", tc.decode(r.stderr)))
+                out.append(("fail", f"{tag} asm -O{level}: go mod init", tc.decode(r.stderr)))
                 continue
             for arch in WIDE_ARCHES:
                 env = go_env()
@@ -1814,17 +1880,75 @@ class Runner:
                                    capture_output=True)
                 asm = tc.decode(r.stdout) + tc.decode(r.stderr)
                 if r.returncode != 0:
-                    out.append(("fail", f"wide asm -O{level} {arch}: go build -gcflags=-S", asm[-2000:]))
+                    out.append(("fail", f"{tag} asm -O{level} {arch}: go build -gcflags=-S", asm[-2000:]))
                     continue
-                for fn, (kind, n) in sorted(want.items()):
-                    label = f"wide asm {fn} -O{level} {arch}: {kind}{f' {n}' if n else ''}"
-                    got = wide_accesses(arch, asm, f"{fn}_g")
-                    if got is None:
-                        out.append(("fail", label, f"no {fn}_g in Go's code for {arch}"))
-                        continue
-                    ok = not got if kind == "none" else [(k, b) for k, b, _ in got] == [(kind, n)]
-                    out.append(("ok" if ok else "fail", label,
-                                None if ok else "\n".join(t for _, _, t in got) or "no access"))
+                yield level, arch, asm
+
+    def wide_asm(self):
+        """The code Go makes of the wide loads and stores of
+        test/go/export/wide/wide.goose (issue #23), at -O2 and at -O0, for
+        each of WIDE_ARCHES (Runner.library_asm): each export fn an `// asm:`
+        line annotates must reach memory through a pointer as it says: `load
+        n`, once, with one n-byte load; `store n`, once, with one n-byte
+        store; `none`, never, as a local array on Go's own stack does (one on
+        the fixed-frame stack would not)."""
+        out = []
+        src = HERE / "go" / "export" / "wide" / "wide.goose"
+        want = wide_annotations(src)
+        if not want:
+            out.append(("fail", f"wide asm: no // asm: line in {src.name}", None))
+            return out
+        for level, arch, asm in self.library_asm(src, "wide", out):
+            for fn, (kind, n) in sorted(want.items()):
+                label = f"wide asm {fn} -O{level} {arch}: {kind}{f' {n}' if n else ''}"
+                got = wide_accesses(arch, asm, f"{fn}_g")
+                if got is None:
+                    out.append(("fail", label, f"no {fn}_g in Go's code for {arch}"))
+                    continue
+                ok = not got if kind == "none" else [(k, b) for k, b, _ in got] == [(kind, n)]
+                out.append(("ok" if ok else "fail", label,
+                            None if ok else "\n".join(t for _, _, t in got) or "no access"))
+        return out
+
+    def select_asm(self):
+        """The code Go makes of the selects of
+        test/go/export/selects/selects.goose (issue #26), at -O2 and at -O0,
+        for each of WIDE_ARCHES (Runner.library_asm): each export fn an `//
+        asm: select, branches m` line annotates must have at least one
+        conditional select and exactly m conditional branches, those of its
+        loop and its guard, so that none of the choices it makes is a
+        branch."""
+        out = []
+        src = HERE / "go" / "export" / "selects" / "selects.goose"
+        want = select_annotations(src)
+        if not want:
+            out.append(("fail", f"select asm: no // asm: line in {src.name}", None))
+            return out
+        for level, arch, asm in self.library_asm(src, "selects", out):
+            for fn, branches in sorted(want.items()):
+                label = f"select asm {fn} -O{level} {arch}: select, branches {branches}"
+                got = select_counts(arch, asm, f"{fn}_g")
+                if got is None:
+                    out.append(("fail", label, f"no {fn}_g in Go's code for {arch}"))
+                    continue
+                sels, brs = got
+                ok = sels and len(brs) == branches
+                out.append(("ok" if ok else "fail", label, None if ok else
+                            f"{len(sels)} select(s), {len(brs)} branch(es):\n" + "\n".join(sels + brs)))
+        return out
+
+    def bce_gaps(self, src):
+        """A reproducer of a gap in the front end's bounds-check elimination
+        (test/go/bce_gaps/, issue #26): at -O1 and -O2, where calls are
+        inlined, each of its `// bce:keep` lines must keep every check on it,
+        and each `// bce:elide` line elide every one (goose --check
+        --bce-test). Once the front end closes the gap, a `bce:keep` line
+        fails, and the write-up is out of date."""
+        out = []
+        for level in ("1", "2"):
+            label = f"bce gap {src.name} -O{level}"
+            code, o, e = self.goose(f"-O{level}", "--check", "--bce-test", src)
+            out.append(("ok", label, None) if code == 0 else ("fail", label, o + e))
         return out
 
     # --- the command line ----------------------------------------------------
@@ -2266,6 +2390,7 @@ def main():
     stdlib = sorted((UPSTREAM_TEST / "stdlib").glob("*.goose")) + sorted((UPSTREAM_TEST / "threads").glob("*.goose"))
     samples = parity_samples()
     exports = sorted(p for p in (HERE / "go" / "export").iterdir() if p.is_dir())
+    bcegaps = sorted((HERE / "go" / "bce_gaps").glob("*.goose"))
     # The runtime's sections (issue #19): its package, a library of kernels,
     # one compiled with --go-unexported, and two programs in one package.
     runtime_sections = {"runtime": r.runtime_package, "kernels": r.kernels, "unexported": r.unexported_library,
@@ -2277,15 +2402,17 @@ def main():
         stdlib = [p for p in stdlib if p.stem in args.names]
         exports = [p for p in exports if p.name in args.names]
         samples = [p for p in samples if p.stem in args.names]
+        bcegaps = [p for p in bcegaps if p.stem in args.names or "bce_gaps" in args.names]
         if not programs and not build_only and not stdlib and not exports and not samples and \
-                not runtime_sections:
+                not bcegaps and not runtime_sections:
             ap.error(f"no program named {' '.join(args.names)} in test/go/programs, "
-                     "test/go/build_only, test/stdlib, test/threads, test/go/export or samples, "
-                     "and no section runtime, kernels, unexported or shared")
+                     "test/go/build_only, test/stdlib, test/threads, test/go/export, "
+                     "test/go/bce_gaps or samples, and no section runtime, kernels, unexported or shared")
     if args.bless:
         # Their expected output is the C suite's (test/expected/), a
-        # sample's its own, and an export library's its Go tests.
-        stdlib, exports, samples = [], [], []
+        # sample's its own, an export library's its Go tests, and a BCE
+        # gap's its annotations.
+        stdlib, exports, samples, bcegaps = [], [], [], []
         runtime_sections = {}
     unsupported = [] if args.names else sorted((HERE / "go" / "unsupported").glob("*.goose"))
     sweep = []
@@ -2305,10 +2432,13 @@ def main():
         futures += [pool.submit(r.sample, p) for p in samples]
         futures += [pool.submit(r.export, p) for p in exports]
         futures += [pool.submit(f) for f in runtime_sections.values()]
-        # The code Go makes of the wide loads and stores (issue #23), beside
-        # their export library's own tests.
+        # The code Go makes of the wide loads and stores (issue #23) and of
+        # the selects (issue #26), beside their export libraries' own tests.
         if not args.bless and (not args.names or "wide" in args.names):
             futures.append(pool.submit(r.wide_asm))
+        if not args.bless and (not args.names or "selects" in args.names):
+            futures.append(pool.submit(r.select_asm))
+        futures += [pool.submit(r.bce_gaps, p) for p in bcegaps]
         futures += [pool.submit(r.overflow, name) for name in ([] if args.names else OVERFLOW_CASES)]
         futures += [pool.submit(r.fixture, p, True) for p in sweep]
         futures += [pool.submit(r.fuzz, seed)

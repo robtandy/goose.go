@@ -667,15 +667,20 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
             fdstsaves.push_back(cat(fdst, " = ", sav));
         }
     }
-    GenStmts(sp->body->stmts);
-    if (auto tail = sp->body->tail) {
-        auto asvalue = !sp->rets.empty() && !IsVoidT(tail->exprtype);
-        if (auto fi = Is<IfExpr>(tail); fi && !fi->elseb) asvalue = false;
-        if (asvalue) {
-            vector<Node *> vals = { tail };
-            GenNormalReturn(vals);
-        } else {
-            GenStmt(tail);
+    // A body that only chooses among its values, as std's min and max do
+    // where nothing is inlined: one return of the choice
+    // (codegen_go_select.h).
+    if (!GenSelectReturn(sp)) {
+        GenStmts(sp->body->stmts);
+        if (auto tail = sp->body->tail) {
+            auto asvalue = !sp->rets.empty() && !IsVoidT(tail->exprtype);
+            if (auto fi = Is<IfExpr>(tail); fi && !fi->elseb) asvalue = false;
+            if (asvalue) {
+                vector<Node *> vals = { tail };
+                GenNormalReturn(vals);
+            } else {
+                GenStmt(tail);
+            }
         }
     }
     // Where Go's flow reaches the end of a function with results, the
