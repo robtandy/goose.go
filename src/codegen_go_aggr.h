@@ -211,7 +211,7 @@ inline string CodeGenGo::GenLitVal(Node *n) {
     }
     // A large value's temporary is on a data stack, as C's is, zeroed first.
     auto v = FixedLocal(t, T(), "", false, n->line);
-    LitInto(n, AtVar(v, t), true);
+    LitInto(n, AtLocal(v, t), true);
     return v;
 }
 
@@ -435,7 +435,7 @@ inline void CodeGenGo::ElemwiseInto(TypeExpr *t, TType op, Line ln, const string
                 default: Fail(ln, cat("internal: elementwise arithmetic on ", TypeText(tt)));
             }
         };
-    rec(t, dst, AtVar(l, t), AtVar(r, t));
+    rec(t, dst, AtLocal(l, t), AtLocal(r, t));
 }
 
 inline void CodeGenGo::ElemwiseNegInto(TypeExpr *t, Line ln, const string &x, const GoLoc &dst) {
@@ -472,7 +472,7 @@ inline void CodeGenGo::ElemwiseNegInto(TypeExpr *t, Line ln, const string &x, co
             default: Fail(ln, cat("internal: elementwise negation of ", TypeText(tt)));
         }
     };
-    rec(t, dst, AtVar(x, t));
+    rec(t, dst, AtLocal(x, t));
 }
 
 // The operands of an elementwise operation, each in a variable: a scalar

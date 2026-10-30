@@ -946,7 +946,7 @@ inline string CodeGenGo::GenFvCall(Call *c, const GoDst &d0) {
     ind++;
     for (size_t i = 0; i < c->fvparams.size(); i++)
         BindLocal(c->fvparams[i], i < c->args.size() ? c->args[i] : nullptr);
-    for (auto st : c->fvbody->stmts) GenStmt(st);
+    GenStmts(c->fvbody->stmts);
     if (auto tail = c->fvbody->tail) {
         if (!wantsval) GenAny(tail, GoDst {});
         else if (d.k == GD_STACK) GenConstruct(tail, d.s, d.t ? d.t : c->exprtype, d.lenlv);

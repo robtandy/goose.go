@@ -60,6 +60,14 @@ inline CodeGenGo::GoLoc CodeGenGo::AtVar(const string &x, TypeExpr *t) {
     return l;
 }
 
+// The same, where x may be a variable the body declares (Decl), which is a
+// Go local of the function's own (GoLoc::golocal).
+inline CodeGenGo::GoLoc CodeGenGo::AtLocal(const string &x, TypeExpr *t) {
+    auto l = AtVar(x, t);
+    l.golocal = IsGoName(x) && ltypes.count(x);
+    return l;
+}
+
 inline string CodeGenGo::AddrOf(const GoLoc &l) {
     if (!l.addr.empty()) return l.addr;
     if (!l.ptr.empty()) return cat("unsafe.Pointer(", l.ptr, ")");
@@ -92,6 +100,14 @@ inline CodeGenGo::GoLoc CodeGenGo::AtRef(const string &x, TypeExpr *rt) {
 // later uses -- the right side of an assignment, the arguments after a
 // receiver -- cannot move by rebinding a reference or changing an index.
 inline CodeGenGo::GoLoc CodeGenGo::PinLoc(const GoLoc &l) {
+    // A Go local's own storage is where it is: its indices are snapshots,
+    // and every array it is indexed in is a fixed one. Only a bounds check
+    // in it runs now, as the pin's would, and again, passing, where the
+    // place is used.
+    if (l.golocal && !l.lv.empty() && !l.unal) {
+        if (l.lv.find("GsIdx(") != string::npos) L("_ = ", l.lv);
+        return l;
+    }
     auto p = T();
     if (l.unal) {
         Decl(p, "unsafe.Pointer", l.addr);
@@ -196,6 +212,7 @@ inline CodeGenGo::GoLoc CodeGenGo::FieldLocAt(const GoLoc &base, int fi, Line ln
     GoLoc r;
     if (ti.rep == GR_NATIVE) {
         r = AtVar(cat(base.lv, ".", Sanitize((*fields)[fi].name)), ft);
+        r.golocal = base.golocal;
     } else {
         r = AtAddr(AddOff(AddrOf(base), ti.offs[fi]), ft);
     }
@@ -254,6 +271,7 @@ inline CodeGenGo::GoView CodeGenGo::ArrayView(const GoLoc &l, Line ln) {
     } else if (t->kind == TY_ARRAY && t->arr->akind == A_FIXED) {
         v.elem = t->arr->sub;
         v.arr = l.lv;
+        v.local = l.golocal && !l.lv.empty();
         v.data = AddrOf(l);
         v.len = cat(ArrSize(t->arr));
         v.fixed = ArrSize(t->arr);
@@ -316,9 +334,22 @@ inline CodeGenGo::GoView CodeGenGo::ArrayView(const GoLoc &l, Line ln) {
 inline CodeGenGo::GoLoc CodeGenGo::ElemAt(const GoView &v, const string &i, Line ln) {
     int64_t k;
     bool uns;
-    if (!v.arr.empty() && GoConstInt(i, k, uns) && !uns && k >= 0)
-        return AtVar(cat(v.arr, "[", k, "]"), v.elem);
-    if (GoConstInt(i, k, uns) && !uns) return AtAddr(AddOff(v.data, k * v.esize), v.elem);
+    auto isconst = GoConstInt(i, k, uns);
+    if (!v.arr.empty() && isconst && !uns && k >= 0) {
+        auto r = AtVar(cat(v.arr, "[", k, "]"), v.elem);
+        r.golocal = v.local;
+        return r;
+    }
+    // An element of a Go local's own fixed array: Go's indexing, which takes
+    // no address of the variable, so that it stays a Go value rather than a
+    // slot of the function's frame (GoLoc::golocal). The index is in range,
+    // checked (GsIdx) or proven so, and Go's own check passes too.
+    if (v.local && !isconst) {
+        auto r = AtVar(cat(v.arr, "[", i, "]"), v.elem);
+        r.golocal = true;
+        return r;
+    }
+    if (isconst && !uns) return AtAddr(AddOff(v.data, k * v.esize), v.elem);
     auto ix = IsGoName(i) ? i : cat("(", i, ")");
     auto off = v.esize == 1 ? ix : cat(ix, "*", v.esize);
     (void)ln;
@@ -350,8 +381,9 @@ inline CodeGenGo::GoLoc CodeGenGo::IndexLoc(GoLoc l, Node *idxnode, Line ln, boo
     while (l.t->kind == TY_REF) DerefLoc(l);
     auto v = ArrayView(l, ln);
     // An index that runs statements may change the array: the elements and
-    // the length are read before it.
-    if (HasStmts(idxnode)) {
+    // the length are read before it. A Go local's own fixed array stays
+    // where it is, and so does its length.
+    if (HasStmts(idxnode) && !v.local) {
         auto d = T(), n = T();
         Decl(d, "unsafe.Pointer", v.data);
         Decl(n, "int64", v.len);
@@ -395,6 +427,10 @@ inline CodeGenGo::GoLoc CodeGenGo::VarLoc(const VarDef *vd, Line ln) {
         return l;
     }
     auto l = AtVar(VarRef(vd, ln), vd->type);
+    // A local or a parameter, but for a free variable, which arrives as a
+    // pointer to the caller's, and a large value, a pointer into a data
+    // stack: a Go variable of the function's own.
+    l.golocal = vnames.count(vd) && !fvptr.count(vd);
     if (PrefVar(vd)) {
         l.ispref = true;
         l.fl = cat("(*", l.lv, ".FreeHdr)");
@@ -504,10 +540,10 @@ inline CodeGenGo::GoLoc CodeGenGo::GenLoc(Node *n) {
     auto x = GenX(n);
     if (IsGoName(x) && !IsGoConst(x) && (Is<Call>(n) || IsCtl(n) || Is<StructLit>(n) ||
                                          Is<ArrayLit>(n) || Is<StrLit>(n) || Is<SliceExpr>(n)))
-        return AtVar(x, t);   // A temporary of the node's own already.
+        return AtLocal(x, t);   // A temporary of the node's own already.
     auto v = T();
     Decl(v, LocalT(t, n->line), x);
-    return AtVar(v, t);
+    return AtLocal(v, t);
 }
 
 // ------------------------------------------------------------------

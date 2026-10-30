@@ -135,7 +135,7 @@ inline void CodeGenGo::EmitDeferBody(Defer *d) {
     PushSc(SC_PLAIN);
     L("{");
     ind++;
-    for (auto st : d->body->stmts) GenStmt(st);
+    GenStmts(d->body->stmts);
     if (d->body->tail) GenStmt(d->body->tail);
     PopSc();
     ind--;
@@ -189,7 +189,7 @@ inline void CodeGenGo::PlaceLabel(const GoScope &s) {
 // A Block's contents, without its scope or braces (the caller's). Its tail
 // is its value; an inlined body's tail is a return too (exitscope).
 inline void CodeGenGo::GenBlockInner(Block *b, const GoDst &d, size_t first, int exitscope) {
-    for (auto i = first; i < b->stmts.size(); ++i) GenStmt(b->stmts[i]);
+    GenStmts(b->stmts, first);
     if (!b->tail) return;
     if (Unreached()) return GenUnreached([&] { GenBlockInner(b, d, b->stmts.size(), exitscope); });
     if (!IsVoidT(b->tail->exprtype) && d.k != GD_DISCARD) {
@@ -476,7 +476,7 @@ inline void CodeGenGo::EmitIbBody(InlineBlock *ib, const GoDst &d) {
 // the scopes it leaves; the end of an iteration runs the loop scope's own.
 
 inline void CodeGenGo::GenLoopBody(Block *bodyb, size_t first) {
-    for (auto i = first; i < bodyb->stmts.size(); i++) GenStmt(bodyb->stmts[i]);
+    GenStmts(bodyb->stmts, first);
     if (bodyb->tail) GenStmt(bodyb->tail);
     if (Unreached()) GenUnreached([&] { EmitRestores(scopes.back()); });
     else EmitRestores(scopes.back());
@@ -542,6 +542,8 @@ inline void CodeGenGo::GenLoop(LoopExpr *lp, const GoDst &d) {
 
 inline void CodeGenGo::GenFor(ForLoop *f) {
     if (f->iterkind != IK_RANGE && f->iterkind != IK_COUNT) return GenForArray(f);
+    // A value's bytes stored one by one: one store (codegen_go_wide.h).
+    if (GenWideStoreLoop(f)) return;
     // The loop variable runs at the range's own type: narrow counters stay
     // narrow (§6.5). A binder whose type ends where the range does (`for i:
     // u8 in 0..256`) is a copy of a counter of the range's own, wider type,

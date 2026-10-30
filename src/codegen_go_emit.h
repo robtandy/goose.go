@@ -667,7 +667,7 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
             fdstsaves.push_back(cat(fdst, " = ", sav));
         }
     }
-    for (auto st : sp->body->stmts) GenStmt(st);
+    GenStmts(sp->body->stmts);
     if (auto tail = sp->body->tail) {
         auto asvalue = !sp->rets.empty() && !IsVoidT(tail->exprtype);
         if (auto fi = Is<IfExpr>(tail); fi && !fi->elseb) asvalue = false;
@@ -1409,8 +1409,12 @@ inline string CodeGenGo::Source(const string &srcname) {
     };
     // What the program's Go and the --include files' use of the runtime's,
     // by the names the runtime declares them by; and of Go's packages.
+    // The packages the program's Go may name besides the runtime's: math/bits,
+    // and encoding/binary, which a wide load or store calls
+    // (codegen_go_wide.h).
     auto known = rt.imports;
     known["bits"] = "math/bits";
+    known["binary"] = "encoding/binary";
     GoUses uses;
     GoScanUses(program(false), known, uses);
     auto proguses = uses;
