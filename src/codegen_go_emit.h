@@ -767,7 +767,9 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
 // Globals (§11.1): package-level variables, initialized in declaration
 // order by gsInitGlobals before main runs. A `let` global of a `const`
 // scalar type with a literal initializer is never written (§9.5), and Go
-// initializes it before anything runs, as the C backend's static data is.
+// initializes it before anything runs, as the C backend's static data is;
+// and so is every other global C makes static data whose value Go can
+// spell as a constant, a table of them say (StaticConst, issue #62).
 
 inline bool CodeGenGo::StaticInit(Node *n, TypeExpr *t, string &out) {
     if (!n || !IsScalarT(t)) return false;
@@ -784,6 +786,96 @@ inline bool CodeGenGo::StaticInit(Node *n, TypeExpr *t, string &out) {
         return true;
     }
     return false;
+}
+
+// The value of a global the C backend makes static data (cstatic), n its
+// initializer, as a Go constant expression of t's Go type, where Go can spell
+// one (issue #62): an integer, a float or a bool literal, and a fixed array
+// or a native struct of those, built of literals, a string's bytes, fills
+// and the static globals they name. Go's linker lays such a global out with
+// its value, so that it holds it before anything runs, a library's start
+// included, and gsInitGlobals has nothing of it to do. A value Go has no
+// constant for -- a NaN, an infinity, a negative zero -- and one held as
+// the bytes of its C layout (GR_BYTES), which hold its fields in the
+// target's byte order, are left to gsInitGlobals.
+inline bool CodeGenGo::StaticConst(Node *n, TypeExpr *t, string &out, bool elem) {
+    if (!n || !t) return false;
+    if (auto id = Is<Ident>(n)) {
+        auto it = id->vdef ? cstatic.find(id->vdef) : cstatic.end();
+        return it != cstatic.end() && it->second != n && StaticConst(it->second, t, out, elem);
+    }
+    switch (t->kind) {
+        case TY_INT: {
+            auto i = Is<IntLit>(n);
+            if (!i || t->intstorage == IS_VARINT || t->ix) return false;
+            out = i->uns || (i->val < 0 && t->intstorage == IS_U64) ? cat((uint64_t)i->val) : cat(i->val);
+            return true;
+        }
+        case TY_FLT: {
+            auto f = Is<FltLit>(n);
+            if (!f) return false;
+            auto v = f->val;
+            auto f32 = t->fltstorage == FS_F32;
+            if (v != v || std::isinf(v) || (f32 && std::fabs(v) >= std::ldexp(2.0 - std::ldexp(1.0, -24), 127)) ||
+                ((f32 ? (float)v == 0 : v == 0) && std::signbit(v)))
+                return false;
+            out.clear();
+            CatOne(out, v);
+            return true;
+        }
+        case TY_BOOL: {
+            auto b = Is<BoolLit>(n);
+            if (!b) return false;
+            out = b->val ? "true" : "false";
+            return true;
+        }
+        case TY_ARRAY: {
+            if (t->arr->akind != A_FIXED) return false;
+            auto k = ArrSize(t->arr);
+            auto sub = t->arr->sub;
+            vector<string> elems;
+            if (auto s = Is<StrLit>(n)) {
+                if (!IsU8(sub) || (int64_t)s->val.size() != k) return false;
+                for (auto c : s->val) elems.push_back(cat((int)(uint8_t)c));
+            } else if (auto al = Is<ArrayLit>(n)) {
+                if (al->fillval) {
+                    string e;
+                    if (!StaticConst(al->fillval, sub, e, true)) return false;
+                    elems.assign((size_t)k, e);
+                } else {
+                    if ((int64_t)al->elems.size() != k) return false;
+                    for (auto x : al->elems) {
+                        string e;
+                        if (!StaticConst(x, sub, e, true)) return false;
+                        elems.push_back(e);
+                    }
+                }
+            } else {
+                return false;
+            }
+            // An element's type is the array's: Go takes it as said.
+            out = elem ? string("{") : cat(GoT(t, n->line), "{");
+            for (size_t i = 0; i < elems.size(); i++) Append(out, i ? ", " : "", elems[i]);
+            out += "}";
+            return true;
+        }
+        case TY_STRUCT: {
+            auto sl = Is<StructLit>(n);
+            auto si = SI(t);
+            if (!sl || sl->sinst != si || TI(t, n->line).rep != GR_NATIVE) return false;
+            string fields;
+            for (size_t fi = 0; fi < si->st->fields.size(); fi++) {
+                if (si->st->fields[fi].ispad) continue;
+                string v;
+                // A field's value names its type where it is a composite.
+                if (!StaticConst(sl->InitFor((int)fi), si->ftypes[fi], v, false)) return false;
+                Append(fields, fields.empty() ? "" : ", ", Sanitize(si->st->fields[fi].name), ": ", v);
+            }
+            out = cat(elem ? string() : TI(t, n->line).name, "{", fields, "}");
+            return true;
+        }
+        default: return false;
+    }
 }
 
 // Whether evaluating n has no effect but its value, and cannot fail: a
@@ -944,6 +1036,12 @@ inline void CodeGenGo::EmitGlobalDecls() {
             if (!d->isvar && d->type->cq && g->inits.size() == g->defs.size() &&
                 StaticInit(g->inits[di], d->type, init)) {
                 Append(gdecls, "var ", name, " ", gt, " = ", init, "\n");
+                gnames[d] = name;
+                gstatic.insert(d);
+            } else if (auto cs = cstatic.find(d); cs != cstatic.end() && StaticConst(cs->second, d->type, init)) {
+                // Static data, as C's is: a constant composite literal,
+                // which the linker lays out (issue #62).
+                Append(gdecls, "var ", name, " = ", init, "\n");
                 gnames[d] = name;
                 gstatic.insert(d);
             } else {

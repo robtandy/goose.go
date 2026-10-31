@@ -1269,6 +1269,7 @@ struct CodeGenGo {
     void FindUsedGlobals();
     void EmitGlobalDecls();
     bool StaticInit(Node *n, TypeExpr *t, string &out);
+    bool StaticConst(Node *n, TypeExpr *t, string &out, bool elem = false);
     void EmitGlobalInit();
     void InitGlobalValue(VarDef *d, Node *init);
     // The dedicated stacks of the globals, in the order gsInitGlobals sets
