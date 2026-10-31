@@ -1,8 +1,11 @@
 package goose
 
 import (
+	"encoding/binary"
 	"math"
+	"math/bits"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"unsafe"
@@ -793,6 +796,154 @@ func GsF2U(d float64, f32 bool, file string, line int) uint64 {
 		GsAsFail("changes the value", gsFloatText(d, f32), "u64", file, line)
 	}
 	return v
+}
+
+// ---------------------------------------------------------------------------
+// Wide loads and stores (issue #23): the integer of 2, 4 or 8 bytes at b,
+// little- or big-endian, at any address, which an integer ORed together from
+// consecutive bytes is, and a store of one, which a run of byte stores is.
+// Where Go itself makes one load of an integer's bytes at any address, each
+// is that load or that store, and a byte swap for the other order, with no
+// call: Go inlines it into any function, even one of 5000 nodes or more,
+// into which it inlines nothing that costs more than 20, encoding/binary's
+// functions included (issue #62). Anywhere else each is encoding/binary's,
+// a byte at a time.
+
+// gsWideLE and gsWideBE are whether the target is little-endian, or
+// big-endian, and one where Go merges the byte loads of an integer into one
+// load whatever its address (amd64, 386, arm64 and ppc64le; s390x).
+// Constants, which Go folds, so that each function below is its one branch.
+const (
+	gsWideLE = runtime.GOARCH == "amd64" || runtime.GOARCH == "386" || runtime.GOARCH == "arm64" || runtime.GOARCH == "ppc64le"
+	gsWideBE = runtime.GOARCH == "s390x"
+)
+
+// GsLe16 is the little-endian integer at b, and GsBe16 the big-endian one.
+func GsLe16(b *[2]byte) uint16 {
+	if gsWideLE {
+		return *(*uint16)(unsafe.Pointer(b))
+	}
+	if gsWideBE {
+		v := *(*uint16)(unsafe.Pointer(b))
+		return v<<8 | v>>8
+	}
+	return binary.LittleEndian.Uint16(b[:])
+}
+
+func GsBe16(b *[2]byte) uint16 {
+	if gsWideBE {
+		return *(*uint16)(unsafe.Pointer(b))
+	}
+	if gsWideLE {
+		v := *(*uint16)(unsafe.Pointer(b))
+		return v<<8 | v>>8
+	}
+	return binary.BigEndian.Uint16(b[:])
+}
+
+// GsLe32 is the little-endian integer at b, and GsBe32 the big-endian one.
+func GsLe32(b *[4]byte) uint32 {
+	if gsWideLE {
+		return *(*uint32)(unsafe.Pointer(b))
+	}
+	if gsWideBE {
+		return bits.ReverseBytes32(*(*uint32)(unsafe.Pointer(b)))
+	}
+	return binary.LittleEndian.Uint32(b[:])
+}
+
+func GsBe32(b *[4]byte) uint32 {
+	if gsWideBE {
+		return *(*uint32)(unsafe.Pointer(b))
+	}
+	if gsWideLE {
+		return bits.ReverseBytes32(*(*uint32)(unsafe.Pointer(b)))
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
+
+// GsLe64 is the little-endian integer at b, and GsBe64 the big-endian one.
+func GsLe64(b *[8]byte) uint64 {
+	if gsWideLE {
+		return *(*uint64)(unsafe.Pointer(b))
+	}
+	if gsWideBE {
+		return bits.ReverseBytes64(*(*uint64)(unsafe.Pointer(b)))
+	}
+	return binary.LittleEndian.Uint64(b[:])
+}
+
+func GsBe64(b *[8]byte) uint64 {
+	if gsWideBE {
+		return *(*uint64)(unsafe.Pointer(b))
+	}
+	if gsWideLE {
+		return bits.ReverseBytes64(*(*uint64)(unsafe.Pointer(b)))
+	}
+	return binary.BigEndian.Uint64(b[:])
+}
+
+// GsPutLe16 stores v at b little-endian, and GsPutBe16 big-endian.
+func GsPutLe16(b *[2]byte, v uint16) {
+	if gsWideLE {
+		*(*uint16)(unsafe.Pointer(b)) = v
+	} else if gsWideBE {
+		*(*uint16)(unsafe.Pointer(b)) = v<<8 | v>>8
+	} else {
+		binary.LittleEndian.PutUint16(b[:], v)
+	}
+}
+
+func GsPutBe16(b *[2]byte, v uint16) {
+	if gsWideBE {
+		*(*uint16)(unsafe.Pointer(b)) = v
+	} else if gsWideLE {
+		*(*uint16)(unsafe.Pointer(b)) = v<<8 | v>>8
+	} else {
+		binary.BigEndian.PutUint16(b[:], v)
+	}
+}
+
+// GsPutLe32 stores v at b little-endian, and GsPutBe32 big-endian.
+func GsPutLe32(b *[4]byte, v uint32) {
+	if gsWideLE {
+		*(*uint32)(unsafe.Pointer(b)) = v
+	} else if gsWideBE {
+		*(*uint32)(unsafe.Pointer(b)) = bits.ReverseBytes32(v)
+	} else {
+		binary.LittleEndian.PutUint32(b[:], v)
+	}
+}
+
+func GsPutBe32(b *[4]byte, v uint32) {
+	if gsWideBE {
+		*(*uint32)(unsafe.Pointer(b)) = v
+	} else if gsWideLE {
+		*(*uint32)(unsafe.Pointer(b)) = bits.ReverseBytes32(v)
+	} else {
+		binary.BigEndian.PutUint32(b[:], v)
+	}
+}
+
+// GsPutLe64 stores v at b little-endian, and GsPutBe64 big-endian.
+func GsPutLe64(b *[8]byte, v uint64) {
+	if gsWideLE {
+		*(*uint64)(unsafe.Pointer(b)) = v
+	} else if gsWideBE {
+		*(*uint64)(unsafe.Pointer(b)) = bits.ReverseBytes64(v)
+	} else {
+		binary.LittleEndian.PutUint64(b[:], v)
+	}
+}
+
+func GsPutBe64(b *[8]byte, v uint64) {
+	if gsWideBE {
+		*(*uint64)(unsafe.Pointer(b)) = v
+	} else if gsWideLE {
+		*(*uint64)(unsafe.Pointer(b)) = bits.ReverseBytes64(v)
+	} else {
+		binary.BigEndian.PutUint64(b[:], v)
+	}
 }
 
 // ---------------------------------------------------------------------------
