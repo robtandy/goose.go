@@ -665,6 +665,12 @@ inline void CodeGenGo::EnsureFromChannels(FnSpec *t) {
     };
     Append(decls, instances ? "\t" : "", "// The result channels of a long-distance return to ", t->sf->qname, " (§7.9).\n");
     for (size_t i = 0; i < rets.size(); i++) {
+        // A result built where it is received: the channel is the receiver's
+        // address, which the target names while it runs.
+        if (NeedsResultLocation(rets[i])) {
+            var(cat("gsLret_", tid, "_", i), "unsafe.Pointer");
+            continue;
+        }
         if (IsFix(rets[i])) {
             var(cat("gsLret_", tid, "_", i), GoT(rets[i], t->sf->line));
             continue;
@@ -703,11 +709,15 @@ inline void CodeGenGo::GenFromReturn(Return *r) {
     // destination since: the catch moves them down (EmitRfCheck).
     for (size_t i = 0; i < rets.size(); i++)
         if (IsBytesT(rets[i])) L(chan("Fval", i), " = ", Top(chan("Fdst", i)));
+    // A result built where it is received: at the address its channel holds.
+    auto lret = [&](size_t i) {
+        return NeedsResultLocation(rets[i]) ? AtAddr(chan("Lret", i), rets[i]).lv : chan("Lret", i);
+    };
     if (r->vals.size() == rets.size()) {
         for (size_t i = 0; i < rets.size(); i++) {
             if (IsResz(rets[i])) GenConstruct(r->vals[i], chan("Fdst", i), rets[i], chan("Lret", i));
             else if (IsBytesT(rets[i])) GenConstruct(r->vals[i], chan("Fdst", i), rets[i]);
-            else GenAny(r->vals[i], GoDst { GD_LVALUE, chan("Lret", i), rets[i] });
+            else GenAny(r->vals[i], GoDst { GD_LVALUE, lret(i), rets[i] });
         }
     } else {
         // One call's results forwarded into the channels.
@@ -717,7 +727,7 @@ inline void CodeGenGo::GenFromReturn(Return *r) {
         for (size_t i = 0; i < rets.size(); i++) {
             if (IsResz(rets[i])) chans[i] = GoDst { GD_STACK, chan("Fdst", i), rets[i], chan("Lret", i) };
             else if (IsBytesT(rets[i])) chans[i] = GoDst { GD_STACK, chan("Fdst", i), rets[i] };
-            else chans[i] = GoDst { GD_LVALUE, chan("Lret", i), rets[i] };
+            else chans[i] = GoDst { GD_LVALUE, lret(i), rets[i] };
         }
         auto res = GenCallVals(c, chans[0], &chans);
         if (Unreached()) return;
@@ -778,7 +788,8 @@ inline void CodeGenGo::EmitRfCheck(FnSpec *callee) {
                 rv.push_back(dstcounts[i]);
                 continue;
             }
-            if (IsBytesT(rt)) continue;
+            // Built where it is received already.
+            if (IsBytesT(rt) || NeedsResultLocation(rt)) continue;
             rv.push_back(lret);
         }
         EmitExitRestores(0);
@@ -917,8 +928,9 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
                 auto dst = cat("gs_dst", i);
                 if (IsResz(rt)) chans[i] = GoDst { GD_STACK, dst, rt, dstcounts[i] };
                 else if (IsBytesT(rt)) chans[i] = GoDst { GD_STACK, dst, rt };
+                else if (NeedsResultLocation(rt)) chans[i] = GoDst { GD_LVALUE, ResultLv(i), rt };
                 else continue;
-                starts[i] = ExitStart(c, dst, chans[i].lenlv, 0);
+                if (IsBytesT(rt)) starts[i] = ExitStart(c, dst, chans[i].lenlv, 0);
             }
             auto fixed = GenForward(c, sp->rets, chans);
             if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
@@ -928,7 +940,9 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
             for (size_t i = 0; i < sp->rets.size(); i++) {
                 auto rt = sp->rets[i];
                 if (IsResz(rt)) rv.push_back(dstcounts[i]);
-                else if (!IsBytesT(rt)) rv.push_back(Snapshot(rt, fixed[i]));
+                else if (NeedsResultLocation(rt)) {
+                    if (fixed[i] != ResultLv(i)) L(ResultLv(i), " = ", fixed[i]);
+                } else if (!IsBytesT(rt)) rv.push_back(Snapshot(rt, fixed[i]));
             }
             EmitExitRestores(0);
             string list;
@@ -940,9 +954,17 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
         if (c && !c->dispatch.empty() && c->dispatch[0]->rets.size() == sp->rets.size()) {
             // A case-function call's results, which its cases deliver into
             // temporaries.
-            auto res = GenDispatch(c, GoDst {}, nullptr);
+            vector<GoDst> chans(sp->rets.size());
             for (size_t i = 0; i < sp->rets.size(); i++)
-                rv.push_back(Coerce(res[i], c->dispatch[0]->rets[i], sp->rets[i], c->line));
+                if (NeedsResultLocation(sp->rets[i])) chans[i] = GoDst { GD_LVALUE, ResultLv(i), sp->rets[i] };
+            auto res = GenDispatch(c, chans[0], &chans);
+            for (size_t i = 0; i < sp->rets.size(); i++) {
+                if (!NeedsResultLocation(sp->rets[i])) {
+                    rv.push_back(Coerce(res[i], c->dispatch[0]->rets[i], sp->rets[i], c->line));
+                    continue;
+                }
+                if (res[i] != ResultLv(i)) L(ResultLv(i), " = ", res[i]);
+            }
             if (Unreached()) return GenUnreached([&] { GenNormalReturn(vals); });
             EmitExitRestores(0);
             string list;
@@ -960,6 +982,10 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
             vector<GoDst> chans(sp->rets.size());
             for (size_t i = 0; i < sp->rets.size(); i++) {
                 auto rt = sp->rets[i];
+                if (NeedsResultLocation(rt)) {
+                    chans[i] = GoDst { GD_LVALUE, ResultLv(i), rt };
+                    continue;
+                }
                 if (!IsBytesT(rt)) continue;
                 if (!TEq(c->spec->rets[i], rt))
                     Unsupported(c->line, cat("forwarding a ", TypeText(c->spec->rets[i]),
@@ -972,7 +998,9 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
             for (size_t i = 0; i < sp->rets.size(); i++) {
                 auto rt = sp->rets[i];
                 if (IsResz(rt)) rv.push_back(dstcounts[i]);
-                else if (!IsBytesT(rt)) rv.push_back(Snapshot(rt, CoerceVal(res[i], c->spec->rets[i], rt, c->line)));
+                else if (NeedsResultLocation(rt)) {
+                    if (res[i] != ResultLv(i)) L(ResultLv(i), " = ", res[i]);
+                } else if (!IsBytesT(rt)) rv.push_back(Snapshot(rt, CoerceVal(res[i], c->spec->rets[i], rt, c->line)));
             }
             EmitExitRestores(0);
             string list;
@@ -1037,6 +1065,11 @@ inline void CodeGenGo::GenNormalReturn(const vector<Node *> &vals) {
                 if (run) rv.push_back(lenlv);
                 continue;
             }
+            // Built where the caller receives it (NeedsResultLocation).
+            if (NeedsResultLocation(rt)) {
+                GenInto(vals[i], AtAddr(cat("gs_r", i), rt), rt);
+                continue;
+            }
             auto later = false;
             for (auto j = i + 1; j < vals.size(); j++) later = later || HasStmts(vals[j]);
             auto x = Coerce(GenX(vals[i]), vals[i]->exprtype, rt, vals[i]->line);
@@ -1070,7 +1103,12 @@ inline void CodeGenGo::GenVarDecl(VarDecl *vd) {
 // A local's Go name, given afresh at each declaration: a `defer` body emitted
 // at several exits declares its locals again each time.
 inline string CodeGenGo::LocalName(VarDef *vd) {
-    auto name = Unique2(Sanitize(vd->name));
+    // A root owner's component is named owner.field: owner_field_g.
+    string base(vd->name);
+    if (vd->componentowner)
+        for (auto &c : base)
+            if (c == '.') c = '_';
+    auto name = Unique2(Sanitize(base));
     return vnames[vd] = name;
 }
 
@@ -1088,6 +1126,38 @@ inline string CodeGenGo::Unique2(const string &base) {
 
 inline void CodeGenGo::BindLocal(VarDef *d, Node *init, bool forlocal) {
     auto t = d->type;
+    // A root owner (CodeGen::BindLocal): each component a local of its own,
+    // bound to its field's initializer in declaration order as a variable of
+    // its type is, on a data stack of its own where it needs one; then the
+    // descriptor, a reference to each, which only a reference to the owner
+    // reads. Where the body takes none, FinishBody leaves the descriptor out
+    // (ROOTMARK), and the components are the locals they are.
+    if (IsRoot(t)) {
+        auto sl = Is<StructLit>(init);
+        if (!sl || !sl->sinst || !sl->sinst->st->isroot)
+            Fail(d->line, cat("internal: the root owner ", d->name, " is not built by its literal"));
+        auto name = LocalName(d);
+        auto gt = GoT(t, d->line);
+        auto si = SI(t);
+        vector<pair<string, string>> refs;
+        for (size_t i = 0; i < d->components.size(); i++) {
+            auto c = d->components[i];
+            if (!c) continue;
+            BindLocal(c, sl->InitFor((int)i), forlocal);
+            auto cl = VarLoc(c, d->line);
+            refs.push_back({ Sanitize(si->st->fields[i].name),
+                             c->type->kind == TY_REF ? RefOfLoc(cl) : RefValOf(cl, d->line) });
+        }
+        L("var ", name, " ", gt, DECLMARK, name, ROOTMARK, name);
+        NoteType(name, gt);
+        for (auto &[f, ref] : refs) L(name, ".", f, " = ", ref, ROOTMARK, name);
+        return;
+    }
+    // A reference to a root owner that cannot be rebound, bound to an owner
+    // named directly or to another such reference, names that owner for its
+    // whole life (CodeGen::AliasTarget): no Go variable, its dereference
+    // the owner itself, whose components the body reaches as its own.
+    if (BindRootAlias(d, init)) return;
     // A resizable or bytes value, on a data stack of its own (or its
     // destination's, a named result), where it is built.
     if (IsBytesT(t)) {
@@ -1152,6 +1222,37 @@ inline void CodeGenGo::BindLocal(VarDef *d, Node *init, bool forlocal) {
     }
     auto x = Coerce(GenX(init), init->exprtype, t, init->line);
     Decl(LocalName(d), gt, x);
+}
+
+// A reference d to a root owner, bound to init, that stands for the owner
+// init names for d's whole life (BindLocal): `&x` or `x` of an owner x this
+// function names directly, or another such reference. d is no `var`, and
+// no nested function reaches it, which would take its address. Its
+// reference value is the owner's descriptor's address (RefOfLoc), whose
+// dereference is the owner (RefPlace), as an inlined body's reference
+// parameter naming a place of a Go local's own is that place (issue #24).
+inline bool CodeGenGo::BindRootAlias(VarDef *d, Node *init) {
+    auto t = d->type;
+    if (!init || !t || t->kind != TY_REF || IsRelRef(t) || t->ref->optional || !IsRoot(t->ref->sub) ||
+        d->isvar || d->captured || d->isglobal)
+        return false;
+    auto n = init;
+    if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
+    auto id = Is<Ident>(n);
+    if (!id || !id->vdef) return false;
+    auto v = id->vdef;
+    if (auto it = refvars.find(v); it != refvars.end()) {
+        if (!RefPlace(it->second, t)) return false;
+        refvars[d] = it->second;
+        return true;
+    }
+    if (!v->type || !IsRoot(v->type) || !TEq(v->type, t->ref->sub)) return false;
+    auto l = VarLoc(v, init->line);
+    if (!l.rootowner) return false;
+    auto rv = RefOfLoc(l);
+    refplaces[rv] = l;
+    refvars[d] = rv;
+    return true;
 }
 
 // Whether a destination names the same storage wherever its statement

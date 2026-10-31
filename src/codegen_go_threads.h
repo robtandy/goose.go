@@ -93,10 +93,14 @@ inline vector<VarDef *> &CodeGenGo::ThreadGlobals(FnSpec *entry) {
     };
     set<FnSpec *> seen;
     set<const VarDef *> named;
+    set<TypeExpr *> namedtypes;
     function<void(FnSpec *)> rec = [&](FnSpec *sp) {
         if (!sp || !sp->body || !seen.insert(sp).second) return;
         function<void(Node *)> walk = [&](Node *n) {
             if (!n) return;
+            // The arrays the types it names name too: an index type's, a
+            // pool a relative reference measures from (CodeGen's).
+            NodeNamedArrays(n, namedtypes, [&](VarDef *a, bool) { if (member(a)) named.insert(a); });
             if (auto id = Is<Ident>(n); id && member(id->vdef)) named.insert(id->vdef);
             if (auto c = Is<Call>(n)) {
                 rec(c->spec);
@@ -418,6 +422,9 @@ inline void CodeGenGo::EmitThreadThunk(FnSpec *sp, int64_t stacks) {
     }
     auto list = ki.needssp ? string("gs, 0") : ki.needsgs ? string("gs") : GsArgPh(sp);
     for (auto &a : args) Append(list, list.empty() ? "" : ", ", a);
+    // A worker has no caller: its function's failures report its
+    // declaration.
+    if (ki.located) Append(list, list.empty() ? "" : ", ", CallerLoc(sp->sf->line));
     L(ki.name, "(", list, ")");
     // Under GS_STACK_STATS a worker reports its stacks as its program ends.
     if (opts.stackstats) L("gsProg.StackStats(gs, ", stacks, ")");
@@ -634,6 +641,13 @@ inline vector<string> CodeGenGo::EmitQGet(Call *c, const GoDst &d0) {
 // initializer, no function one calls, and in a program, none fn main()
 // reaches.
 inline bool CodeGenGo::CopyShares(VarDef *d) {
+    // A root owner's copy is its components' (EnsureInstanceFn), and its
+    // descriptor is made again for them: it shares what one of them would.
+    if (d->type && IsRoot(d->type)) {
+        for (auto c : d->components)
+            if (c && CopyShares(c)) return true;
+        return false;
+    }
     if (PrefVar(d) || HoldsFatRef(d->type)) return true;
     if (!HoldsAddr(d->type, false)) return false;
     if (!d->isvar) {
@@ -665,7 +679,8 @@ inline bool CodeGenGo::CopyShares(VarDef *d) {
         if (!opts.library && mainsf && !mainsf->specs.empty() && seen.insert(mainsf->specs[0]).second)
             walk(mainsf->specs[0]->body);
     }
-    if (startnamed.count(d)) return true;
+    // A component is named through its owner.
+    if (startnamed.count(d) || (d->componentowner && startnamed.count(d->componentowner))) return true;
     // What its initializer leaves in it: a literal of no address but static
     // data's, or with none, the default value of its type, which holds none.
     function<bool(Node *)> literal = [&](Node *n) -> bool {
@@ -741,18 +756,30 @@ inline string CodeGenGo::EnsureInstanceFn(FnSpec *sp) {
         Bump(k, n);
     };
     auto stacks = false;
-    for (auto d : sp ? InstanceGlobals(sp) : ThreadGlobals(nullptr)) {
+    function<void(VarDef *)> copy = [&](VarDef *d) {
         auto t = d->type;
-        if (!sp && CopyShares(d)) continue;   // No export reaches it.
         auto gn = gnames.at(d);
+        if (IsRoot(t)) {
+            // A root owner: each component copied as a global of its own,
+            // and the descriptor made again, of references to the copies.
+            auto si = SI(t);
+            for (auto c : d->components) {
+                if (!c) continue;
+                copy(c);
+                auto cl = VarLoc(c, d->line);
+                L(gn, ".", Sanitize(si->st->fields[c->componentfield].name), " = ",
+                  c->type->kind == TY_REF ? RefOfLoc(cl) : RefValOf(cl, d->line));
+            }
+            return;
+        }
         if (!IsBytesT(t)) {
             if (TI(t, d->line).size) L(gn, " = ", src(gn));
-            continue;
+            return;
         }
         stacks = true;
         if (!IsResz(t)) {
             copyrun(gstks.at(d), src(gn), gn);
-            continue;
+            return;
         }
         L(gn, " = ", src(gn));
         auto start = IsFrameObj(t) ? cat(FoTailHdr(t, gn), ".Base") : cat(gn, ".Base");
@@ -762,6 +789,10 @@ inline string CodeGenGo::EnsureInstanceFn(FnSpec *sp) {
             L(p.first, " = ", src(p.first));
             copyrun(p.second, cat(src(p.first), ".Base"), cat(p.first, ".Base"));
         }
+    };
+    for (auto d : sp ? InstanceGlobals(sp) : ThreadGlobals(nullptr)) {
+        if (!sp && CopyShares(d)) continue;   // No export reaches it.
+        copy(d);
     }
     PopSc();
     auto fb = FinishBody(body);

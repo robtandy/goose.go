@@ -31,6 +31,49 @@ inline string CodeGenGo::FileRef(Line l) {
     return it->second;
 }
 
+// Whether a check at l fails where the function's caller called it: l is a
+// line of the standard library, in a function that takes its caller's
+// location (SpecInfo::located, CodeGen::AtCaller).
+inline bool CodeGenGo::AtCaller(Line l) {
+    return curinfo && curinfo->located && ast.StdlibFile(l.fileidx);
+}
+
+// The file and the line a check at l reports: its own, or its caller's,
+// which a located function reads from gs_at as it starts (EmitSpec).
+inline string CodeGenGo::LocArgs(Line l) {
+    if (AtCaller(l)) return "gs_atf, gs_atl";
+    return cat(FileRef(l), ", ", l.line);
+}
+
+// The length of the array an index or bound type names (CodeGen's
+// GlobalLenLv): a grow-only global's, or a root owner's component's, which
+// is a global of its own.
+inline string CodeGenGo::IndexTypeLen(TypeExpr *t, Line ln) {
+    auto arr = t->ix ? t->ix->arr : nullptr;
+    if (arr && arr->type && (!IsResz(arr->type) || IsFrameObj(arr->type)))
+        Unsupported(ln, cat("the index type ", TypeText(t), " of an array that is no grow-only global"));
+    auto it = arr ? gnames.find(arr) : gnames.end();
+    if (it == gnames.end()) Fail(ln, cat("internal: the index type ", TypeText(t), " without its array"));
+    return cat(it->second, ".Len");
+}
+
+// What a call at l hands a callee that takes its caller's location: the
+// location the function was handed, where l is a line of the library in a
+// located function, else l's own, a package variable of the file's and
+// line's (CodeGen::CallerLoc).
+inline string CodeGenGo::CallerLoc(Line l) {
+    if (AtCaller(l)) return "gs_at";
+    auto key = make_pair(l.fileidx, l.line);
+    auto it = locrefs.find(key);
+    if (it == locrefs.end()) {
+        auto file = FileRef(l);
+        auto name = Unique(cat("gsLoc", locrefs.size()));
+        Append(locdecls, "var ", name, " = GsLoc{File: ", file, ", Line: ", l.line, "}\n");
+        it = locrefs.emplace(key, name).first;
+    }
+    return cat("&", it->second);
+}
+
 // ------------------------------------------------------------------
 // Names: the C backend's (CodeGen::Sanitize), whose _g suffix no Go keyword,
 // predeclared name or runtime name has.
@@ -721,11 +764,25 @@ inline string CodeGenGo::GenBinary(Binary *b) {
 inline string CodeGenGo::GenCast(AsCast *c) {
     auto st = c->child->exprtype, tt = c->totype;
     if (!tt) Fail(c->line, "internal: unchecked cast");
-    if (tt->ix) Unsupported(c->line, cat("a conversion to the index type ", TypeText(tt)));
     auto tgt = GoT(tt, c->line);
     GoT(st, c->line);
     // A constant converted would be checked by the Go compiler to fit.
     auto x = Materialize(st, GenX(c->child));
+    // Into an index or bound type: the value is checked against the array it
+    // names first, in every build, below its length or, a bound, at most
+    // that (CodeGen::IndexTypeCheck, §3.11), but where BCE proved it in range
+    // (AsCast::nobc): an expression, as GS_IDX is, which runs where the
+    // conversion does, a && or || side's only where that side runs. A value
+    // the check passes is its int64 again. A narrower width then converts as
+    // any `as` does: what it wraps to is in range still.
+    if (tt->ix && !c->nobc) {
+        if (st->kind != TY_INT || st->intstorage == IS_VARINT)
+            Unsupported(c->line, cat("a conversion of a ", TypeText(st), " to the index type ", TypeText(tt)));
+        auto chk = cat(tt->ix->upto ? "GsUpto(" : "GsIdx(", Coerce(x, st, ast.inttypes[IS_I64], c->line), ", ",
+                       IndexTypeLen(tt, c->line), ", ", LocArgs(c->line), ")");
+        auto sgt = GoT(st, c->line);
+        x = sgt == "int64" ? chk : cat(sgt, "(", chk, ")");
+    }
     string out;
     if (tt->kind == TY_INT) {
         auto is = tt->intstorage;

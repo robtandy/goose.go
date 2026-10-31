@@ -718,6 +718,17 @@ inline void CodeGenGo::ConstructCall(Call *c, TypeExpr *et, const string &stk, T
         return;
     }
     auto rt0 = c->rettypes.empty() ? nullptr : c->rettypes[0];
+    // A value holding relative references, a function's or a function
+    // value's, is built in its slot, claimed first, as a pushed element is,
+    // so that its links are measured from there (CodeGen::ConstructCall).
+    auto delivered = c->fvbody ? c->fvbody->exprtype : rt0;
+    if (c->builtin < 0 && delivered && NeedsResultLocation(delivered) && TEq(delivered, et)) {
+        auto p = T();
+        Decl(p, "unsafe.Pointer", Top(stk));
+        Bump(stk, cat(TI(et, c->line).size));
+        GenCallAny(c, GoDst { GD_LVALUE, AtAddr(p, et).lv, et });
+        return;
+    }
     // A bytes-class result feeding a fixed-class slot, or a slot of an array
     // kind it cannot be built in, is built on a temporary of its own and
     // copied into the slot below.
@@ -972,17 +983,28 @@ inline string CodeGenGo::GenRzArrayBuiltin(Call *c) {
             auto r = CoerceVal(GenX(an[1]), an[1]->exprtype, ast.RefTo(v.elem, ln, false), ln);
             return cat("(int64(uintptr(unsafe.Pointer(", r, ")) - uintptr(", v.data, ")) / ", v.esize, ")");
         }
+        case B_CHECK_LENGTH: {
+            // n, a length the array's elements could have on a data stack,
+            // or an abort (CodeGen's): GS_E_ARRAYLEN, or the message given.
+            auto l = RzRecvLoc(an[0]);
+            auto v = ArrayView(l, ln);
+            return SliceLen(an[1], FixedSize(v.elem) ? v.esize : 0, ln, "GsEArrayLen",
+                            an.size() > 2 ? an[2] : nullptr);
+        }
         case B_POP: {
             auto l = RzRecvLoc(an[0]);
             auto v = ArrayView(l, ln);
             auto elem = v.elem;
             auto nl = T();
             Decl(nl, "int64", cat(v.len, " - 1"));
-            L("if ", nl, " < 0 {");
-            ind++;
-            L("GsAbort(GsEPop, ", LocArgs(ln), ")");
-            ind--;
-            LS("}");
+            // An array BCE proved not empty here has no check (Call::nobc).
+            if (!c->nobc) {
+                L("if ", nl, " < 0 {");
+                ind++;
+                L("GsAbort(GsEPop, ", LocArgs(ln), ")");
+                ind--;
+                LS("}");
+            }
             L(v.lenlv, " = ", nl);
             // The array tops its stack: its elements end at the top.
             Bump(l.stk, cat(-v.esize));
@@ -1625,18 +1647,30 @@ inline string CodeGenGo::PlaceRun(const GoLoc &l, const string &n) {
     return i;
 }
 
-// A slice pool's length argument, evaluated once: a negative length, or one
-// no data stack could hold, aborts before anything changes.
-inline string CodeGenGo::SliceLen(Node *n, int64_t esz, Line ln) {
+// A slice pool's length argument, or check_length's, evaluated once: a
+// negative length, or one no data stack could hold, aborts before anything
+// changes (CodeGen::SliceLen), with the runtime's message for `error`, or
+// the one the program gave (FailCall). Elements of no bytes fit any length
+// that is not negative.
+inline string CodeGenGo::SliceLen(Node *n, int64_t esz, Line ln, const char *error, Node *msg) {
     auto i64 = ast.inttypes[IS_I64];
     auto nv = T();
     Decl(nv, "int64", Coerce(GenX(n), n->exprtype, i64, ln));
-    L("if uint64(", nv, ") > uint64(gsStackReserve/", esz, ") {");
+    if (esz) L("if uint64(", nv, ") > uint64(gsStackReserve/", esz, ") {");
+    else L("if ", nv, " < 0 {");
     ind++;
-    L("GsAbort(GsESliceLen, ", LocArgs(ln), ")");
+    L(FailCall(error, msg, ln));
     ind--;
     LS("}");
     return nv;
+}
+
+// The call a failed check makes: the runtime's message for `error`, or the
+// string literal a range_index or a check_length was given in its place
+// (CodeGen::FailCall).
+inline string CodeGenGo::FailCall(const char *error, Node *msg, Line ln) {
+    if (auto s = msg ? Is<StrLit>(msg) : nullptr) return cat("GsAbortMsg(", GoStr(s->val), ", ", LocArgs(ln), ")");
+    return cat("GsAbort(", error, ", ", LocArgs(ln), ")");
 }
 
 // Grows a slice pool's element region to `end` elements where it is shorter.
@@ -1719,13 +1753,13 @@ inline vector<string> CodeGenGo::EmitSlicePool(Call *c, vector<Node *> &an, Line
     }
     string i, n;
     if (c->builtin == B_ALLOC_SLICE) {
-        n = SliceLen(an[1], esz, ln);
+        n = SliceLen(an[1], FixedSize(elem) ? esz : 0, ln, "GsESliceLen");
         i = PlaceRun(l, n);
         EmitSliceExtend(l, cat(i, " + ", n), esz);
         EmitDefaultElems(v, i, n, c->defaultinit);
     } else {
         auto sv = Snapshot(st, CoerceVal(GenX(an[1]), an[1]->exprtype, st, ln));
-        n = SliceLen(an[2], esz, ln);
+        n = SliceLen(an[2], FixedSize(elem) ? esz : 0, ln, "GsESliceLen");
         i = indexof(sv);
         auto ol = T();
         Decl(ol, "int64", cat(sv, ".Len"));

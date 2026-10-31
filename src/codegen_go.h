@@ -200,10 +200,23 @@ struct CodeGenGo {
     }
 
     // Abort locations: one string constant per source file, named by the
-    // calls that report a place in it.
+    // calls that report a place in it. A check in a standard library
+    // function fails where the program called the library, as C's does
+    // (CodeGen::CallerLoc): such a function takes that call's location, a
+    // *GsLoc, as its last parameter, gs_at, reports its own lines there
+    // (gs_atf, gs_atl, which its body reads from gs_at as it starts), and
+    // hands it on to the library functions it calls (SpecInfo::located).
+    // Library code inlined into the program's is anchored at the call
+    // already (Inliner::AtCallSite). The locations a call hands on are
+    // package variables, gsLoc<n> (locdecls), one per file and line.
     map<int, string> filerefs;
+    map<pair<int, int>, string> locrefs;
+    string locdecls;
     string FileRef(Line l);
-    string LocArgs(Line l) { return cat(FileRef(l), ", ", l.line); }
+    bool AtCaller(Line l);
+    string LocArgs(Line l);
+    string CallerLoc(Line l);
+    string IndexTypeLen(TypeExpr *t, Line ln);
 
     // ------------------------------------------------------------------
     // Names (codegen_go_values.h).
@@ -257,6 +270,11 @@ struct CodeGenGo {
     map<pair<EnumInst *, int>, TypeExpr *> varianttypes;
     TypeExpr *VariantType(TypeExpr *enumtype, int vi);
     bool HasRelRef(TypeExpr *t);
+    // A fixed-size result holding relative references is built where its
+    // caller receives it (C's result location), so that a link from it is
+    // measured from there: its callee takes the address, gs_r<i>, and gives
+    // it no Go result (Signature, EmitSpecCall, GenNormalReturn).
+    bool NeedsResultLocation(TypeExpr *t) { return t && IsFix(t) && t->kind != TY_REF && HasRelRef(t); }
     bool BitwiseEq(TypeExpr *t);
     static constexpr int64_t NATIVE_VALUE_LIMIT = 4096;
     bool IsLargeFixed(TypeExpr *t);
@@ -315,6 +333,7 @@ struct CodeGenGo {
                          bool bitwise, Line ln);
     void BuildEnum(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
     void BuildFrameObj(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
+    void BuildRootStruct(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
     void BuildLimited(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln);
     void EmitTypeDecls();
     unordered_map<string, string> eqfns;
@@ -353,6 +372,10 @@ struct CodeGenGo {
         // the variable stays a Go value, where its address would move it
         // into the function's frame (FinishBody, DESIGN.md §3.6).
         bool golocal = false;
+        // A root owner variable, local or global, named directly: its
+        // fields are its components' own places (FieldLocAt), where one
+        // reached through a reference is its descriptor's.
+        const VarDef *rootowner = nullptr;
     };
     // An array's or a slice's elements.
     struct GoView {
@@ -562,8 +585,21 @@ struct CodeGenGo {
     // same stacks (--stacks).
 
     bool IsResz(TypeExpr *t) { return Cls(t) == SC_RESIZABLE; }
-    bool IsBytesT(TypeExpr *t) { return Cls(t) != SC_FIXED; }
-    bool NeedsStack(TypeExpr *t) { return IsBytesT(t) || IsLargeFixed(t); }
+    // A root owner (docs/design/root_structs.md upstream) is no value of any
+    // size: its descriptor, a Go struct of a reference to each of its
+    // components, which lie apart, each where a local or a global of its
+    // type would (CodeGen's, codegen_go_types.h BuildRootStruct).
+    bool IsRoot(TypeExpr *t) { return Cls(t) == SC_ROOT; }
+    bool IsBytesT(TypeExpr *t) { auto c = Cls(t); return c == SC_VARIABLE || c == SC_RESIZABLE; }
+    bool NeedsStack(TypeExpr *t) {
+        if (IsRoot(t)) {
+            auto si = SI(t);
+            for (auto ft : si->ftypes)
+                if (ft && NeedsStack(ft)) return true;
+            return false;
+        }
+        return IsBytesT(t) || IsLargeFixed(t);
+    }
     bool IsFrameObj(TypeExpr *t) { return t->kind == TY_STRUCT && SI(t)->frameobj; }
     bool IsFatRef(TypeExpr *t) {
         return t->kind == TY_REF && t->ref->lenstorage < 0 && IsResz(t->ref->sub);
@@ -674,7 +710,8 @@ struct CodeGenGo {
     void EmitFree(vector<Node *> &an, Line ln);
     string SpanArgs(const GoLoc &l);
     string PlaceRun(const GoLoc &l, const string &n);
-    string SliceLen(Node *n, int64_t esz, Line ln);
+    string SliceLen(Node *n, int64_t esz, Line ln, const char *error, Node *msg = nullptr);
+    string FailCall(const char *error, Node *msg, Line ln);
     void EmitSliceExtend(const GoLoc &l, const string &end, int64_t esz);
     void EmitDefaultElems(const GoView &v, const string &first, const string &count, Node *init);
     vector<string> EmitSlicePool(Call *c, vector<Node *> &an, Line ln);
@@ -820,6 +857,9 @@ struct CodeGenGo {
         // A long-distance return (§7.9) can come back through a call of it:
         // its callers check for one in flight (EmitRfCheck).
         bool hasrf = false;
+        // A standard library function's: it takes its caller's location,
+        // gs_at, last (AtCaller, CallerLoc).
+        bool located = false;
     };
     // Long-distance returns (`return ... from`, a block's return out of the
     // functions it is handed to, §7.9), as the C backend has them
@@ -1015,6 +1055,10 @@ struct CodeGenGo {
     set<string> largegts;
     void NoteType(const string &name, const string &gt) { ltypes[name] = gt; }
     static constexpr const char *FRAMEEND = "\x03";
+    // The marker the lines of a root owner's descriptor end with, its name
+    // after it: FinishBody drops them where nothing else names the owner's
+    // descriptor, which only a reference to the owner reads (BindLocal).
+    static constexpr const char *ROOTMARK = "\x04";
     // Whether a callee takes the block is known once every body is: one
     // whose frame holds a local takes it, as does any calling one. Until
     // then a call's and a signature's place for it holds GSARG/GSPARAM and
@@ -1117,10 +1161,13 @@ struct CodeGenGo {
     void GenExitValue(Node *val, int si);
     vector<string> GenForward(Call *c, const vector<TypeExpr *> &rets, const vector<GoDst> &chans);
     void GenNormalReturn(const vector<Node *> &vals);
+    // Result i's place, where its caller receives it (NeedsResultLocation).
+    string ResultLv(size_t i) { return cat("(*(*", GoT(curspec->rets[i], curspec->sf->line), ")(gs_r", i, "))"); }
     void GenVarDecl(VarDecl *vd);
     string LocalName(VarDef *vd);
     string Unique2(const string &base);
     void BindLocal(VarDef *d, Node *init, bool forlocal = true);
+    bool BindRootAlias(VarDef *d, Node *init);
     bool StableDest(Node *n);
     GoLoc AssignLoc(Node *lval, bool pointee);
     void GenAssign(Assign *a);
@@ -1218,6 +1265,7 @@ struct CodeGenGo {
     void EmitGlobalDecls();
     bool StaticInit(Node *n, TypeExpr *t, string &out);
     void EmitGlobalInit();
+    void InitGlobalValue(VarDef *d, Node *init);
     // The dedicated stacks of the globals, in the order gsInitGlobals sets
     // them up: each one's index follows the main program's stacks.
     vector<string> gstkorder;
