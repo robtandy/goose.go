@@ -52,6 +52,15 @@ func TestKernels(t *testing.T) {
 	if got := CountDigitsBytes([]byte("77")); got != 2 {
 		t.Errorf("CountDigitsBytes = %d", got)
 	}
+	// A constant table, there with no start (issue #62).
+	for _, c := range []struct {
+		x    uint64
+		want int64
+	}{{0, 1}, {9, 1}, {10, 2}, {999, 3}, {1000, 4}, {1e18, 19}, {1e19 - 1, 19}, {1e19, 20}, {math.MaxUint64, 20}} {
+		if got := DecimalDigits(c.x); got != c.want {
+			t.Errorf("DecimalDigits(%d) = %d, want %d", c.x, got, c.want)
+		}
+	}
 }
 
 // An abort is a panic whose value is an error naming the check's place.

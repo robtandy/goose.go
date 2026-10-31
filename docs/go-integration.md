@@ -258,7 +258,7 @@ go test -tags goose -run '^$' -fuzz '^FuzzCountRecords$' -fuzztime 1m
 
 An input that fails is written to `testdata/fuzz/FuzzCountRecords/`: check it in, and it is a seed of every `go test` from then on.
 
-**Guard pages,** for a kernel that reads or writes more than a byte at a time. The Go the compiler writes reaches memory through `unsafe.Pointer` wherever bounds-check elimination proved an index in range (`binary.LittleEndian.Uint64((*[8]byte)(p)[:])`), so Go checks none of it. A read past the end of a slice on Go's heap reads its allocation's slack or the next object's bytes, and seldom faults: no other test sees it, and `-d=checkptr` sees it only where it crosses into another allocation. An input that ends where a `PROT_NONE` page starts makes any read past its end fault, at once:
+**Guard pages,** for a kernel that reads or writes more than a byte at a time. The Go the compiler writes reaches memory through `unsafe.Pointer` wherever bounds-check elimination proved an index in range (`gsLe64((*[8]byte)(p))`, an 8-byte load at `p`), so Go checks none of it. A read past the end of a slice on Go's heap reads its allocation's slack or the next object's bytes, and seldom faults: no other test sees it, and `-d=checkptr` sees it only where it crosses into another allocation. An input that ends where a `PROT_NONE` page starts makes any read past its end fault, at once:
 
 <!-- example: guard_test.go -->
 ```go
@@ -431,7 +431,7 @@ Both builds report 0 B/op and 0 allocs/op: a kernel's call allocates nothing.
 
 ### Byte-assembled loads: one-load helpers
 
-An integer ORed together from consecutive bytes is one load, of 2, 4 or 8 bytes, only where every byte's bounds check is gone: anything else is a load and a check per byte (the README's [Integers in bytes](../README.md#integers-in-bytes-one-load-one-store)). Write each width once, as a helper that slices its span and indexes the slice by constants, as `le32` and `le64` do: the slice's one check proves every byte, wherever the helper is called, at a position proven or not. A helper of indices instead (`s[i] | (s[i + 1] as u64) << 8 | ...`) is one load only where the compiler proves `i` through `i + 7` in range at its every call, from a loop's condition or a guard, and eight checked bytes elsewhere. Then check the Go: the example's file holds one `binary.LittleEndian.Uint32` and one `binary.LittleEndian.Uint64`, a load each (`test/run_go_tests.py` counts them).
+An integer ORed together from consecutive bytes is one load, of 2, 4 or 8 bytes, only where every byte's bounds check is gone: anything else is a load and a check per byte (the README's [Integers in bytes](../README.md#integers-in-bytes-one-load-one-store)). Write each width once, as a helper that slices its span and indexes the slice by constants, as `le32` and `le64` do: the slice's one check proves every byte, wherever the helper is called, at a position proven or not. A helper of indices instead (`s[i] | (s[i + 1] as u64) << 8 | ...`) is one load only where the compiler proves `i` through `i + 7` in range at its every call, from a loop's condition or a guard, and eight checked bytes elsewhere. Then check the Go: the example's file holds one call of `gsLe32` and one of `gsLe64`, the runtime's, a load each (`test/run_go_tests.py` counts them).
 
 ### Shift width: cast before shifting
 

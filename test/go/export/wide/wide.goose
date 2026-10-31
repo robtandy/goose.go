@@ -146,6 +146,40 @@ export fn le32_via_local(s: const u8[:], i: i64, j: i64) -> u64 {
     r[j] | (r[j + 1] as u64) << 8 | (r[j + 2] as u64) << 16 | (r[j + 3] as u64) << 24
 }
 
+// ---- a function Go takes to be big, of 5000 nodes or more, into which it
+// inlines nothing that costs more than 20 (issue #62): 256 loads of 8 bytes
+// and 32 stores, each the one load or store, with no call, which
+// run_go_tests.py checks at -O2, where the inline fns below are inlined
+// (Runner.call_asm).
+
+// A round: the little-endian word at s[j..j + 8] mixed into h.
+inline fn mix(h: u64, s: const u8[:], j: i64) -> u64 {
+    let w = s[j] | (s[j + 1] as u64) << 8 | (s[j + 2] as u64) << 16 | (s[j + 3] as u64) << 24 |
+        (s[j + 4] as u64) << 32 | (s[j + 5] as u64) << 40 | (s[j + 6] as u64) << 48 |
+        (s[j + 7] as u64) << 56;
+    ((h ^ w) * 1099511628211) ^ (h >> 29)
+}
+// 8 rounds over s[i..i + 64], and the state after them stored big-endian at
+// o[k..k + 8], which the guard proves in their slices; h where it does not.
+inline fn mix8(h: u64, s: const u8[:], i: i64, o: u8[:], k: i64) -> u64 {
+    if i < 0 || i > s.len - 64 || k < 0 || k > o.len - 8 { return h; }
+    let x = mix(mix(mix(mix(mix(mix(mix(mix(h, s, i), s, i + 8), s, i + 16), s, i + 24), s, i + 32), s, i + 40),
+                    s, i + 48), s, i + 56);
+    for b in 8 { o[k + b] = (x >> (8 * (7 - b))) as! u8; }
+    x
+}
+inline fn mix64(h: u64, s: const u8[:], i: i64, o: u8[:], k: i64) -> u64 {
+    mix8(mix8(mix8(mix8(mix8(mix8(mix8(mix8(h, s, i, o, k), s, i + 64, o, k + 8), s, i + 128, o, k + 16),
+                             s, i + 192, o, k + 24), s, i + 256, o, k + 32), s, i + 320, o, k + 40),
+              s, i + 384, o, k + 48), s, i + 448, o, k + 56)
+}
+// The digest of s[..2048], each 64 bytes' state stored into o[..256].
+// asm: big, no calls
+export fn digest_2k(s: const u8[:], o: u8[:]) -> u64 {
+    mix64(mix64(mix64(mix64(14695981039346656037, s, 0, o, 0), s, 512, o, 64), s, 1024, o, 128),
+          s, 1536, o, 192)
+}
+
 // ---- for go test -bench: the sum of the little-endian words of s, 8 bytes
 // at a time, one load each; and a byte at a time, `+` where `|` would be,
 // of which no load is made.

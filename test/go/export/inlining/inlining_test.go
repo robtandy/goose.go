@@ -73,6 +73,33 @@ func TestKernels(t *testing.T) {
 	if got := TagsLenWithStack(nil, nil); got != 0 {
 		t.Errorf("TagsLenWithStack(nil) = %d", got)
 	}
+	// A struct of two i64s and two bools, the bytes of its C layout to Go,
+	// built and returned with no block (issue #62).
+	for _, c := range []struct {
+		xs                   []int64
+		x, first, last, span int64
+		any, many            bool
+	}{
+		{[]int64{4, 1, 4, 2, 4}, 4, 0, 4, 5, true, true},
+		{[]int64{4, 1, 4, 2, 4}, 2, 3, 3, 1, true, false},
+		{[]int64{4, 1}, 7, -1, -1, -1, false, false},
+		{nil, 0, -1, -1, -1, false, false},
+	} {
+		f := FindAll(c.xs, c.x)
+		first, last, any, many := found(f)
+		if first != c.first || last != c.last || any != c.any || many != c.many {
+			t.Errorf("FindAll(%v, %d) = %d, %d, %v, %v", c.xs, c.x, first, last, any, many)
+		}
+		if g := FindAllWithStack(nil, c.xs, c.x); g != f {
+			t.Errorf("FindAllWithStack(%v, %d) = %v, FindAll %v", c.xs, c.x, g, f)
+		}
+		if got := FoundSpan(f); got != c.span {
+			t.Errorf("FoundSpan(FindAll(%v, %d)) = %d", c.xs, c.x, got)
+		}
+		if got := FoundSpanWithStack(nil, f); got != c.span {
+			t.Errorf("FoundSpanWithStack(FindAll(%v, %d)) = %d", c.xs, c.x, got)
+		}
+	}
 	ws := []int64{1, 2, 3, 4}
 	gs := AcquireStackBlock(1)
 	defer ReleaseStackBlock(gs)
@@ -100,6 +127,11 @@ func TestKernels(t *testing.T) {
 			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
 		}
 	}
+}
+
+// found is a Found's fields, at their offsets in its C layout.
+func found(f Found_g) (first, last int64, any, many bool) {
+	return *(*int64)(unsafe.Pointer(&f[0])), *(*int64)(unsafe.Pointer(&f[8])), f[16] != 0, f[17] != 0
 }
 
 // A caller's array that nothing else lets escape stays on its stack where
@@ -158,6 +190,11 @@ func TestCallerArraysStay(t *testing.T) {
 			var a [4]string
 			a[1], a[3] = "two", "four"
 			sink += TagsLen(a[:])
+		}},
+		{"FindAll", func() {
+			var a [8]int64
+			a[5] = 3
+			sink += FoundSpan(FindAll(a[:], 3))
 		}},
 	}
 	for _, c := range stay {

@@ -13,7 +13,8 @@
 // line annotates (go test -c -gcflags=-m=2, Runner.entry_points): `inline`,
 // Go can inline every one of its entry points; `no escape`, none of them lets
 // a slice or reference parameter escape (`does not escape`, or leaks it to
-// its result only); `escape`, each does (`leaking param`). It compares the
+// its result only); `escape`, each does (`leaking param`); `block-free`, none
+// takes a block of data stacks (AcquireStackBlock). It compares the
 // code Go makes of each callX function of inlining_test.go with that of
 // directX, the call of the function a caller could write by hand: the same
 // instructions. inlining_test.go checks what each computes, and that a
@@ -73,6 +74,34 @@ export fn tags_len(tags: const (const u8[:])[:]) -> i64 {
     var n = 0;
     for t in tags { n += t.len; }
     n
+}
+
+// Where x is in xs, first and last, and whether once or more than once: a
+// struct of two i64s and two bools, 18 bytes in its C layout, which leaves
+// Go a tail to pad, so that its Go value is those bytes. Built, read and
+// written in a Go local, which none of its addresses outlives an access of,
+// it stays a Go local, on Go's stack (issue #62): the function takes no
+// frame on the fixed-frame stack, and its entry points no block.
+struct Found { first: i64, last: i64, any: bool, many: bool }
+
+// entry: inline, no escape, block-free
+export fn find_all(xs: const i64[:], x: i64) -> Found {
+    var f = Found { first: -1, last: -1, any: false, many: false };
+    for v, i in xs {
+        if v == x {
+            if f.any { f.many = true; } else { f.first = i; }
+            f.last = i;
+            f.any = true;
+        }
+    }
+    f
+}
+
+// The span of what find_all found, -1 for nothing: a Found as a parameter.
+// entry: inline, block-free
+export fn found_span(f: Found) -> i64 {
+    if !f.any { return -1; }
+    f.last - f.first + 1
 }
 
 fn weighted(xs: const i64[:], k: i64) -> i64 {

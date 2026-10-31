@@ -2,6 +2,7 @@ package goose
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/big"
@@ -645,6 +646,73 @@ func TestFloatText(t *testing.T) {
 		text = string(gsAppendFloat(nil, float64(f), true))
 		if back, err := strconv.ParseFloat(text, 32); err != nil || float32(back) != f {
 			t.Fatalf("f32 %v prints as %q", f, text)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Wide loads and stores (issue #62): each the integer encoding/binary reads
+// at every offset of a buffer on a data stack, in both orders, and each
+// store the bytes it writes, the bytes around them untouched.
+
+func TestWideLoadsStores(t *testing.T) {
+	gs := NewStackBlock(1, 1<<20, 64<<10)
+	defer gs.Close()
+	buf := unsafe.Slice((*byte)(gs.Base[0]), 32)
+	seed := lcg(62)
+	fill := func() {
+		for i := range buf {
+			buf[i] = byte(seed.next(256))
+		}
+	}
+	at := func(off int) unsafe.Pointer { return unsafe.Add(gs.Base[0], off) }
+	for off := 0; off+8 <= len(buf); off++ {
+		fill()
+		b := buf[off:]
+		for _, c := range []struct {
+			name      string
+			got, want uint64
+		}{
+			{"GsLe16", uint64(GsLe16((*[2]byte)(at(off)))), uint64(binary.LittleEndian.Uint16(b))},
+			{"GsBe16", uint64(GsBe16((*[2]byte)(at(off)))), uint64(binary.BigEndian.Uint16(b))},
+			{"GsLe32", uint64(GsLe32((*[4]byte)(at(off)))), uint64(binary.LittleEndian.Uint32(b))},
+			{"GsBe32", uint64(GsBe32((*[4]byte)(at(off)))), uint64(binary.BigEndian.Uint32(b))},
+			{"GsLe64", GsLe64((*[8]byte)(at(off))), binary.LittleEndian.Uint64(b)},
+			{"GsBe64", GsBe64((*[8]byte)(at(off))), binary.BigEndian.Uint64(b)},
+		} {
+			if c.got != c.want {
+				t.Errorf("%s at %d = %#x, want %#x", c.name, off, c.got, c.want)
+			}
+		}
+		v := uint64(seed.next(math.MaxInt64))<<1 | 1
+		le, be := binary.ByteOrder(binary.LittleEndian), binary.ByteOrder(binary.BigEndian)
+		for _, c := range []struct {
+			name  string
+			n     int
+			order binary.ByteOrder
+			put   func()
+		}{
+			{"GsPutLe16", 2, le, func() { GsPutLe16((*[2]byte)(at(off)), uint16(v)) }},
+			{"GsPutBe16", 2, be, func() { GsPutBe16((*[2]byte)(at(off)), uint16(v)) }},
+			{"GsPutLe32", 4, le, func() { GsPutLe32((*[4]byte)(at(off)), uint32(v)) }},
+			{"GsPutBe32", 4, be, func() { GsPutBe32((*[4]byte)(at(off)), uint32(v)) }},
+			{"GsPutLe64", 8, le, func() { GsPutLe64((*[8]byte)(at(off)), v) }},
+			{"GsPutBe64", 8, be, func() { GsPutBe64((*[8]byte)(at(off)), v) }},
+		} {
+			fill()
+			want := append([]byte(nil), buf...)
+			switch c.n {
+			case 2:
+				c.order.PutUint16(want[off:], uint16(v))
+			case 4:
+				c.order.PutUint32(want[off:], uint32(v))
+			default:
+				c.order.PutUint64(want[off:], v)
+			}
+			c.put()
+			if !bytes.Equal(buf, want) {
+				t.Errorf("%s at %d wrote %x, want %x", c.name, off, buf, want)
+			}
 		}
 	}
 }

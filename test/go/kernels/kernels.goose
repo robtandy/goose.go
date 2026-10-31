@@ -1,11 +1,13 @@
 // A library of kernels (issue #19): pure functions over slices, which take
-// no data stack, hold no global and spawn no worker. Its Go needs nothing
-// of the runtime's data stacks, pools or text forms, and test/run_go_tests.py
-// checks that the file the compiler writes holds none of them (the runtime's
-// functions it names are absent, and the file is short); nor, since the
-// kernels keep what they are handed in their own variables, does it move
-// an argument off its caller's stack or keep one alive (issue #22).
-// kernels_test.go calls the entry points.
+// no data stack, hold no global but a constant table and spawn no worker.
+// Its Go needs nothing of the runtime's data stacks, pools or text forms, and
+// test/run_go_tests.py checks that the file the compiler writes holds none
+// of them (the runtime's functions it names are absent, and the file is
+// short); nor, since the kernels keep what they are handed in their own
+// variables, does it move an argument off its caller's stack or keep one
+// alive (issue #22); nor, the table being Go's static data, does the library
+// have a start, or globals to initialize (issue #62). kernels_test.go calls
+// the entry points.
 
 // The dot product of a and b, over the elements they both have.
 export fn dot(a: const f64[:], b: const f64[:]) -> f64 {
@@ -64,3 +66,16 @@ export fn count_digits(text: const u8[:]) -> i64 {
 // The quotient of a and b: a division by zero aborts, which crosses to the
 // Go caller as a panic.
 export fn quotient(a: i64, b: i64) -> i64 { a / b }
+
+// The powers of ten that fit a u64: a constant table, which is static data.
+const POW10: u64[20] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000,
+                        10000000000, 100000000000, 1000000000000, 10000000000000, 100000000000000,
+                        1000000000000000, 10000000000000000, 100000000000000000, 1000000000000000000,
+                        10000000000000000000];
+
+// The decimal digits of x, by the table.
+export fn decimal_digits(x: u64) -> i64 {
+    var n = 1;
+    while n < 20 && x >= POW10[n] { n += 1; }
+    n
+}

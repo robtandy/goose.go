@@ -174,8 +174,48 @@ func TestSums(t *testing.T) {
 	}
 }
 
+// digest2k is digest_2k in Go: 8 rounds of each 64 bytes of s[..2048] that s
+// holds, each block's state stored big-endian into o[8*b..] where o holds it.
+func digest2k(s, o []byte) uint64 {
+	h := uint64(14695981039346656037)
+	for blk := 0; blk < 32; blk++ {
+		i, k := 64*blk, 8*blk
+		if i > len(s)-64 || k > len(o)-8 {
+			continue
+		}
+		for j := i; j < i+64; j += 8 {
+			h = ((h ^ binary.LittleEndian.Uint64(s[j:])) * 1099511628211) ^ (h >> 29)
+		}
+		binary.BigEndian.PutUint64(o[k:], h)
+	}
+	return h
+}
+
+// The function Go takes to be big (issue #62), whose 256 loads and 32 stores
+// are each one load or store with no call: what it computes and stores, for
+// inputs that hold every block, some of them and none.
+func TestDigest2k(t *testing.T) {
+	for _, c := range []struct{ size, out int }{{2048, 256}, {4000, 300}, {2047, 256}, {1000, 256}, {2048, 100}, {0, 0}} {
+		s := data(c.size, int64(c.size)+7)
+		got, want := make([]byte, c.out), make([]byte, c.out)
+		if g, w := Digest2kBytes(s, got), digest2k(s, want); g != w || !bytes.Equal(got, want) {
+			t.Errorf("Digest2k(len %d, len %d) = %#x, want %#x; stored %x, want %x", c.size, c.out, g, w, got, want)
+		}
+	}
+}
+
 // go test -bench . compares the wide loads with the bytes read one by one,
 // and with encoding/binary's own, and each call with encoding/binary's.
+func BenchmarkDigest2k(b *testing.B) {
+	s, o := data(2048, 5), make([]byte, 256)
+	b.SetBytes(int64(len(s)))
+	var sum uint64
+	for i := 0; i < b.N; i++ {
+		sum += Digest2kBytes(s, o)
+	}
+	_ = sum
+}
+
 func BenchmarkSumLe64(b *testing.B) {
 	s := data(4096, 3)
 	b.SetBytes(int64(len(s)))

@@ -113,10 +113,22 @@ tests under the race detector too, where cgo builds.
 The entry points of the kernels of test/go/export/inlining/ (issue #22) are
 read as Go compiles them, at -O2 and at -O0 (`go test -c -gcflags=-m=2`):
 each export fn an `// entry:` line annotates must have entry points Go can
-inline (`inline`), and whose slice and pointer parameters do not escape (`no
-escape`) or all do (`escape`); and each callX function of its tests, a call
+inline (`inline`), whose slice and pointer parameters do not escape (`no
+escape`) or all do (`escape`), and that take no block of data stacks
+(`block-free`, issue #62); and each callX function of its tests, a call
 of an entry point, must be the same instructions for arm64 and for amd64 as
 directX, the call of its function written by hand (Runner.entry_points).
+
+The code Go makes of the export fns of test/go/export/string_slices/ and
+test/go/export/wide/ (issue #62) is read for arm64 and amd64, at -O2 and at
+-O0: each export fn an `// asm: no calls` line annotates must call nothing
+but its stack check -- its reads of the strings of a []string were calls of
+runtime.memmove -- and one an `// asm: big, no calls` line annotates, at
+-O2, must be a function Go takes to be big, of 5000 nodes or more, which it
+inlines nothing costing more than 20 into, and call nothing either -- its
+wide loads and stores were calls of encoding/binary's there; and every
+helper of the file reading or writing a value holding Go pointers where it
+may lie unaligned (gsLd_, gsSt_) must call nothing (Runner.call_asm).
 
 The library of test/go/export/arena/ (issue #25), whose export fns grow
 globals on data stacks of their own in a program without workers, keeps its
@@ -290,7 +302,7 @@ EXAMPLE_GUIDE = REPO / "docs" / "go-integration.md"
 # which the line before it names: lines of the file as they are.
 EXAMPLE_EXCERPT = re.compile(r"^<!-- example: (\S+) -->\n```\w*\n(.*?)^```$", re.M | re.S)
 EXAMPLE_GENERATED = "records_goose.go"
-EXAMPLE_LOADS = {"binary.LittleEndian.Uint32(": 1, "binary.LittleEndian.Uint64(": 1}
+EXAMPLE_LOADS = {"gsLe32((*[4]byte)(": 1, "gsLe64((*[8]byte)(": 1}
 EXAMPLE_ABSENT = ["gsLibStart", "StackBlock", "gsEscape", "KeepAlive", '"sync"', '"syscall"']
 EXAMPLE_ENTRIES = {"CountRecords", "CountRecordsString", "CountRecordsBytes"}
 # The example's mutants, the guide's mutation checks, which its tests must
@@ -306,8 +318,8 @@ EXAMPLE_MUTANTS = [
      "r.(*gsError)", "r.(interface{ RuntimeError() })", "^TestCount$", None),
     # Right, and reading 4 bytes past the span: only the guard page sees it.
     ("a 4-byte load reading 8", EXAMPLE_GENERATED,
-     r"binary\.LittleEndian\.Uint32\(\(\*\[4\]byte\)\(([^()]+)\)\[:\]\)",
-     r"uint32(binary.LittleEndian.Uint64((*[8]byte)(\1)[:]))", "^TestKernelGuardPage$",
+     r"gsLe32\(\(\*\[4\]byte\)\(([^()]+)\)\)",
+     r"uint32(gsLe64((*[8]byte)(\1)))", "^TestKernelGuardPage$",
      "^(TestKernelTable|TestKernelRandom|FuzzCountRecords|TestCount)$"),
 ]
 # A top-level declaration of Go source as gofmt lays it out: a method's
@@ -1095,7 +1107,7 @@ def wide_annotations(src):
         if m:
             pending = ("none", 0) if m[3] else (m[1], int(m[2]))
             continue
-        m = re.match(r'^export (?:"\w+" )?fn (\w+)\(', line)
+        m = re.match(r'^export (?:"\w+" )?(?:checkfree )?fn (\w+)\(', line)
         if m and pending:
             want[m[1]] = pending
         if not line.startswith("//"):
@@ -1171,7 +1183,7 @@ def select_annotations(src):
         if m:
             pending = int(m[1])
             continue
-        m = re.match(r'^export (?:"\w+" )?fn (\w+)\(', line)
+        m = re.match(r'^export (?:"\w+" )?(?:checkfree )?fn (\w+)\(', line)
         if m and pending is not None:
             want[m[1]] = pending
         if not line.startswith("//"):
@@ -1231,7 +1243,7 @@ def spill_annotations(src):
         if m:
             pending = m[1]
             continue
-        m = re.match(r'^export (?:"\w+" )?fn (\w+)\(', line)
+        m = re.match(r'^export (?:"\w+" )?(?:checkfree )?fn (\w+)\(', line)
         if m and pending:
             want[m[1]] = pending
         if not line.startswith("//"):
@@ -1323,6 +1335,48 @@ def not_inlined(gosrc, mout, names):
     return out
 
 
+# --- functions whose code calls nothing (issue #62) ---------------------------
+
+# The sources whose `// asm: no calls` and `// asm: big, no calls` lines
+# Runner.call_asm checks.
+CALL_SOURCES = ["export/string_slices/string_slices.goose", "export/wide/wide.goose"]
+# The call a function's code makes that is none of its own: the check of
+# its goroutine's stack its prologue makes, where it has a frame.
+STACK_CHECK = re.compile(r"\bruntime\.morestack\w*\(SB\)")
+# The helpers that read and write a value holding Go pointers where it may
+# lie unaligned (codegen_go_places.h LdStFn), whose copies of its bytes were
+# calls of runtime.memmove.
+LDST_HELPER = re.compile(r"^\S+\.(gs(?:Ld|St)_\w+) STEXT", re.M)
+
+
+def call_annotations(src):
+    """The export fns of src an `// asm: no calls` or `// asm: big, no calls`
+    comment line above names: name -> whether `big`."""
+    want, pending = {}, None
+    for line in src.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^// asm: (big, )?no calls$", line)
+        if m:
+            pending = bool(m[1])
+            continue
+        m = re.match(r'^export (?:"\w+" )?(?:checkfree )?fn (\w+)\(', line)
+        if m and pending is not None:
+            want[m[1]] = pending
+        if not line.startswith("//"):
+            pending = None
+    return want
+
+
+def asm_calls(asm, fn):
+    """The calls the function fn makes in the output of `go build
+    -gcflags=-S`, each as text, but its stack check (STACK_CHECK), or None
+    where fn is not there."""
+    insns = asm_insns(asm, fn)
+    if insns is None:
+        return None
+    return [f"{op} {', '.join(o)}" for op, o in insns
+            if op == "CALL" and not STACK_CHECK.search(" ".join(o))]
+
+
 # --- the frames of locals handed to inlined bodies by reference (issue #24) ---
 
 def frame_annotations(src):
@@ -1335,7 +1389,7 @@ def frame_annotations(src):
         if m:
             pending = 0 if m[2] else int(m[1])
             continue
-        m = re.match(r'^export (?:"\w+" )?fn (\w+)\(', line)
+        m = re.match(r'^export (?:"\w+" )?(?:checkfree )?fn (\w+)\(', line)
         if m and pending is not None:
             want[m[1]] = pending
         if not line.startswith("//"):
@@ -1400,8 +1454,8 @@ def go_calls(text, name):
 
 # What an `// entry:` line can say of an export fn's entry points: Go can
 # inline each; none lets a parameter viewing its caller's memory escape; each
-# lets every one escape.
-ENTRY_PROPS = {"inline", "no escape", "escape"}
+# lets every one escape; none takes a block of data stacks (issue #62).
+ENTRY_PROPS = {"inline", "no escape", "escape", "block-free"}
 
 
 def go_export_name(sym):
@@ -1420,7 +1474,7 @@ def entry_annotations(src):
         if m:
             pending = set(m[1].split(", "))
             continue
-        m = re.match(r'^export (?:"(\w+)" )?fn (\w+)\(', line)
+        m = re.match(r'^export (?:"(\w+)" )?(?:checkfree )?fn (\w+)\(', line)
         if m and pending is not None:
             want[go_export_name(m[1] or m[2])] = pending
         if not line.startswith("//"):
@@ -3446,6 +3500,52 @@ class Runner:
                 out.append(("ok" if not got else "fail", label, None if not got else "\n".join(got)))
         return out
 
+    def call_asm(self):
+        """The code Go makes of the export fns of CALL_SOURCES (issue #62), at
+        -O2 and at -O0, for each of WIDE_ARCHES (Runner.library_asm): each
+        export fn an `// asm: no calls` line annotates must call nothing but
+        its stack check, its reads of the slices a slice of slices holds
+        included, which were calls of runtime.memmove; each one an `// asm:
+        big, no calls` line annotates, at -O2, where its inline helpers are
+        inlined, must be one Go takes to be big, of 5000 nodes or more (`go
+        build -gcflags=-m=2`), into which it inlines nothing that costs more
+        than 20, and call nothing either, its wide loads and stores
+        included, which were calls of encoding/binary's there; and every
+        helper reading or writing a value holding Go pointers where it may
+        lie unaligned (gsLd_, gsSt_) must call nothing."""
+        out = []
+        for rel in CALL_SOURCES:
+            src = HERE / "go" / rel
+            want = call_annotations(src)
+            if not want:
+                out.append(("fail", f"calls: no // asm: no calls line in {src.name}", None))
+                continue
+            tag = f"calls-{src.stem}"
+            bigs = {}
+            for level, arch, asm in self.library_asm(src, tag, out):
+                if level not in bigs:
+                    r = subprocess.run([self.go, "build", "-gcflags=-m=2", "."], cwd=self.work / f"{tag}-asm-O{level}",
+                                       env=go_env(), capture_output=True)
+                    bigs[level] = set(re.findall(r"function (\w+) considered 'big'",
+                                                 tc.decode(r.stdout) + tc.decode(r.stderr)))
+                for fn, big in sorted(want.items()):
+                    if big and level != "2":
+                        continue
+                    label = f"calls {src.stem} {fn} -O{level} {arch}: {'big, ' if big else ''}no calls"
+                    got = asm_calls(asm, f"{fn}_g")
+                    if got is None:
+                        out.append(("fail", label, f"no {fn}_g in Go's code for {arch}"))
+                        continue
+                    if big and f"{fn}_g" not in bigs[level]:
+                        out.append(("fail", label, f"Go does not take {fn}_g to be big (go build -gcflags=-m=2)"))
+                        continue
+                    out.append(("ok" if not got else "fail", label, None if not got else "\n".join(got)))
+                for helper in sorted(set(LDST_HELPER.findall(asm))):
+                    got = asm_calls(asm, helper)
+                    out.append(("ok" if not got else "fail", f"calls {src.stem} {helper} -O{level} {arch}: no calls",
+                                None if not got else "\n".join(got)))
+        return out
+
     def bce_gaps(self, src):
         """A reproducer of a gap in the front end's bounds-check elimination
         (test/go/bce_gaps/, issue #26): at -O1 and -O2, where calls are
@@ -3539,8 +3639,10 @@ class Runner:
         by shape of a generic one that the tests make); `no escape`, no parameter of
         them that views a caller's memory escapes (`does not escape`, or it
         leaks to the result alone); `escape`, each one does (`leaking
-        param`). Go reports no escapes of a generic function's own, whose
-        callers' arrays inlining_test.go follows instead (AllocsPerRun).
+        param`); and as the Go says, `block-free`, Name takes no block of
+        data stacks from the pool (issue #62). Go reports no escapes of a
+        generic function's own, whose callers' arrays inlining_test.go
+        follows instead (AllocsPerRun).
         Then, for each of WIDE_ARCHES (`go test -c -gcflags=-S`),
         each callX function of the tests must be the same instructions as
         directX: a call of an entry point is the call of its function that
@@ -3591,6 +3693,14 @@ class Runner:
                 if not eps:
                     out.append(("fail", f"entry points {name} -O{level}", f"no func {name} in {gofile.name}"))
                     continue
+                if "block-free" in props:
+                    # Name calls the function with no block: it acquires none
+                    # from the pool, and turns on no fault scope for one.
+                    text = re.search(rf"^func {name}(?:\[.*?\])?\(.*?^}}$", gosrc, re.M | re.S)
+                    held = [w for w in ("AcquireStackBlock", "SetPanicOnFault") if text and w in text[0]]
+                    ok = text is not None and not held
+                    out.append(("ok" if ok else "fail", f"entry points {name} -O{level}: block-free",
+                                None if ok else text[0] if text else f"no func {name}"))
                 for ep, line, views, generic in eps:
                     at = f"./{gofile.name}:{line}:"
                     said = [x[len(at):].partition(": ")[2] for x in report.splitlines() if x.startswith(at)]
@@ -4188,6 +4298,11 @@ def main():
         # library's own tests.
         if not args.bless and (not args.names or "bounds" in args.names):
             futures.append(pool.submit(r.spill_asm))
+        # The calls Go makes of a slice of slices' slices and of a big
+        # function's wide loads and stores (issue #62): none, beside their
+        # export libraries' own tests.
+        if not args.bless and (not args.names or {"string_slices", "wide"} & set(args.names)):
+            futures.append(pool.submit(r.call_asm))
         # The frames of locals handed to inlined bodies by reference (issue
         # #24), beside their export library's own tests.
         if not args.bless and (not args.names or "inline_refs" in args.names):

@@ -82,6 +82,24 @@ export fn clamp_sum(xs: const i64[:], lo: i64, hi: i64) -> i64 {
     s
 }
 
+// ---- in a checkfree fn (§7.14), which may call std's choices of scalars
+// under --target=go (issue #62): none leaves a bounds check in it.
+
+// The largest of xs, each capped at hi.
+// asm: select, branches 1
+export checkfree fn capped_max(xs: const i64[:], hi: i64) -> i64 {
+    var m = -9223372036854775807 - 1;
+    for x in xs { m = max(m, min(x, hi)); }
+    m
+}
+// The sum of each value clamped to [lo, hi], of its magnitude and its sign.
+// asm: select, branches 1
+export checkfree fn choices_sum(xs: const i64[:], lo: i64, hi: i64) -> i64 {
+    var s = 0;
+    for x in xs { s += clamp(x, lo, hi) + abs(x) + sign(x); }
+    s
+}
+
 // A function of the program's own, which chooses as std's max does.
 fn larger(a: i32, b: i32) -> i32 {
     if a > b { return a; }

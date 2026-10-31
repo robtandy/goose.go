@@ -74,6 +74,18 @@ inline string CodeGenGo::AddrOf(const GoLoc &l) {
     return cat("unsafe.Pointer(&", l.lv, ")");
 }
 
+// The address a load or a store of the place l takes for itself alone,
+// where l is a Go local's own (GoLoc::golocal): `&` marked (TMARK), which
+// FinishBody counts as no use of the local's address, since none outlives
+// the access, so that the local stays a Go local on Go's stack, where Go
+// keeps that address, as every pointer in its own variables, right as the
+// stack moves (issue #62). "" for any other place.
+inline string CodeGenGo::TransientAddr(const GoLoc &l) {
+    if (!l.taddr.empty()) return l.taddr;
+    if (!l.golocal || l.lv.empty() || !l.addr.empty() || !l.ptr.empty() || l.unal) return "";
+    return cat("unsafe.Pointer(&", TMARK, l.lv, ")");
+}
+
 inline string CodeGenGo::PtrOf(const GoLoc &l) {
     if (!l.ptr.empty()) return l.ptr;
     if (l.unal) Fail(l.t->line, cat("internal: a typed pointer to a ", TypeText(l.t), " that may lie unaligned"));
@@ -123,7 +135,7 @@ inline CodeGenGo::GoLoc CodeGenGo::PinLoc(const GoLoc &l) {
 
 inline string CodeGenGo::Ld(const GoLoc &l) {
     if (!l.unal) return l.lv;
-    return cat(LdStFn(l.t, false), "(", l.addr, ")");
+    return cat(LdStFn(l.t, false), "(", l.taddr.empty() ? l.addr : l.taddr, ")");
 }
 
 inline void CodeGenGo::St(const GoLoc &l, const string &x) {
@@ -131,12 +143,23 @@ inline void CodeGenGo::St(const GoLoc &l, const string &x) {
         L(l.lv, " = ", x);
         return;
     }
-    L(LdStFn(l.t, true), "(", l.addr, ", ", x, ")");
+    L(LdStFn(l.t, true), "(", l.taddr.empty() ? l.addr : l.taddr, ", ", x, ")");
 }
 
 // The helpers that read and write a value of type t at an address that may
-// be unaligned: a copy of its bytes through a variable of its Go type,
-// which Go compiles to a few loads and stores.
+// be unaligned (issue #62). A load is Go's own where the address is aligned
+// as Go aligns the type, which is where a Go []string's strings and most
+// values lie, one load of each word into a register; elsewhere it copies
+// the bytes through a variable of the type. A store writes the bytes, never
+// the type: a typed store of a Go pointer is one Go's write barrier sees,
+// which reads the slot's old bytes as a pointer, and a data stack's bytes
+// may be anything. A slice's are its two words, as integers; any other
+// value's are copied from a variable of its type. The copies are of a
+// struct of the bytes (gsBytes<n>), whose alignment is 1, as checkptr
+// requires where an address may be unaligned, and no array: Go copies an
+// array between addresses that may overlap with a call of runtime.memmove
+// where it is longer than Go moves inline (8 bytes on arm64), and moves a
+// struct inline.
 inline string CodeGenGo::LdStFn(TypeExpr *t, bool store) {
     auto &ti = TI(t, t->line);
     auto it = ldstfns.find(ti.name);
@@ -144,13 +167,32 @@ inline string CodeGenGo::LdStFn(TypeExpr *t, bool store) {
         auto m = Mangle(t);
         auto ld = Unique(cat("gsLd_", m)), st = Unique(cat("gsSt_", m));
         it = ldstfns.emplace(ti.name, pair<string, string> { ld, st }).first;
-        Append(ldstcode, "// A ", ti.name, " where it may lie unaligned, byte for byte.\nfunc ", ld,
-               "(p unsafe.Pointer) (v ", ti.name, ") {\n\t*(*[", ti.size,
-               "]byte)(unsafe.Pointer(&v)) = *(*[", ti.size, "]byte)(p)\n\treturn\n}\n\nfunc ", st,
-               "(p unsafe.Pointer, v ", ti.name, ") {\n\t*(*[", ti.size, "]byte)(p) = *(*[", ti.size,
-               "]byte)(unsafe.Pointer(&v))\n}\n\n");
+        auto raw = BytesStruct(ti.size);
+        Append(ldstcode, "// A ", ti.name, " where it may lie unaligned: Go's own load where it lies where\n"
+               "// Go aligns one, a copy of its bytes elsewhere.\nfunc ", ld, "(p unsafe.Pointer) ", ti.name,
+               " {\n\tif uintptr(p)&", ti.align - 1, " == 0 {\n\t\treturn *(*", ti.name, ")(p)\n\t}\n\tvar v ",
+               ti.name, "\n\t*(*", raw, ")(unsafe.Pointer(&v)) = *(*", raw, ")(p)\n\treturn v\n}\n\n");
+        if (ti.name == "GsSlice")
+            Append(ldstcode, "// A GsSlice stored where it may lie unaligned: its words, as integers.\nfunc ", st,
+                   "(p unsafe.Pointer, v GsSlice) {\n\t*(*uintptr)(p) = uintptr(v.Data)\n"
+                   "\t*(*int64)(unsafe.Add(p, 8)) = v.Len\n}\n\n");
+        else
+            Append(ldstcode, "// A ", ti.name, " stored where it may lie unaligned: a copy of its bytes.\nfunc ", st,
+                   "(p unsafe.Pointer, v ", ti.name, ") {\n\t*(*", raw, ")(p) = *(*", raw,
+                   ")(unsafe.Pointer(&v))\n}\n\n");
     }
     return store ? it->second.second : it->second.first;
+}
+
+// The struct of n bytes the copies of LdStFn move a value's bytes as.
+inline string CodeGenGo::BytesStruct(int64_t n) {
+    auto it = bytestypes.find(n);
+    if (it != bytestypes.end()) return it->second;
+    auto name = Unique(cat("gsBytes", n));
+    bytestypes[n] = name;
+    Append(ldstcode, "// The bytes of a value of ", n, ", which Go copies as a struct, whatever their\n"
+           "// address.\ntype ", name, " struct {\n\tb [", n, "]byte\n}\n\n");
+    return name;
 }
 
 inline void CodeGenGo::CopyElemBytes(const string &dst, const string &src, const string &n,
@@ -232,6 +274,7 @@ inline CodeGenGo::GoLoc CodeGenGo::FieldLocAt(const GoLoc &base, int fi, Line ln
         r.golocal = base.golocal;
     } else {
         r = AtAddr(AddOff(AddrOf(base), ti.offs[fi]), ft);
+        AtTransient(r, base, ti.offs[fi]);
     }
     r.viaref = base.viaref || ft->kind == TY_REF;
     // A part of a frame object lives on its stack: its tail is a header (or
@@ -259,7 +302,8 @@ inline string CodeGenGo::TagOf(const GoLoc &e, Line ln) {
     auto &ti = TI(e.t, ln);
     if (ti.rep == GR_TAG) return e.lv;
     if (TagStore(ei->en) == IS_U8) return cat(e.lv, "[0]");
-    return cat("(*(*uint16)(", AddrOf(e), "))");
+    auto ta = TransientAddr(e);
+    return cat("(*(*uint16)(", ta.empty() ? AddrOf(e) : ta, "))");
 }
 
 // The payload of variant vi, which the ADT at e holds.
@@ -270,8 +314,21 @@ inline CodeGenGo::GoLoc CodeGenGo::PayloadLoc(const GoLoc &e, int vi, Line ln) {
     auto &ti = TI(e.t, ln);
     if (ti.voffs[vi] < 0) Fail(ln, "internal: the payload of a variant without one");
     auto r = AtAddr(AddOff(AddrOf(e), ti.voffs[vi]), vt);
+    AtTransient(r, e, ti.voffs[vi]);
     r.viaref = e.viaref;
     return r;
+}
+
+// The place r, at byte off of the value at base, which a Go local of the
+// function's own holds as the bytes of its C layout (TransientAddr): read
+// and written through the local's address taken for each access alone, and
+// a Go local's own too, but for its address as a value, r.addr (issue #62).
+inline void CodeGenGo::AtTransient(GoLoc &r, const GoLoc &base, int64_t off) {
+    auto ta = TransientAddr(base);
+    if (ta.empty()) return;
+    r.taddr = AddOff(ta, off);
+    if (!r.unal) r.lv = cat("(*(*", GoT(r.t, Line {}), ")(", r.taddr, "))");
+    r.golocal = true;
 }
 
 // The elements of an array or a slice at l: where they start, how many
