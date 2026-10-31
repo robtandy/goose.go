@@ -1608,12 +1608,10 @@ inline string CodeGenGo::Source(const string &srcname) {
     };
     // What the program's Go and the --include files' use of the runtime's,
     // by the names the runtime declares them by; and of Go's packages.
-    // The packages the program's Go may name besides the runtime's: math/bits,
-    // and encoding/binary, which a wide load or store calls
-    // (codegen_go_wide.h).
+    // The package the program's Go may name besides the runtime's: math/bits,
+    // which std's popcount, clz and ctz call (codegen_go_export.h).
     auto known = rt.imports;
     known["bits"] = "math/bits";
-    known["binary"] = "encoding/binary";
     GoUses uses;
     GoScanUses(program(false), known, uses);
     auto proguses = uses;

@@ -290,7 +290,7 @@ EXAMPLE_GUIDE = REPO / "docs" / "go-integration.md"
 # which the line before it names: lines of the file as they are.
 EXAMPLE_EXCERPT = re.compile(r"^<!-- example: (\S+) -->\n```\w*\n(.*?)^```$", re.M | re.S)
 EXAMPLE_GENERATED = "records_goose.go"
-EXAMPLE_LOADS = {"binary.LittleEndian.Uint32(": 1, "binary.LittleEndian.Uint64(": 1}
+EXAMPLE_LOADS = {"gsLe32((*[4]byte)(": 1, "gsLe64((*[8]byte)(": 1}
 EXAMPLE_ABSENT = ["gsLibStart", "StackBlock", "gsEscape", "KeepAlive", '"sync"', '"syscall"']
 EXAMPLE_ENTRIES = {"CountRecords", "CountRecordsString", "CountRecordsBytes"}
 # The example's mutants, the guide's mutation checks, which its tests must
@@ -306,8 +306,8 @@ EXAMPLE_MUTANTS = [
      "r.(*gsError)", "r.(interface{ RuntimeError() })", "^TestCount$", None),
     # Right, and reading 4 bytes past the span: only the guard page sees it.
     ("a 4-byte load reading 8", EXAMPLE_GENERATED,
-     r"binary\.LittleEndian\.Uint32\(\(\*\[4\]byte\)\(([^()]+)\)\[:\]\)",
-     r"uint32(binary.LittleEndian.Uint64((*[8]byte)(\1)[:]))", "^TestKernelGuardPage$",
+     r"gsLe32\(\(\*\[4\]byte\)\(([^()]+)\)\)",
+     r"uint32(gsLe64((*[8]byte)(\1)))", "^TestKernelGuardPage$",
      "^(TestKernelTable|TestKernelRandom|FuzzCountRecords|TestCount)$"),
 ]
 # A top-level declaration of Go source as gofmt lays it out: a method's

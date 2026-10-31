@@ -12,11 +12,15 @@
 // where every byte's address is a constant away from one base it knows is no
 // nil pointer, and a byte read through the slice's own pointer, at offset 0,
 // is a nil check that keeps the rest apart; nor does it see through a loop.
-// So the backend writes them as encoding/binary does, the bytes viewed as an
-// array, `binary.LittleEndian.Uint64((*[8]byte)(p)[:])`, which Go compiles to
-// one load (and a byte swap for the other order) on every target that has
-// unaligned ones, and to the bytes elsewhere: the value is the same on every
-// target, its byte order included.
+// So the backend writes each as one call of the runtime's, the bytes viewed
+// as an array, `GsLe64((*[8]byte)(p))` (goose_bytes.go): on every target where
+// Go makes one load of an integer's bytes at any address (amd64, arm64, 386,
+// ppc64le, s390x), the load itself, `*(*uint64)(p)`, and a byte swap for the
+// other order, and encoding/binary's bytes elsewhere: the value is the same
+// on every target, its byte order included. The call costs Go's inliner 3 to
+// 14, so that Go inlines it even into a function of 5000 nodes or more, into
+// which it inlines nothing costing more than 20: encoding/binary's
+// `binary.LittleEndian.Uint64`, which these were, is a call there (issue #62).
 //
 // Only where every byte's bounds check is gone already -- BCE proved it
 // (Index::nobc), or the index is a constant within a fixed array -- so that
@@ -206,21 +210,21 @@ inline bool CodeGenGo::WideLeaf(Node *n, TypeExpr *ot, WideByte &w) {
     return true;
 }
 
-// The n bytes from element `at` of the u8 view v, as the []byte encoding/binary
-// takes: a Go local's own array sliced, which takes no address of it
-// (GoLoc::golocal), anything else viewed at its address as a [n]byte, which
-// Go converts with no check but for nil (unsafe.Slice would check that the
-// address does not overflow too).
+// The n bytes from element `at` of the u8 view v, as the *[n]byte the
+// runtime's wide loads and stores take (GsLe64): a Go local's own array
+// sliced and converted, which takes no address of it (GoLoc::golocal),
+// anything else viewed at its address, which Go converts with no check
+// (unsafe.Slice would check that the address does not overflow).
 inline string CodeGenGo::WideBytes(const GoView &v, const string &at, int64_t n) {
     int64_t k;
     bool uns;
     auto isconst = GoConstInt(at, k, uns) && !uns;
     if (v.local) {
-        if (isconst) return cat(v.arr, "[", k, ":", k + n, "]");
-        return cat(v.arr, "[", at, ":", at, "+", n, "]");
+        if (isconst) return cat("(*[", n, "]byte)(", v.arr, "[", k, ":", k + n, "])");
+        return cat("(*[", n, "]byte)(", v.arr, "[", at, ":", at, "+", n, "])");
     }
     auto p = isconst ? AddOff(v.data, k) : cat("unsafe.Add(", v.data, ", ", at, ")");
-    return cat("(*[", n, "]byte)(", p, ")[:]");
+    return cat("(*[", n, "]byte)(", p, ")");
 }
 
 // The index `idx`, an int64 IndexValue gave, moved by a constant.
@@ -232,7 +236,9 @@ static string WideAt(const string &idx, int64_t delta) {
     return cat("(", idx, delta > 0 ? " + " : " - ", delta > 0 ? delta : -delta, ")");
 }
 
-static const char *WideOrder(bool le) { return le ? "LittleEndian" : "BigEndian"; }
+// The runtime's load of n bytes in an order, GsLe64, and its store, GsPutLe64.
+static string WideLoadFn(bool le, int64_t n) { return cat(le ? "GsLe" : "GsBe", 8 * n); }
+static string WideStoreFn(bool le, int64_t n) { return cat(le ? "GsPutLe" : "GsPutBe", 8 * n); }
 
 // An OR of 2, 4 or 8 bytes of one array at consecutive indices, each shifted
 // to its place in a little- or a big-endian order (WideLeaf), as one load:
@@ -289,7 +295,7 @@ inline string CodeGenGo::GenWideLoad(Binary *b) {
     while (l.t->kind == TY_REF) DerefLoc(l);
     auto v = ArrayView(l, first.ix->line);
     auto at = WideAt(IndexValue(first.ix->idx), k0 - first.off);
-    auto x = cat("binary.", WideOrder(le), ".Uint", 8 * n, "(", WideBytes(v, at, n), ")");
+    auto x = cat(WideLoadFn(le, n), "(", WideBytes(v, at, n), ")");
     auto ut = ast.inttypes[n == 2 ? IS_U16 : n == 4 ? IS_U32 : IS_U64];
     return Coerce(Coerce(x, ut, ot, b->line), ot, b->exprtype, b->line);
 }
@@ -424,7 +430,7 @@ inline bool CodeGenGo::GenWideStoreLoop(ForLoop *f) {
     vnames.erase(f->vdef);
     auto ut = ast.inttypes[n == 2 ? IS_U16 : n == 4 ? IS_U32 : IS_U64];
     auto x = Coerce(GenX(v), v->exprtype, ut, a->line);
-    L("binary.", WideOrder(le), ".PutUint", 8 * n, "(", WideBytes(view, at, n), ", ", x, ")");
+    L(WideStoreFn(le, n), "(", WideBytes(view, at, n), ", ", x, ")");
     return true;
 }
 
@@ -487,7 +493,7 @@ inline size_t CodeGenGo::GenWideStoreRun(const vector<Node *> &stmts, size_t i) 
         auto at = WideAt(IndexValue(w[0].ix->idx), k0 - w[0].off);
         auto ut = ast.inttypes[n == 2 ? IS_U16 : n == 4 ? IS_U32 : IS_U64];
         auto x = Coerce(GenX(v0), v0->exprtype, ut, first->line);
-        L("binary.", WideOrder(le), ".PutUint", 8 * n, "(", WideBytes(view, at, n), ", ", x, ")");
+        L(WideStoreFn(le, n), "(", WideBytes(view, at, n), ", ", x, ")");
         PopSc();
         return (size_t)n;
     }

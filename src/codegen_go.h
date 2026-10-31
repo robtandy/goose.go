@@ -538,7 +538,8 @@ struct CodeGenGo {
     // ------------------------------------------------------------------
     // Wide loads and stores (codegen_go_wide.h): an integer assembled from
     // the bytes of consecutive elements of a u8 array or slice, or taken
-    // apart into them, as one load or one store, through encoding/binary.
+    // apart into them, as one load or one store, through the runtime's
+    // GsLe64 and its kin, which Go inlines into any function.
 
     // A byte of one: its element, the constant its index adds to the rest
     // of it, and how far left the byte goes in the integer.
