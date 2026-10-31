@@ -410,7 +410,8 @@ static void GoLineUses(string_view s, unordered_map<string, int> &uses) {
 }
 
 // The identifiers whose address a line takes (`&x`, `&x.f`, `&x[i]`),
-// outside its string literals, into addressed.
+// outside its string literals, into addressed: not where a load or a store
+// takes it for itself alone, `&` marked (CodeGenGo::TMARK, TransientAddr).
 static void GoLineAddressed(string_view s, unordered_set<string> &addressed) {
     auto isid = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
     for (size_t p = 0; p < s.size(); p++) {
@@ -431,13 +432,15 @@ static void GoLineAddressed(string_view s, unordered_set<string> &addressed) {
 // A line's code with each identifier `ren` maps renamed, outside its string
 // literals and comments, but for a field selector's: the first of the pair
 // where it is used, the second where `&` takes its address (and nothing
-// selects a part of it after).
+// selects a part of it after), marked or not (TMARK).
 static string GoRename(string_view s, const unordered_map<string, pair<string, string>> &ren) {
     auto isid = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
     string out;
     out.reserve(s.size() + 16);
     for (size_t p = 0; p < s.size();) {
         auto c = s[p];
+        // The identifier `&` (or `&` and its mark) takes the address of.
+        auto at = p + 1 < s.size() && s[p + 1] == CodeGenGo::TMARK[0] ? p + 2 : p + 1;
         if (c == '"' || c == '\'') {
             auto b = p;
             for (p++; p < s.size() && s[p] != c; p++)
@@ -447,9 +450,9 @@ static string GoRename(string_view s, const unordered_map<string, pair<string, s
         } else if (c == '/' && p + 1 < s.size() && s[p + 1] == '/') {
             out.append(s.substr(p));
             break;
-        } else if (c == '&' && p + 1 < s.size() && (isalpha((unsigned char)s[p + 1]) || s[p + 1] == '_') &&
+        } else if (c == '&' && at < s.size() && (isalpha((unsigned char)s[at]) || s[at] == '_') &&
                    (p == 0 || s[p - 1] != '&')) {
-            auto b = p + 1, e = b;
+            auto b = at, e = b;
             while (e < s.size() && isid(s[e])) e++;
             auto it = ren.find(string(s.substr(b, e - b)));
             if (it == ren.end()) {
@@ -661,6 +664,8 @@ inline string CodeGenGo::FinishBody(const string &b, bool frames, const vector<s
             p = e + 1;
         }
     }
+    // The marks of the addresses a load or a store takes for itself alone.
+    out.erase(std::remove(out.begin(), out.end(), TMARK[0]), out.end());
     return out;
 }
 
@@ -1866,7 +1871,10 @@ inline string CodeGenGo::Source(const string &srcname) {
     for (auto &[from, to] : prename)
         if (rt.toplevel.count(to) || GoRuntimeName(to))
             Fail(Line {}, cat("internal: the program's ", from, " renamed to the runtime's ", to));
-    // The renames, then gofmt's layout of the program's Go.
+    // The renames, then gofmt's layout of the program's Go. No mark of an
+    // address a load or a store takes for itself alone is left in it
+    // (TMARK): FinishBody drops each.
+    if (prog.find(TMARK[0]) != string::npos) Fail(Line {}, "internal: a marked address outside a function's body");
     prog = GoFormat(GoRenameIdents(prog, rtcode, prename, imp ? unordered_map<string, string> {} : rtwords));
     if (imp) {
         // A name the program's Go uses that the runtime keeps to itself is

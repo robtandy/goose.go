@@ -366,16 +366,24 @@ struct CodeGenGo {
         bool ispref = false;    // lv is a GsPref: a pool reference variable.
         // lv is a Go local variable or parameter of the function's own, or a
         // part of one that no pointer leads to (a field of a native struct,
-        // an element of an array): the same storage wherever lv is
-        // evaluated, its indices being snapshots (IndexValue). An element of
-        // a fixed array there is indexed as Go indexes it (ElemAt), so that
-        // the variable stays a Go value, where its address would move it
-        // into the function's frame (FinishBody, DESIGN.md §3.6).
+        // an element of an array, a field of a struct held as bytes at its
+        // offset, taddr): the same storage wherever lv is evaluated, its
+        // indices being snapshots (IndexValue). An element of a fixed array
+        // there is indexed as Go indexes it (ElemAt), so that the variable
+        // stays a Go value, where its address would move it into the
+        // function's frame (FinishBody, DESIGN.md §3.6).
         bool golocal = false;
         // A root owner variable, local or global, named directly: its
         // fields are its components' own places (FieldLocAt), where one
         // reached through a reference is its descriptor's.
         const VarDef *rootowner = nullptr;
+        // A part of a Go local's own value held as the bytes of its C layout
+        // (a field of a struct, an ADT's payload: golocal, issue #62): the
+        // address its loads and stores take, the local's for that access
+        // alone (TransientAddr), which lv and Ld and St reach it through,
+        // so that the local stays a Go local on Go's stack. Its address as
+        // a value is addr, which moves the local into the frame.
+        string taddr;
     };
     // An array's or a slice's elements.
     struct GoView {
@@ -398,6 +406,8 @@ struct CodeGenGo {
     static GoLoc AtVar(const string &x, TypeExpr *t);
     GoLoc AtLocal(const string &x, TypeExpr *t);
     static string AddrOf(const GoLoc &l);
+    static string TransientAddr(const GoLoc &l);
+    void AtTransient(GoLoc &r, const GoLoc &base, int64_t off);
     string PtrOf(const GoLoc &l);
     string RefOfLoc(const GoLoc &l);
     // The pointee of the plain reference value x of type rt, in whatever
@@ -1070,6 +1080,11 @@ struct CodeGenGo {
     // the specialization's number, which ResolveGsArgs replaces.
     static constexpr const char *GSARG = "\x05";
     static constexpr const char *GSPARAM = "\x06";
+    // The marker after the `&` of an address a load or a store takes of a
+    // Go local of the function's own for itself alone (TransientAddr,
+    // issue #62): an address no value holds, which FinishBody takes for no
+    // use of the local's address, and drops.
+    static constexpr const char *TMARK = "\x07";
     unordered_map<FnSpec *, int> specnum;
     vector<FnSpec *> numspec;
     unordered_map<FnSpec *, set<FnSpec *>> phcalls;

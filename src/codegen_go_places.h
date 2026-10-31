@@ -74,6 +74,18 @@ inline string CodeGenGo::AddrOf(const GoLoc &l) {
     return cat("unsafe.Pointer(&", l.lv, ")");
 }
 
+// The address a load or a store of the place l takes for itself alone,
+// where l is a Go local's own (GoLoc::golocal): `&` marked (TMARK), which
+// FinishBody counts as no use of the local's address, since none outlives
+// the access, so that the local stays a Go local on Go's stack, where Go
+// keeps that address, as every pointer in its own variables, right as the
+// stack moves (issue #62). "" for any other place.
+inline string CodeGenGo::TransientAddr(const GoLoc &l) {
+    if (!l.taddr.empty()) return l.taddr;
+    if (!l.golocal || l.lv.empty() || !l.addr.empty() || !l.ptr.empty() || l.unal) return "";
+    return cat("unsafe.Pointer(&", TMARK, l.lv, ")");
+}
+
 inline string CodeGenGo::PtrOf(const GoLoc &l) {
     if (!l.ptr.empty()) return l.ptr;
     if (l.unal) Fail(l.t->line, cat("internal: a typed pointer to a ", TypeText(l.t), " that may lie unaligned"));
@@ -123,7 +135,7 @@ inline CodeGenGo::GoLoc CodeGenGo::PinLoc(const GoLoc &l) {
 
 inline string CodeGenGo::Ld(const GoLoc &l) {
     if (!l.unal) return l.lv;
-    return cat(LdStFn(l.t, false), "(", l.addr, ")");
+    return cat(LdStFn(l.t, false), "(", l.taddr.empty() ? l.addr : l.taddr, ")");
 }
 
 inline void CodeGenGo::St(const GoLoc &l, const string &x) {
@@ -131,7 +143,7 @@ inline void CodeGenGo::St(const GoLoc &l, const string &x) {
         L(l.lv, " = ", x);
         return;
     }
-    L(LdStFn(l.t, true), "(", l.addr, ", ", x, ")");
+    L(LdStFn(l.t, true), "(", l.taddr.empty() ? l.addr : l.taddr, ", ", x, ")");
 }
 
 // The helpers that read and write a value of type t at an address that may
@@ -262,6 +274,7 @@ inline CodeGenGo::GoLoc CodeGenGo::FieldLocAt(const GoLoc &base, int fi, Line ln
         r.golocal = base.golocal;
     } else {
         r = AtAddr(AddOff(AddrOf(base), ti.offs[fi]), ft);
+        AtTransient(r, base, ti.offs[fi]);
     }
     r.viaref = base.viaref || ft->kind == TY_REF;
     // A part of a frame object lives on its stack: its tail is a header (or
@@ -289,7 +302,8 @@ inline string CodeGenGo::TagOf(const GoLoc &e, Line ln) {
     auto &ti = TI(e.t, ln);
     if (ti.rep == GR_TAG) return e.lv;
     if (TagStore(ei->en) == IS_U8) return cat(e.lv, "[0]");
-    return cat("(*(*uint16)(", AddrOf(e), "))");
+    auto ta = TransientAddr(e);
+    return cat("(*(*uint16)(", ta.empty() ? AddrOf(e) : ta, "))");
 }
 
 // The payload of variant vi, which the ADT at e holds.
@@ -300,8 +314,21 @@ inline CodeGenGo::GoLoc CodeGenGo::PayloadLoc(const GoLoc &e, int vi, Line ln) {
     auto &ti = TI(e.t, ln);
     if (ti.voffs[vi] < 0) Fail(ln, "internal: the payload of a variant without one");
     auto r = AtAddr(AddOff(AddrOf(e), ti.voffs[vi]), vt);
+    AtTransient(r, e, ti.voffs[vi]);
     r.viaref = e.viaref;
     return r;
+}
+
+// The place r, at byte off of the value at base, which a Go local of the
+// function's own holds as the bytes of its C layout (TransientAddr): read
+// and written through the local's address taken for each access alone, and
+// a Go local's own too, but for its address as a value, r.addr (issue #62).
+inline void CodeGenGo::AtTransient(GoLoc &r, const GoLoc &base, int64_t off) {
+    auto ta = TransientAddr(base);
+    if (ta.empty()) return;
+    r.taddr = AddOff(ta, off);
+    if (!r.unal) r.lv = cat("(*(*", GoT(r.t, Line {}), ")(", r.taddr, "))");
+    r.golocal = true;
 }
 
 // The elements of an array or a slice at l: where they start, how many
