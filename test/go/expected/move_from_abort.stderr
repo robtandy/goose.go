@@ -1,0 +1,1 @@
+goose runtime error: move_from lengths differ (test/go/programs/move_from_abort.goose:8)

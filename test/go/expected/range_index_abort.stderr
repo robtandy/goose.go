@@ -1,0 +1,1 @@
+goose runtime error: slice not within this array (test/go/programs/range_index_abort.goose:5)
