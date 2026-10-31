@@ -39,6 +39,11 @@ inline void CodeGenGo::CollectSpecs() {
         auto base = Sanitize(sp->sf->ns, sp->sf->name);
         if (namecount[sp->sf->qname] > 1) Append(base, "_", sp->id);
         si.name = Unique(base);
+        // A standard library function reports its failures where the
+        // program called it (AtCaller): but for an export's, whose Go
+        // signature is its host's, and main, which has no caller.
+        si.located = ast.StdlibFile(sp->sf->line.fileidx) && !sp->sf->isexport &&
+                     sp->sf != ast.MainFunction();
     }
     unordered_map<FnSpec *, vector<pair<FnSpec *, const Call *>>> callees;
     auto typed = [](TypeExpr *t) {
@@ -163,6 +168,8 @@ inline void CodeGenGo::CollectSpecs() {
 inline bool CodeGenGo::HoldsFatRef(TypeExpr *t) {
     set<const void *> open;
     function<bool(TypeExpr *)> rec = [&](TypeExpr *x) -> bool {
+        // A root owner's descriptor reaches the stacks of all its components.
+        if (IsRoot(x)) return true;
         switch (x->kind) {
             case TY_REF: return IsFatRef(x) || rec(x->ref->sub);
             case TY_SLICE: return rec(x->sub);
@@ -287,15 +294,18 @@ inline string CodeGenGo::Signature(FnSpec *sp) {
         // A result holding relative references is built where it is
         // received, so that a link from it to the receiver's storage is
         // measured from there (C's result location, NeedsResultLocation):
-        // a Go result is a copy.
-        if (rt->kind != TY_REF && IsFix(rt) && HasRelRef(rt))
-            Unsupported(sp->sf->line, cat("a function result holding relative references (",
-                                          TypeText(rt), ")"));
+        // its caller hands the place's address.
+        if (NeedsResultLocation(rt)) {
+            GoT(rt, sp->sf->line);
+            add(cat("gs_r", i, " unsafe.Pointer"));
+            continue;
+        }
         Append(rets, nrets++ ? ", " : "", ParamT(rt, sp->sf->line));
         curzeros.push_back(ZeroOf(rt, sp->sf->line));
         curgorets.push_back(ParamT(rt, sp->sf->line));
     }
     if (nrets > 1) rets = cat("(", rets, ")");
+    if (si.located) add("gs_at *GsLoc");
     return cat("func ", emiter ? ernames[sp] : si.name, "(", params, ")", rets.empty() ? "" : " ", rets);
 }
 
@@ -493,6 +503,22 @@ inline string CodeGenGo::FinishBody(const string &b, bool frames, const vector<s
         pos = nl + 1;
     }
     auto trimmed = [](string_view line) { return line.substr(std::min(line.size(), line.find_first_not_of('\t'))); };
+    // A root owner's descriptor that no other line names is never read: its
+    // lines go (ROOTMARK, BindLocal), and the addresses of the components
+    // they take with them, which leaves those locals Go's own.
+    if (b.find(ROOTMARK[0]) != string::npos) {
+        unordered_map<string, int> named;
+        for (auto line : lines)
+            if (line.find(ROOTMARK[0]) == string_view::npos)
+                GoLineUses(line.substr(0, line.find(DECLMARK[0])), named);
+        vector<string_view> kept;
+        for (auto line : lines) {
+            auto m = line.find(ROOTMARK[0]);
+            if (m == string_view::npos) kept.push_back(line);
+            else if (named[string(line.substr(m + 1))]) kept.push_back(line.substr(0, m));
+        }
+        lines = std::move(kept);
+    }
     for (auto line : lines) {
         if (trimmed(line) == FRAMEEND) continue;
         GoLineUses(line.substr(0, line.find(DECLMARK[0])), uses);
@@ -663,6 +689,15 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
         EnsureFromChannels(sp);
         auto tid = fromids[sp];
         for (size_t i = 0; i < sp->rets.size(); i++) {
+            // A result built where it is received names its receiver.
+            if (NeedsResultLocation(sp->rets[i])) {
+                auto sav = T();
+                auto lret = GlName(cat("gsLret_", tid, "_", i));
+                Decl(sav, "unsafe.Pointer", lret);
+                L(lret, " = gs_r", i);
+                fdstsaves.push_back(cat(lret, " = ", sav));
+                continue;
+            }
             if (!IsBytesT(sp->rets[i])) continue;
             auto sav = T();
             auto fdst = GlName(cat("gsFdst_", tid, "_", i));
@@ -702,8 +737,25 @@ inline void CodeGenGo::EmitSpec(FnSpec *sp, bool er) {
     auto framed = false;
     auto fb = FinishBody(body, true, curgorets, &framed);
     if (framed) hasframe.insert(sp);
+    // A located function's checks report its caller's place, read once.
+    if (curinfo->located && fb.find("gs_atf") != string::npos)
+        fb = cat("\tgs_atf, gs_atl := gs_at.File, gs_at.Line\n", fb);
     if (UsesGl(fb)) glusers.insert(sp);
     if (fb.find("gsGStk_") != string::npos) gstkusers.insert(sp);
+    // So does one naming a root global whose components are on stacks of
+    // their own, whose descriptor a call it makes may reach them through.
+    if (!gstkusers.count(sp)) {
+        auto reach = false;
+        function<void(Node *)> walk = [&](Node *n) {
+            if (!n || reach) return;
+            if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->isglobal && id->vdef->type &&
+                                        IsRoot(id->vdef->type) && NeedsStack(id->vdef->type))
+                reach = true;
+            RunChildren(n, walk);
+        };
+        walk(sp->body);
+        if (reach) gstkusers.insert(sp);
+    }
     Append(code, "// ", sp->sf->qname, ", line ", sp->sf->line.line, er ? ", its element-run twin" : "", "\n",
            sig, " {\n", fb, "}\n\n");
     curspec = nullptr;
@@ -770,14 +822,23 @@ inline void CodeGenGo::FindUsedGlobals() {
     unordered_map<const VarDef *, pair<VarDecl *, size_t>> declof;
     for (auto g : ast.globals)
         for (size_t i = 0; i < g->defs.size(); i++) declof[g->defs[i]] = { g, i };
+    set<TypeExpr *> namedtypes;
     function<void(Node *)> mark = [&](Node *n) {
         if (!n) return;
-        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->isglobal &&
-                                    usedglobals.insert(id->vdef).second) {
-            auto it = declof.find(id->vdef);
+        auto use = [&](VarDef *v) {
+            if (!usedglobals.insert(v).second) return;
+            auto it = declof.find(v);
             if (it != declof.end() && it->second.second < it->second.first->inits.size())
                 mark(it->second.first->inits[it->second.second]);
-        }
+        };
+        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->isglobal) use(id->vdef);
+        // The arrays the types it names name too: an index type's, a pool a
+        // relative reference measures from, a root owner's component's,
+        // which is there with its owner.
+        NodeNamedArrays(n, namedtypes, [&](VarDef *a, bool) {
+            if (!a || !a->isglobal) return;
+            use(a->componentowner ? a->componentowner : a);
+        });
         RunChildren(n, mark);
     };
     for (auto sp : livespecs) mark(sp->body);
@@ -789,12 +850,18 @@ inline void CodeGenGo::FindUsedGlobals() {
         // (--stacks).
         for (auto d : g->defs) pure = pure && (!IsLargeFixed(d->type) || cstatic.count(d));
         // So does a value on a stack of its own, which C reserves for every
-        // such global.
-        for (auto d : g->defs) pure = pure && !IsBytesT(d->type);
+        // such global, a root owner's component included.
+        for (auto d : g->defs) pure = pure && !IsBytesT(d->type) && !(IsRoot(d->type) && NeedsStack(d->type));
         if (pure) continue;
         for (auto d : g->defs) usedglobals.insert(d);
         for (auto i : g->inits) mark(i);
     }
+    // A root owner's components are there wherever it is.
+    for (auto g : ast.globals)
+        for (auto d : g->defs)
+            if (usedglobals.count(d) && d->type && IsRoot(d->type))
+                for (auto c : d->components)
+                    if (c) usedglobals.insert(c);
 }
 
 inline void CodeGenGo::EmitGlobalDecls() {
@@ -822,11 +889,36 @@ inline void CodeGenGo::EmitGlobalDecls() {
         Append(gdecls, "var ", name, " ", gt, "\n");
         return name;
     };
+    // A global's place, or a root owner's component's, which is a global of
+    // its own: a value on a data stack is its header (or base) and a
+    // dedicated stack, which follows the main program's in its block
+    // (gsInitGlobals sets it up).
+    auto onstack = [&](VarDef *d, const string &name, Line ln) {
+        GoT(d->type, ln);
+        auto stk = Unique(cat("gsGStk_", name));
+        gnames[d] = var(d, name, IsResz(d->type) ? RzGoT(d->type, ln) : "unsafe.Pointer");
+        gstks[d] = workers ? var(d, stk, "int64") : stk;
+    };
     for (auto g : ast.globals) {
         for (size_t di = 0; di < g->defs.size(); di++) {
             auto d = g->defs[di];
             if (!usedglobals.count(d)) continue;
             auto name = Unique(Sanitize(g->ns, d->name));
+            if (IsRoot(d->type)) {
+                // A root owner (CodeGen::EmitGlobalDecls): its descriptor,
+                // and each component a global of its own, owner_field.
+                gnames[d] = var(d, name, GoT(d->type, g->line));
+                for (auto c : d->components) {
+                    if (!c) continue;
+                    string cname(c->name);
+                    for (auto &ch : cname)
+                        if (ch == '.') ch = '_';
+                    auto cn = Unique(Sanitize(g->ns, cname));
+                    if (IsBytesT(c->type)) onstack(c, cn, g->line);
+                    else gnames[c] = var(c, cn, GoT(c->type, g->line));
+                }
+                continue;
+            }
             if (IsBytesT(d->type)) {
                 // A header (or base) and a dedicated stack, which follows the
                 // main program's in its block (gsInitGlobals sets it up).
@@ -876,26 +968,7 @@ inline void CodeGenGo::EmitGlobalInit() {
             auto d = g->defs[i];
             // Initialized at its declaration, or not there at all.
             if (gstatic.count(d) || !usedglobals.count(d)) continue;
-            auto init = g->inits[i];
-            if (IsBytesT(d->type)) {
-                InitGlobalStack(d);
-                GenConstruct(init, gstks[d], d->type, IsResz(d->type) ? RzLenLv(d->type, gnames[d]) : "");
-                continue;
-            }
-            if (PrefVar(d)) {
-                L(gnames[d], " = ", GenPrefVal(init));
-                continue;
-            }
-            if (IsLargeFixed(d->type) && (Is<ArrayLit>(init) || Is<StructLit>(init) || Is<StrLit>(init))) {
-                // Built where it stays. Where the C backend's initializer
-                // builds it, it takes a data stack for the value first.
-                if (!cstatic.count(d)) AllocStk();
-                auto dst = AtVar(gnames[d], d->type);
-                if (auto sl = Is<StrLit>(init)) StrLitInto(sl, dst);
-                else LitInto(init, dst, true);
-                continue;
-            }
-            GenAny(init, GoDst { GD_LVALUE, gnames[d], d->type });
+            InitGlobalValue(d, g->inits[i]);
         }
         // An initializer that never completes (a `loop {}`) leaves the ones
         // after it unreached, for Go as for the program.
@@ -911,6 +984,46 @@ inline void CodeGenGo::EmitGlobalInit() {
     Append(code, "// The globals' initializers, in declaration order (§11.1).\n"
                  "func gsInitGlobals(gs *GsStackBlock) {\n\t_ = gs\n", fb, "}\n\n");
     initlen = code.size() - initat;
+}
+
+// A global's value, from its initializer (CodeGen::InitGlobalValue): a root
+// owner's components each as a global of its own, in declaration order, and
+// its descriptor the references to them.
+inline void CodeGenGo::InitGlobalValue(VarDef *d, Node *init) {
+    if (IsRoot(d->type)) {
+        auto sl = Is<StructLit>(init);
+        if (!sl || !sl->sinst || !sl->sinst->st->isroot)
+            Fail(d->line, cat("internal: the root owner ", d->name, " is not built by its literal"));
+        auto si = SI(d->type);
+        for (auto c : d->components) {
+            if (!c) continue;
+            auto i = c->componentfield;
+            InitGlobalValue(c, sl->InitFor(i));
+            auto cl = VarLoc(c, init->line);
+            auto ref = c->type->kind == TY_REF ? RefOfLoc(cl) : RefValOf(cl, init->line);
+            L(gnames[d], ".", Sanitize(si->st->fields[i].name), " = ", ref);
+        }
+        return;
+    }
+    if (IsBytesT(d->type)) {
+        InitGlobalStack(d);
+        GenConstruct(init, gstks[d], d->type, IsResz(d->type) ? RzLenLv(d->type, gnames[d]) : "");
+        return;
+    }
+    if (PrefVar(d)) {
+        L(gnames[d], " = ", GenPrefVal(init));
+        return;
+    }
+    if (IsLargeFixed(d->type) && (Is<ArrayLit>(init) || Is<StructLit>(init) || Is<StrLit>(init))) {
+        // Built where it stays. Where the C backend's initializer builds it,
+        // it takes a data stack for the value first.
+        if (!cstatic.count(d)) AllocStk();
+        auto dst = AtVar(gnames[d], d->type);
+        if (auto sl = Is<StrLit>(init)) StrLitInto(sl, dst);
+        else LitInto(init, dst, true);
+        return;
+    }
+    GenAny(init, GoDst { GD_LVALUE, gnames[d], d->type });
 }
 
 // A global's dedicated stack, and its pool's freelist's, set up where its
@@ -1486,7 +1599,10 @@ inline string CodeGenGo::Source(const string &srcname) {
                               "var gsProg = GsProgram{StackReserve: gsStackReserve, StackGap: gsStackGap, FrameReserve: "
                               "gsFrameReserve}\n\n");
     auto program = [&](bool withprog) {
-        return cat("// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n", withprog ? progdecl(opts.library) : "",
+        return cat("// ---- program ----\n\n", filedecls, filedecls.empty() ? "" : "\n",
+                   locdecls.empty() ? "" : "// The places the standard library's functions report failures at: where the\n"
+                                            "// program called them.\n",
+                   locdecls, locdecls.empty() ? "" : "\n", withprog ? progdecl(opts.library) : "",
                    tdecls, inst, gdecls, gdecls.empty() ? "" : "\n", rfdecls, rfdecls.empty() ? "" : "\n", code,
                    xcode.empty() ? "" : "// ---- export fns' entry points ----\n\n", xcode, eqcode, bcode, ldstcode);
     };

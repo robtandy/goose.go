@@ -757,6 +757,53 @@ inline string CodeGenGo::GenArrayBuiltin(Call *c) {
     // (codegen_go_rz.h).
     auto recv = an[0]->exprtype;
     while (recv && recv->kind == TY_REF) recv = recv->ref->sub;
+    if (c->builtin == B_RANGE_INDEX) {
+        // The index of the slice's first element in the array (CodeGen's):
+        // 0 for an empty one, which may come from anywhere. One the checker
+        // did not prove the array's own (Call::poolcheck) must start a whole
+        // number of elements into it and end inside its length, or abort,
+        // with GS_E_ARRAYSLICE or the message given; and where elements have
+        // no bytes, every slice starts at 0 and must fit the length.
+        auto l = recv && IsResz(recv) ? RzRecvLoc(an[0]) : RecvLoc(an[0]);
+        auto v = ArrayView(l, ln);
+        auto st = ast.SliceOf(v.elem, ln);
+        auto sv = Snapshot(st, CoerceVal(GenX(an[1]), an[1]->exprtype, st, ln));
+        // Elements of no bytes in C's layout are each at 0 (FixedSize), what
+        // the Go array of them spaces out.
+        auto esz = FixedSize(v.elem) ? v.esize : 0;
+        auto fail = FailCall("GsEArraySlice", an.size() > 2 ? an[2] : nullptr, ln);
+        auto len = v.fixed >= 0 ? cat(v.fixed) : v.len;
+        auto i = T();
+        Decl(i, "int64", "0");
+        if (!esz) {
+            L("if uint64(", sv, ".Len) > uint64(", len, ") {");
+            ind++;
+            L(fail);
+            ind--;
+            LS("}");
+        } else if (!c->poolcheck) {
+            L("if ", sv, ".Len != 0 {");
+            ind++;
+            L(i, " = int64(uintptr(", sv, ".Data)-uintptr(", v.data, ")) / ", esz);
+            ind--;
+            LS("}");
+        } else {
+            L("if ", sv, ".Len != 0 {");
+            ind++;
+            auto off = T();
+            Decl(off, "uint64", cat("uint64(uintptr(", sv, ".Data) - uintptr(", v.data, "))"));
+            L("if ", off, "%", esz, " != 0 || ", off, "/", esz, " >= uint64(", len, ") || uint64(", sv, ".Len) > uint64(",
+              len, ")-", off, "/", esz, " {");
+            ind++;
+            L(fail);
+            ind--;
+            LS("}");
+            L(i, " = int64(", off, " / ", esz, ")");
+            ind--;
+            LS("}");
+        }
+        return i;
+    }
     if (recv && IsResz(recv) && c->builtin != B_LEN && c->builtin != B_CAP) return GenRzArrayBuiltin(c);
     switch ((BuiltinKind)c->builtin) {
         case B_LEN: case B_CAP: {
@@ -843,11 +890,14 @@ inline string CodeGenGo::GenArrayBuiltin(Call *c) {
             auto v = ArrayView(l, ln);
             auto nl = T();
             Decl(nl, "int64", cat(v.len, " - 1"));
-            L("if ", nl, " < 0 {");
-            ind++;
-            L("GsAbort(GsEPop, ", LocArgs(ln), ")");
-            ind--;
-            LS("}");
+            // An array BCE proved not empty here has no check (Call::nobc).
+            if (!c->nobc) {
+                L("if ", nl, " < 0 {");
+                ind++;
+                L("GsAbort(GsEPop, ", LocArgs(ln), ")");
+                ind--;
+                LS("}");
+            }
             L(v.lenlv, " = ", IntGoT(v.lenst), "(", nl, ")");
             // Read from the slot it leaves, which nothing has written over
             // yet: a relative reference's offset is measured from there.

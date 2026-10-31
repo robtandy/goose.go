@@ -447,14 +447,15 @@ inline bool CodeGenGo::NamedGoT(TypeExpr *t) {
            (t->kind == TY_ARRAY && t->arr->akind == A_LIMITED);
 }
 
-// What this version represents: every fixed-size type but an index type, a
-// varint relative reference and a reference to a value that is not
-// fixed-size, and an `in pool` reference, whose pool is a resizable.
+// What this version represents: every fixed-size type but a varint
+// relative reference and a reference to a value that is not fixed-size, and
+// an `in pool` reference, whose pool is a resizable.
 inline void CodeGenGo::CheckRepresentable(TypeExpr *t, Line ln) {
     switch (t->kind) {
         case TY_INT:
-            if (t->ix) Unsupported(ln, cat("the index type ", TypeText(t)));
-            // A varint is storage in a bytes value (§3.6).
+            // An index or bound type is its integer, checked against its
+            // array where a value converts to it (GenCast); a varint is
+            // storage in a bytes value (§3.6).
             return;
         case TY_FLT: case TY_BOOL: return;
         case TY_REF: {
@@ -505,6 +506,9 @@ inline string CodeGenGo::GoT(TypeExpr *t, Line ln) {
             if (t->ref->lenstorage == IS_VARINT) return "unsafe.Pointer";
             if (t->ref->lenstorage >= 0) return RelGoT(t);
             if (IsResz(t->ref->sub)) return "GsRref";
+            // A root owner's descriptor is a Go variable's own, a local's or
+            // a global's, which no value lies unaligned in: a typed pointer.
+            if (IsRoot(t->ref->sub)) return cat("*", GoT(t->ref->sub, ln));
             // A reference to a bytes value is its address, as one to a value
             // whose Go type holds Go pointers is (RefIsAddr).
             if (IsBytesT(t->ref->sub) || GoHasPtrs(t->ref->sub)) {
@@ -540,13 +544,14 @@ inline bool CodeGenGo::GoHasPtrs(TypeExpr *t) {
                 case A_GROW: case A_GROWSHRINK: return true;
                 default: return false;
             }
-        case TY_STRUCT: return IsFrameObj(t);
+        case TY_STRUCT: return IsFrameObj(t) || IsRoot(t);
         default: return false;
     }
 }
 
 inline bool CodeGenGo::RefIsAddr(TypeExpr *rt) {
-    if (rt->kind != TY_REF || rt->ref->lenstorage >= 0 || IsResz(rt->ref->sub)) return false;
+    if (rt->kind != TY_REF || rt->ref->lenstorage >= 0 || IsResz(rt->ref->sub) || IsRoot(rt->ref->sub))
+        return false;
     return IsBytesT(rt->ref->sub) || GoHasPtrs(rt->ref->sub);
 }
 
@@ -656,6 +661,10 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
                 BuildFrameObj(ti, decl, t, ln);
                 break;
             }
+            if (IsRoot(t)) {
+                BuildRootStruct(ti, decl, t, ln);
+                break;
+            }
             BuildStructLike(ti, decl, si->st->fields, si->ftypes, StructLayout(si),
                             EmptyLayout(si->st->fields) ? 1 : StructLayout(si).size, BitwiseEq(t), ln);
             break;
@@ -675,6 +684,9 @@ inline const CodeGenGo::GoTypeInfo &CodeGenGo::TI(TypeExpr *t, Line ln) {
         Append(tdecls, "// ", TypeText(t), ": ", FixedSize(t), " bytes",
                ti.exact ? "" : cat(" in its C layout, ", ti.size, " in this one"), ".\n", "type ",
                gt, " ", decl, "\n\n");
+    else if (IsRoot(t))
+        Append(tdecls, "// ", TypeText(t), ": a root owner's descriptor, a reference to each of its\n",
+               "// components, which lie apart.\ntype ", gt, " ", decl, "\n\n");
     else
         Append(tdecls, "// ", TypeText(t), ": a frame object, its fixed fields and its tail's header\n",
                "// (the tail's elements on a data stack).\ntype ", gt, " ", decl, "\n\n");
@@ -772,6 +784,35 @@ inline void CodeGenGo::BuildFrameObj(GoTypeInfo &ti, string &decl, TypeExpr *t, 
     }
     ti.align = maxalign;
     ti.size = (off + maxalign - 1) / maxalign * maxalign;
+    decl += "}";
+}
+
+// A root owner's descriptor (CodeGen::CT of a root struct): a reference to
+// each of its fields, which are its components' own places, each where a
+// variable of its type would be -- a resizable's GsRref, a bytes value's
+// address, a pointer to a fixed-size value -- in Go's own layout, which
+// nothing the program can observe depends on. The descriptor is no value:
+// never copied, compared or serialized, it is always a variable's own, a
+// local's or a global's, and a reference to the owner is a pointer to it.
+inline void CodeGenGo::BuildRootStruct(GoTypeInfo &ti, string &decl, TypeExpr *t, Line ln) {
+    auto si = SI(t);
+    auto &fields = si->st->fields;
+    ti.rep = GR_NATIVE;
+    ti.exact = false;
+    ti.ptrs = ti.addrs = true;
+    ti.goeq = false;
+    ti.offs.assign(fields.size(), 0);
+    decl = "struct {\n";
+    int64_t off = 0;
+    for (size_t i = 0; i < fields.size(); i++) {
+        if (fields[i].ispad || !si->ftypes[i]) continue;
+        auto &f = TI(ast.RefTo(si->ftypes[i], t->line), ln);
+        ti.offs[i] = off;
+        Append(decl, "\t", Sanitize(fields[i].name), " ", f.name, "\n");
+        off += f.size;
+    }
+    ti.align = 8;
+    ti.size = off;
     decl += "}";
 }
 

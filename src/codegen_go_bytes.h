@@ -734,7 +734,22 @@ inline void CodeGenGo::EmitVerifyWalk(string &b, TypeExpr *t, TypeExpr *elem, co
             Append(b, I, "if *(*byte)(", at, ") > 1 {\n", I, "\treturn -1\n", I, "}\n", I, q, "++\n");
             return;
         case TY_INT: {
-            if (t->ix) Unsupported(t->line, cat("serializing the index type ", TypeText(t)));
+            if (t->ix) {
+                // An index or bound type: an image's value must be one of the
+                // array as it is now, which it stays (§3.11). The verifier
+                // is the program's, which reads a global as a package
+                // variable, but in a program with instances.
+                if (instances)
+                    Unsupported(t->line, cat("serializing the index type ", TypeText(t),
+                                             " in a program whose globals are in instances"));
+                auto sz = IntSize(t->intstorage);
+                need(cat(sz));
+                auto v = cat("x", tmp++);
+                Append(b, I, "if ", v, " := *(*", IntGoT(t->intstorage), ")(", at, "); uint64(", v, ")",
+                       t->ix->upto ? " > " : " >= ", "uint64(", IndexTypeLen(t, t->line), ") {\n", I,
+                       "\treturn -1\n", I, "}\n", I, q, " += ", sz, "\n");
+                return;
+            }
             // A varint field: only its length matters to the walk.
             auto k = cat("k", tmp++);
             Append(b, I, "if _, ", k, " := GsUlebCheck(p, ", q, ", n); ", k, " == 0 {\n", I,

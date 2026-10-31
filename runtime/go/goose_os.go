@@ -264,7 +264,9 @@ func gsStdinFill() bool {
 }
 
 // GsOsReadLine appends one line of stdin, without its newline or a carriage
-// return before it: false at the end of the input.
+// return before it: false at the end of the input. A last line that ends
+// at the end of the input, with no newline, keeps a carriage return it
+// ends with, as C's gs_os_read_line does.
 func GsOsReadLine(gs *GsStackBlock, out GsRref) bool {
 	gsStdin.mu.Lock()
 	defer gsStdin.mu.Unlock()
@@ -272,11 +274,13 @@ func GsOsReadLine(gs *GsStackBlock, out GsRref) bool {
 		return false
 	}
 	start := out.Hdr.Len
+	newline := false
 	for {
 		chunk := gsStdin.buf[gsStdin.pos:gsStdin.end]
 		if i := bytes.IndexByte(chunk, '\n'); i >= 0 {
 			GsBldAppend(gs, out, chunk[:i])
 			gsStdin.pos += i + 1
+			newline = true
 			break
 		}
 		GsBldAppend(gs, out, chunk)
@@ -285,7 +289,7 @@ func GsOsReadLine(gs *GsStackBlock, out GsRref) bool {
 			break
 		}
 	}
-	if out.Hdr.Len > start && *(*byte)(unsafe.Add(out.Hdr.Base, out.Hdr.Len-1)) == '\r' {
+	if newline && out.Hdr.Len > start && *(*byte)(unsafe.Add(out.Hdr.Base, out.Hdr.Len-1)) == '\r' {
 		out.Hdr.Len--
 		gs.Stks[out.Stk] = unsafe.Add(gs.Stks[out.Stk], -1)
 	}

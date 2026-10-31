@@ -35,6 +35,9 @@ const (
 	GsERelNull
 	GsEPopN
 	GsEQBound
+	GsEArrayLen
+	GsEArraySlice
+	GsESpanTree
 )
 
 var gsErrMsgs = [...]string{
@@ -55,6 +58,9 @@ var gsErrMsgs = [...]string{
 	GsERelNull:    "non-null relative reference encodes as null",
 	GsEPopN:       "pop_n count negative or beyond the array's length",
 	GsEQBound:     "queue limit of zero or less",
+	GsEArrayLen:   "invalid array length",
+	GsEArraySlice: "slice not within this array",
+	GsESpanTree:   "slice pool span tree is corrupt",
 }
 
 // GsError is a Goose runtime error: what an abort or a failed check panics
@@ -330,6 +336,16 @@ func GsSub(p unsafe.Pointer, lo, hi, n, es int64) GsSlice {
 // failure was, Go takes to return.
 func GsIdx(i, n int64, file string, line int) int64 {
 	if uint64(i) >= uint64(n) {
+		panic(gsIdxErr(i, n, file, line))
+	}
+	return i
+}
+
+// GsUpto is i, checked to be a value of a bound type over an array of n
+// elements: n at most, compared as GsIdx compares, and failing as it fails,
+// as C's conversion to a bound type does (§3.11).
+func GsUpto(i, n int64, file string, line int) int64 {
+	if uint64(i) > uint64(n) {
 		panic(gsIdxErr(i, n, file, line))
 	}
 	return i

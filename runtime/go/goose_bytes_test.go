@@ -57,9 +57,14 @@ func TestAbortMessages(t *testing.T) {
 		{func() { GsAbort(GsESliceLen, "t.goose", 7) }, "goose runtime error: invalid slice length" + at},
 		{func() { GsAbort(GsEPoolSlice, "t.goose", 7) }, "goose runtime error: slice not from this pool" + at},
 		{func() { GsAbort(GsEQBound, "t.goose", 7) }, "goose runtime error: queue limit of zero or less" + at},
+		{func() { GsAbort(GsEArrayLen, "t.goose", 7) }, "goose runtime error: invalid array length" + at},
+		{func() { GsAbort(GsEArraySlice, "t.goose", 7) }, "goose runtime error: slice not within this array" + at},
+		{func() { GsAbort(GsESpanTree, "t.goose", 7) }, "goose runtime error: slice pool span tree is corrupt" + at},
 		{func() { panic(gsIdxErr(5, 3, "t.goose", 7)) }, "goose runtime error: index 5 out of bounds (length 3)" + at},
 		{func() { GsIdx(-1, 3, "t.goose", 7) }, "goose runtime error: index -1 out of bounds (length 3)" + at},
 		{func() { GsIdx(3, 3, "t.goose", 7) }, "goose runtime error: index 3 out of bounds (length 3)" + at},
+		{func() { GsUpto(4, 3, "t.goose", 7) }, "goose runtime error: index 4 out of bounds (length 3)" + at},
+		{func() { GsUpto(-1, 3, "t.goose", 7) }, "goose runtime error: index -1 out of bounds (length 3)" + at},
 		{func() { GsDivFail("t.goose", 7) }, "goose runtime error: division by zero" + at},
 		{func() { GsDivOvf("t.goose", 7) }, "goose runtime error: integer overflow in division" + at},
 		{func() { GsOvf(2000000000, "+", 1000000000, "i32", "t.goose", 7) },
@@ -79,8 +84,8 @@ func TestAbortMessages(t *testing.T) {
 			t.Errorf("got %q, want %q", got, c.want)
 		}
 	}
-	if len(gsErrMsgs) != GsEQBound+1 {
-		t.Errorf("%d error messages for %d ids", len(gsErrMsgs), GsEQBound+1)
+	if len(gsErrMsgs) != GsESpanTree+1 {
+		t.Errorf("%d error messages for %d ids", len(gsErrMsgs), GsESpanTree+1)
 	}
 	for id, m := range gsErrMsgs {
 		if m == "" {
@@ -89,6 +94,9 @@ func TestAbortMessages(t *testing.T) {
 	}
 	if i := GsIdx(2, 3, "t.goose", 7); i != 2 {
 		t.Errorf("GsIdx(2, 3) = %d", i)
+	}
+	if i := GsUpto(3, 3, "t.goose", 7); i != 3 {
+		t.Errorf("GsUpto(3, 3) = %d", i)
 	}
 }
 

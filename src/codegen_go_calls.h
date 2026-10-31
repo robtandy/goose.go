@@ -44,7 +44,7 @@ inline bool CodeGenGo::PlainSig(FnSpec *sp) {
     for (size_t i = 0; i < sp->argtypes.size(); i++)
         if (IsBytesT(sp->argtypes[i]) || IsPoolParam(sp, i)) return false;
     for (auto rt : sp->rets)
-        if (IsBytesT(rt)) return false;
+        if (IsBytesT(rt) || NeedsResultLocation(rt)) return false;
     return true;
 }
 
@@ -79,6 +79,7 @@ inline string CodeGenGo::SpecCallX(Call *c, FnSpec *sp) {
         args.push_back(x);
     }
     for (auto fv : ki.freevars) args.push_back(FreeVarArg(c->FreeVarArg(fv)));
+    if (ki.located) args.push_back(CallerLoc(c->line));
     auto list = StackArgs(sp, c->line);
     for (auto &a : args) Append(list, list.empty() ? "" : ", ", a);
     auto call = cat(ki.name, "(", list, ")");
@@ -189,6 +190,19 @@ inline vector<string> CodeGenGo::EmitSpecCall(Call *c, FnSpec *sp, const GoDst &
             retex[i] = reprefixbase;
             continue;
         }
+        if (NeedsResultLocation(rt)) {
+            // Built where it is received: a place of its own type, else a
+            // temporary of the caller's, which the receiver takes it from
+            // (CodeGen::EmitSpecCall).
+            if (dd.k == GD_LVALUE && !dd.pool && dd.t && TEq(dd.t, rt)) {
+                retex[i] = dd.s;
+            } else {
+                retex[i] = T();
+                Decl(retex[i], LocalT(rt, c->line));
+            }
+            args.push_back(cat("unsafe.Pointer(&", retex[i], ")"));
+            continue;
+        }
         if (IsResz(rt)) {
             string stk;
             if (dd.k == GD_STACK && !dd.lenlv.empty()) {
@@ -212,6 +226,7 @@ inline vector<string> CodeGenGo::EmitSpecCall(Call *c, FnSpec *sp, const GoDst &
             args.push_back(stk);
         }
     }
+    if (ki.located) args.push_back(CallerLoc(c->line));
     auto list = StackArgs(sp, c->line);
     for (auto &a : args) Append(list, list.empty() ? "" : ", ", a);
     auto call = cat(ername.empty() ? ki.name : ername, "(", list, ")");
@@ -221,7 +236,7 @@ inline vector<string> CodeGenGo::EmitSpecCall(Call *c, FnSpec *sp, const GoDst &
         auto rt = sp->rets[i];
         // The twin returns its run's count.
         auto run = i == 0 && !ername.empty();
-        if (IsBytesT(rt) && !IsResz(rt) && !run) continue;
+        if ((IsBytesT(rt) && !IsResz(rt) && !run) || NeedsResultLocation(rt)) continue;
         auto t = T();
         NoteType(t, run || (!IsFrameObj(rt) && IsResz(rt)) ? string("int64")
                     : IsFrameObj(rt) ? RzGoT(rt, c->line) : GoT(rt, c->line));
@@ -623,6 +638,9 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c, const GoDst &d0, vector<Go
                 reprefix = dd;
                 reprefixbase = res[i];
             }
+        } else if (NeedsResultLocation(rt) && dd.k == GD_LVALUE && !dd.pool && dd.t && TEq(dd.t, rt)) {
+            // Built where it is received (EmitSpecCall).
+            res[i] = dd.s;
         } else {
             res[i] = T();
             Decl(res[i], LocalT(rt, ln));
@@ -661,15 +679,19 @@ inline vector<string> CodeGenGo::GenDispatch(Call *c, const GoDst &d0, vector<Go
             for (size_t i = 0; i < an.size(); i++)
                 Append(list, list.empty() ? "" : ", ", (int)i == pos ? pv : args[i]);
             for (auto fv : ki.freevars) Append(list, list.empty() ? "" : ", ", FreeVarArg(c->FreeVarArg(fv)));
-            for (size_t i = 0; i < nr; i++)
+            for (size_t i = 0; i < nr; i++) {
                 if (IsBytesT(sp->rets[i])) Append(list, list.empty() ? "" : ", ", stks[i]);
+                else if (NeedsResultLocation(sp->rets[i]))
+                    Append(list, list.empty() ? "" : ", ", "unsafe.Pointer(&", res[i], ")");
+            }
+            if (ki.located) Append(list, list.empty() ? "" : ", ", CallerLoc(c->line));
             auto call = cat(ki.name, "(", list, ")");
             // The Go results: each fixed one's value, each resizable one's
             // count (or frame object); a bytes value is where it was built.
             string names;
             for (size_t i = 0; i < nr; i++) {
                 auto rt = sp->rets[i];
-                if (IsBytesT(rt) && !IsResz(rt)) continue;
+                if ((IsBytesT(rt) && !IsResz(rt)) || NeedsResultLocation(rt)) continue;
                 Append(names, names.empty() ? "" : ", ", IsResz(rt) ? counts[i] : res[i]);
             }
             if (names.empty()) L(call);
@@ -778,17 +800,20 @@ inline void CodeGenGo::GenCallAny(Call *c, const GoDst &d) {
         return;
     }
     if (!c->dispatch.empty()) {
-        auto res = GenDispatch(c, GoDst {}, nullptr);
+        // A result holding relative references is built where it is
+        // received (NeedsResultLocation).
+        auto rt = c->dispatch[0]->rets.empty() ? nullptr : c->dispatch[0]->rets[0];
+        auto res = GenDispatch(c, NeedsResultLocation(rt) ? d : GoDst {}, nullptr);
         if (d.k == GD_DISCARD || res.empty()) return;
         auto want = d.t ? d.t : c->exprtype;
-        auto rt = c->dispatch[0]->rets[0];
         if (IsRelRef(want)) {
             auto pt = ast.RefTo(want->ref->sub, c->line, want->ref->optional);
             auto v = Snapshot(pt, Coerce(res[0], rt, pt, c->line));
             EmitRelStore(AtVar(d.s, want), v, NonNullRef(c), false, c->line);
             return;
         }
-        L(d.s, " = ", Coerce(res[0], rt, want, c->line));
+        auto x = Coerce(res[0], rt, want, c->line);
+        if (x != d.s) L(d.s, " = ", x);
         return;
     }
     if (!c->spec) Fail(c->line, "internal: unresolved call");
@@ -1030,14 +1055,16 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             // All-zero bytes are every fixed type's default (§4.2), which is
             // Go's zero value of its representation, but where a field
             // declares a default of its own: the checker built that as a
-            // literal (Call::defaultinit).
+            // literal (Call::defaultinit), which is built only then, as C's
+            // is (HasFieldDefaults).
             auto t = c->rettypes.empty() ? c->exprtype : c->rettypes[0];
             GoT(t, ln);
             auto want = d.t ? d.t : c->exprtype;
+            auto zero = !c->defaultinit || !HasFieldDefaults(t);
             // A large one is built in a slot on a data stack, as C's is
             // (FixedLocal), with a default of its own or none.
             auto large = IsLargeFixed(t) && !(curspec && curspec->incycle);
-            if (!c->defaultinit && !large) {
+            if (zero && !large) {
                 if (d.k == GD_DISCARD) return;
                 if (IsRelRef(want)) {
                     L(d.s, " = 0");
@@ -1047,7 +1074,7 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
                 return;
             }
             auto v = FixedLocal(t, T(), "", false, ln);
-            if (!c->defaultinit) {
+            if (zero) {
                 if (d.k != GD_DISCARD) L(d.s, " = ", Coerce(v, t, want, ln));
                 return;
             }
@@ -1184,9 +1211,28 @@ inline void CodeGenGo::GenBuiltin(Call *c, const GoDst &d) {
             if (x != d.s) L(d.s, " = ", x);
             return;
         }
+        case B_MOVE_FROM: {
+            // The receiver, then the source; slices of one length, the
+            // elements copied as memmove copies them, which an overlap of
+            // the two leaves right (CodeGen's).
+            auto dv = ArrayView(RecvLoc(an[0]), ln);
+            auto base = T(), count = T();
+            Decl(base, "unsafe.Pointer", dv.data);
+            Decl(count, "int64", dv.fixed >= 0 ? cat(dv.fixed) : dv.len);
+            auto st = ast.SliceOf(dv.elem, ln);
+            auto src = Snapshot(st, CoerceVal(GenX(an[1]), an[1]->exprtype, st, ln));
+            L("if ", count, " != ", src, ".Len {");
+            ind++;
+            L("GsAbortMsg(\"move_from lengths differ\", ", LocArgs(ln), ")");
+            ind--;
+            LS("}");
+            if (FixedSize(dv.elem)) CopyElemBytes(base, cat(src, ".Data"), count, dv.esize);
+            return;
+        }
         case B_LEN: case B_CAP: case B_INDEX_OF: case B_PUSH: case B_APPEND: case B_POP:
         case B_POP_N: case B_CLEAR: case B_RESIZE: case B_ALLOC_INDEX: case B_ALLOC_REF:
-        case B_ALLOC_SLICE: case B_REALLOC_SLICE: case B_FREE_SLICE: case B_FREE: {
+        case B_ALLOC_SLICE: case B_REALLOC_SLICE: case B_FREE_SLICE: case B_FREE:
+        case B_RANGE_INDEX: case B_CHECK_LENGTH: {
             auto x = GenArrayBuiltin(c);
             if (x.empty() || Unreached()) return;
             auto want = d.t ? d.t : c->exprtype;
@@ -1319,6 +1365,7 @@ inline void CodeGenGo::EmitUserFormat(const string &cur, const GoLoc &l, FnSpec 
     if (!IsGoName(arg) && !IsGoConst(arg) && arg != "nil") arg = Snapshot(pt, arg);
     auto list = StackArgs(sp, ln);
     Append(list, list.empty() ? "" : ", ", RefOfRz(b, ln), ", ", arg);
+    if (ki.located) Append(list, ", ", CallerLoc(ln));
     L(ki.name, "(", list, ")");
     if (ki.hasrf) EmitRfCheck(sp);
     if (rt.b.hdr.empty()) {

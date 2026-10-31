@@ -824,3 +824,164 @@ func TestSpansDeepTree(t *testing.T) {
 		t.Fatalf("the whole pool as one run: at %d of %d", at, p.elems.Len)
 	}
 }
+
+// checkedPool is a std slice_pool (stdlib/slice_pool.goose) as its code
+// keeps one: elements of esz bytes on one data stack of gs, the nodes of its
+// span tree on another, and the tree's header apart from them, which the
+// GsSlicePool* functions check as they read it.
+type checkedPool struct {
+	gs      *GsStackBlock
+	elemStk int64
+	nodeStk int64
+	elems   GsRhdr
+	nodes   GsRhdr
+	tree    gsSpHead
+	esz     int64
+	at      GsLoc
+}
+
+func newCheckedPool(gs *GsStackBlock, elemStk, nodeStk, esz int64) *checkedPool {
+	return &checkedPool{gs: gs, elemStk: elemStk, nodeStk: nodeStk, esz: esz,
+		elems: GsRhdr{Base: gs.Stks[elemStk]}, nodes: GsRhdr{Base: gs.Stks[nodeStk]},
+		at: GsLoc{File: "pool.goose", Line: 3}}
+}
+
+func (p *checkedPool) ref() GsRref        { return GsRref{Hdr: &p.nodes, Stk: p.nodeStk} }
+func (p *checkedPool) tp() unsafe.Pointer { return unsafe.Pointer(&p.tree) }
+
+// place is alloc_slice's placement: past the end while no node exists.
+func (p *checkedPool) place(n int64) int64 {
+	if n == 0 || p.nodes.Len == 0 {
+		return p.elems.Len
+	}
+	return GsSlicePoolPlace(p.gs, p.ref(), p.tp(), p.elems.Len, n, &p.at)
+}
+
+func (p *checkedPool) extend(end int64) {
+	if ext := end - p.elems.Len; ext > 0 {
+		p.elems.Len += ext
+		p.gs.Stks[p.elemStk] = unsafe.Add(p.gs.Stks[p.elemStk], ext*p.esz)
+	}
+}
+
+func (p *checkedPool) alloc(n int64) int64 {
+	i := p.place(n)
+	p.extend(i + n)
+	return i
+}
+
+func (p *checkedPool) free(i, n int64) { GsSlicePoolFree(p.gs, p.ref(), p.tp(), i, n, &p.at) }
+
+// realloc is realloc_slice's placement of the ol elements from i grown or
+// shrunk to n (slice_pool.goose's realloc_slice and finish).
+func (p *checkedPool) realloc(i, ol, n int64) int64 {
+	if n <= ol {
+		p.free(i+n, ol-n)
+		return i
+	}
+	to := i
+	if ol == 0 {
+		to = p.place(n)
+	} else if i+ol != p.elems.Len {
+		to = GsSlicePoolRegrow(p.gs, p.ref(), p.tp(), p.elems.Len, i, ol, n, &p.at)
+	}
+	p.extend(to + n)
+	return to
+}
+
+// A slice pool's checked tree places every run where reusable[]'s unchecked
+// one does, over a long random trace of allocations, frees and resizes,
+// with node 0 left zero and the header apart.
+func TestSlicePoolTreeMatchesSpans(t *testing.T) {
+	gs := NewStackBlock(4, 64<<20, 64<<10)
+	defer gs.Close()
+	plain := newTestPool(gs, 0, 1, 8)
+	checked := newCheckedPool(gs, 2, 3, 8)
+	seed := lcg(7)
+	const slots = 1500
+	runs := make([]poolRun, slots)
+	for step := 0; step < 40000; step++ {
+		q := seed.next(slots)
+		s := runs[q]
+		switch what := seed.next(10); {
+		case s.n == 0:
+			n := 1 + seed.next(12)
+			a, b := plain.alloc(n), checked.alloc(n)
+			if a != b {
+				t.Fatalf("step %d: alloc(%d) at %d, the unchecked tree's %d", step, n, b, a)
+			}
+			runs[q] = poolRun{a, n}
+		case what < 5:
+			plain.free(s.at, s.n)
+			checked.free(s.at, s.n)
+			runs[q] = poolRun{}
+		default:
+			n := seed.next(20)
+			a, b := plain.realloc(s.at, s.n, n), checked.realloc(s.at, s.n, n)
+			if a != b {
+				t.Fatalf("step %d: realloc(%d, %d, %d) at %d, the unchecked tree's %d", step, s.at, s.n, n, b, a)
+			}
+			runs[q] = poolRun{a, n}
+		}
+		if plain.elems.Len != checked.elems.Len {
+			t.Fatalf("step %d: %d elements, the unchecked pool's %d", step, checked.elems.Len, plain.elems.Len)
+		}
+	}
+	if checked.tree.height < 1 {
+		t.Errorf("the trace grew a tree of height %d", checked.tree.height)
+	}
+	if z := *(*[GsSpanNode]byte)(checked.nodes.Base); z != [GsSpanNode]byte{} {
+		t.Errorf("node 0 is not zero")
+	}
+}
+
+// What the program can write of a slice pool's tree is checked before it
+// is used: a count past what a node holds, a height past any path, a child
+// or a chained node past the nodes, each aborts with GS_E_SPANTREE where
+// the program called slice_pool.
+func TestSlicePoolTreeCorrupt(t *testing.T) {
+	const want = "goose runtime error: slice pool span tree is corrupt (pool.goose:3)"
+	cases := []struct {
+		what   string
+		runs   int64
+		freed  func(i int64) bool
+		edit   func(p *checkedPool)
+		action func(p *checkedPool)
+	}{
+		{"a leaf's count", 1, func(int64) bool { return true },
+			func(p *checkedPool) { (*gsSpLeaf)(unsafe.Add(p.nodes.Base, p.tree.root*GsSpanNode)).n = 40 },
+			func(p *checkedPool) { p.alloc(1) }},
+		{"a height", 1, func(int64) bool { return true },
+			func(p *checkedPool) { p.tree.height = 1000 },
+			func(p *checkedPool) { p.free(p.alloc(1), 1) }},
+		{"a child", 80, func(i int64) bool { return i%2 == 0 },
+			func(p *checkedPool) {
+				(*gsSpInner)(unsafe.Add(p.nodes.Base, p.tree.root*GsSpanNode)).child[1] = 1000000
+			},
+			func(p *checkedPool) { p.alloc(2) }},
+		{"the chain", 80, func(i int64) bool { return i == 0 },
+			func(p *checkedPool) { p.tree.chain = 77 },
+			func(p *checkedPool) {
+				for i := int64(1); i < 40; i++ {
+					p.free(2*i, 1)
+				}
+			}},
+	}
+	for _, c := range cases {
+		gs := NewStackBlock(2, 64<<20, 64<<10)
+		p := newCheckedPool(gs, 0, 1, 8)
+		for i := int64(0); i < c.runs; i++ {
+			p.alloc(1)
+		}
+		for i := int64(0); i < c.runs; i++ {
+			if c.freed(i) {
+				p.free(i, 1)
+			}
+		}
+		c.edit(p)
+		if got := abortText(func() { c.action(p) }); got != want {
+			t.Errorf("%s edited: %q, want %q", c.what, got, want)
+		}
+		gs.Close()
+	}
+}

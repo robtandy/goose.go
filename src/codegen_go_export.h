@@ -258,7 +258,20 @@ inline bool CodeGenGo::GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a,
         x = cat(GoExportName(name), "(", list, ")");
         return true;
     }
-    (void)c;
+    // std's slice_pool keeps its free spans in a checked copy of the
+    // runtime's span tree (stdlib/slice_pool_internal.goose, goose_spans.go):
+    // the nodes as the GsRref they are, the tree's header by its address,
+    // and where the program called slice_pool, which a corrupt tree aborts
+    // at (SFunction::takesloc).
+    if (name == "gs_slice_pool_place" || name == "gs_slice_pool_free" || name == "gs_slice_pool_regrow") {
+        if (a.size() < 2 || sp->argtypes.size() != a.size())
+            Fail(c->line, cat("internal: ", name, " bound with another signature"));
+        auto list = cat("gs, ", a[0], ", ", AddrOfRef(sp->argtypes[1], a[1]));
+        for (size_t i = 2; i < a.size(); i++) Append(list, ", ", a[i]);
+        Append(list, ", ", CallerLoc(c->line));
+        x = cat(GoExportName(name), "(", list, ")");
+        return true;
+    }
     return false;
 }
 
@@ -862,6 +875,8 @@ inline void CodeGenGo::EmitExports() {
                 rt = cat("[]", GoT(t->sub, ln));
                 conv = cat("GsSliceToSlice[", GoT(t->sub, ln), "]");
             } else if (IsFix(t) && t->kind != TY_REF) {
+                if (NeedsResultLocation(t))
+                    Unsupported(ln, cat("an export fn's result holding relative references (", TypeText(t), ")"));
                 rt = GoT(t, ln);
             } else {
                 Fail(ln, cat("internal: export fn ", sf->name, " returns ", TypeText(t)));

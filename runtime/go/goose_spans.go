@@ -629,3 +629,583 @@ func GsSpansRegrow(base unsafe.Pointer, n *int64, top *unsafe.Pointer, length, i
 	f.release(&p, &q, &s, idx, ol)
 	return GsSpansAlloc(base, n, top, length, cnt)
 }
+
+// ---------------------------------------------------------------------------
+// std's slice_pool (stdlib/slice_pool_internal.goose) keeps the span tree
+// above in nodes of its own, a node[>..], and a `tree` field for the header,
+// both of which the program can write: these are its externs' functions,
+// gs_slice_pool_place, _free and _regrow of src/runtime/runtime_os.h, the
+// functions above taking the nodes as a GsRref and the header apart from
+// them, with everything read from the tree checked before it is used. A node
+// number must be one of the nodes past node 0, which stays zero and ends
+// the chain of emptied nodes; an entry count must fit the node it is read
+// from as a leaf or an inner node; a height must fit a path; and an entry
+// moved into or out of a node must be one it has room for or holds. A check
+// that fails aborts (GsESpanTree) at the call where the program called
+// slice_pool (at); a wrong tree that passes them hands out wrong spans,
+// which slice_pool checks against its length. Sums of stored indices and
+// counts wrap. New nodes start zeroed, as a pushed `node { .. }` would.
+// Where C reads on past an inner node's entries, in a tree edited so that one
+// node is both an inner node and a leaf of one path, Go's arrays end, and
+// that is a corrupt tree too.
+
+// GsLoc is a place in the program's source: where a standard library
+// function called from there reports its failures (C's gs_loc).
+type GsLoc struct {
+	File string
+	Line int
+}
+
+// gsSpcPath is a path down a slice pool's tree, with the tree it is in.
+type gsSpcPath struct {
+	hd   *gsSpHead
+	base unsafe.Pointer
+	n    *int64
+	top  *unsafe.Pointer
+	at   *GsLoc
+	h    int64
+	node [gsSpanDepth]int64
+	pos  [gsSpanDepth]int64
+}
+
+func gsSpcStart(gs *GsStackBlock, nodes GsRref, tree unsafe.Pointer, at *GsLoc) gsSpcPath {
+	return gsSpcPath{hd: (*gsSpHead)(tree), base: nodes.Hdr.Base, n: &nodes.Hdr.Len,
+		top: &gs.Stks[nodes.Stk], at: at}
+}
+
+func (p *gsSpcPath) leaf(i int64) *gsSpLeaf {
+	return (*gsSpLeaf)(unsafe.Add(p.base, i*GsSpanNode))
+}
+
+func (p *gsSpcPath) inner(i int64) *gsSpInner {
+	return (*gsSpInner)(unsafe.Add(p.base, i*GsSpanNode))
+}
+
+func (p *gsSpcPath) corrupt() { GsAbort(GsESpanTree, p.at.File, p.at.Line) }
+
+// Whether node number i is none of the nodes past node 0; whether it is no
+// inner node, or no leaf, whose count fits; and whether a height fits a
+// path.
+func (p *gsSpcPath) badNum(i int64) bool { return uint64(i)-1 >= uint64(*p.n)-1 }
+func (p *gsSpcPath) badIn(i int64) bool {
+	return p.badNum(i) || uint64(p.inner(i).n)-1 >= gsSpanFan
+}
+func (p *gsSpcPath) badLeaf(i int64) bool {
+	return p.badNum(i) || uint64(p.leaf(i).n) > gsSpanLeaf
+}
+func gsSpcBadH(h int64) bool { return uint64(h) >= gsSpanDepth }
+
+func (p *gsSpcPath) newNode() int64 {
+	if i := p.hd.chain; i != 0 {
+		if p.badNum(i) {
+			p.corrupt()
+		}
+		p.hd.chain = p.leaf(i).link
+		return i
+	}
+	i := *p.n
+	*p.n = i + 1
+	*p.leaf(i) = gsSpLeaf{}
+	*p.top = unsafe.Add(*p.top, GsSpanNode)
+	return i
+}
+
+func (p *gsSpcPath) dropNode(i int64) {
+	p.leaf(i).link = p.hd.chain
+	p.hd.chain = i
+}
+
+func (p *gsSpcPath) open(lf *gsSpLeaf, s int64) {
+	if uint64(lf.n) >= gsSpanLeaf || uint64(s) > uint64(lf.n) {
+		p.corrupt()
+	}
+	gsSpOpen(lf, s)
+}
+
+func (p *gsSpcPath) close(lf *gsSpLeaf, s int64) {
+	if uint64(s) >= uint64(lf.n) {
+		p.corrupt()
+	}
+	gsSpClose(lf, s)
+}
+
+func (p *gsSpcPath) openIn(in *gsSpInner, s int64) {
+	if uint64(in.n) >= gsSpanFan || uint64(s) > uint64(in.n) {
+		p.corrupt()
+	}
+	gsSpOpenIn(in, s)
+}
+
+func (p *gsSpcPath) closeIn(in *gsSpInner, s int64) {
+	if in.n > gsSpanFan || uint64(s) >= uint64(in.n) {
+		p.corrupt()
+	}
+	gsSpCloseIn(in, s)
+}
+
+func (p *gsSpcPath) max(i int64, leaf bool, stop int64) int64 {
+	if leaf {
+		lf := p.leaf(i)
+		return gsSpMost(lf.cnt[:lf.n], stop)
+	}
+	in := p.inner(i)
+	if uint64(in.n) > gsSpanFan {
+		p.corrupt()
+	}
+	return gsSpMost(in.max[:in.n], stop)
+}
+
+func (p *gsSpcPath) key(i int64, leaf bool) int64 {
+	if leaf {
+		return p.leaf(i).idx[0]
+	}
+	return p.inner(i).key[0]
+}
+
+func (p *gsSpcPath) fix(l, was, now int64) {
+	for ; l > 0; l-- {
+		in := p.inner(p.node[l-1])
+		k, c := p.pos[l-1], p.node[l]
+		m := in.max[k]
+		leaf := l == p.h
+		key := p.key(c, leaf)
+		var nm int64
+		switch {
+		case now >= m:
+			nm = now
+		case was < m:
+			nm = m
+		default:
+			nm = p.max(c, leaf, was)
+		}
+		if in.key[k] == key && nm == m {
+			return
+		}
+		in.key[k] = key
+		in.max[k] = nm
+		was = m
+		now = nm
+	}
+}
+
+func (p *gsSpcPath) find(idx int64) int64 {
+	i := p.hd.root
+	p.h = p.hd.height
+	if gsSpcBadH(p.h) {
+		p.corrupt()
+	}
+	for l := int64(0); l < p.h; l++ {
+		if p.badIn(i) {
+			p.corrupt()
+		}
+		in := p.inner(i)
+		k := int64(1)
+		for k < in.n && in.key[k] <= idx {
+			k++
+		}
+		p.node[l] = i
+		p.pos[l] = k - 1
+		i = in.child[k-1]
+	}
+	p.node[p.h] = i
+	if p.badLeaf(i) {
+		p.corrupt()
+	}
+	lf := p.leaf(i)
+	k := int64(0)
+	for k < lf.n && lf.idx[k] <= idx {
+		k++
+	}
+	p.pos[p.h] = k - 1
+	return k - 1
+}
+
+func (p *gsSpcPath) newRoot(a, b int64, leaf bool) {
+	r := p.newNode()
+	rn := p.inner(r)
+	rn.n = 2
+	rn.key[0] = p.key(a, leaf)
+	rn.max[0] = p.max(a, leaf, math.MaxInt64)
+	rn.child[0] = a
+	rn.key[1] = p.key(b, leaf)
+	rn.max[1] = p.max(b, leaf, math.MaxInt64)
+	rn.child[1] = b
+	p.hd.root = r
+	p.hd.height++
+}
+
+func (p *gsSpcPath) addChild(l, k, child int64, leaf bool) {
+	for {
+		in := p.inner(p.node[l])
+		o := in
+		key, max := p.key(child, leaf), p.max(child, leaf, math.MaxInt64)
+		s, nn := k, int64(0)
+		if in.n == gsSpanFan {
+			const half = gsSpanFan / 2
+			nn = p.newNode()
+			if nn == p.node[l] {
+				p.corrupt()
+			}
+			r := p.inner(nn)
+			r.n = in.n - half
+			copy(r.key[:r.n], in.key[half:])
+			copy(r.max[:r.n], in.max[half:])
+			copy(r.child[:r.n], in.child[half:])
+			in.n = half
+			if k > half {
+				o = r
+				s = k - half
+			}
+		}
+		p.openIn(o, s)
+		o.key[s] = key
+		o.max[s] = max
+		o.child[s] = child
+		if nn == 0 {
+			p.fix(l, 0, max)
+			return
+		}
+		if l == 0 {
+			p.newRoot(p.node[0], nn, false)
+			return
+		}
+		p.fix(l, math.MaxInt64, 0)
+		child = nn
+		leaf = false
+		k = p.pos[l-1] + 1
+		l--
+	}
+}
+
+func (p *gsSpcPath) insert(k, idx, cnt int64) {
+	lf := p.leaf(p.node[p.h])
+	o := lf
+	s, nn := k, int64(0)
+	if lf.n == gsSpanLeaf {
+		const half = gsSpanLeaf / 2
+		nn = p.newNode()
+		if nn == p.node[p.h] {
+			p.corrupt()
+		}
+		r := p.leaf(nn)
+		r.n = lf.n - half
+		copy(r.idx[:r.n], lf.idx[half:])
+		copy(r.cnt[:r.n], lf.cnt[half:])
+		lf.n = half
+		if k > half {
+			o = r
+			s = k - half
+		}
+	}
+	p.open(o, s)
+	o.idx[s] = idx
+	o.cnt[s] = cnt
+	switch {
+	case nn == 0:
+		p.fix(p.h, 0, cnt)
+	case p.h == 0:
+		p.newRoot(p.node[0], nn, true)
+	default:
+		p.fix(p.h, math.MaxInt64, 0)
+		p.addChild(p.h-1, p.pos[p.h-1]+1, nn, true)
+	}
+}
+
+func (p *gsSpcPath) delete(k int64) {
+	lf := p.leaf(p.node[p.h])
+	if uint64(k) >= uint64(lf.n) {
+		p.corrupt()
+	}
+	c := lf.cnt[k]
+	p.close(lf, k)
+	if lf.n > 0 || p.h == 0 {
+		p.fix(p.h, c, 0)
+		return
+	}
+	p.dropNode(p.node[p.h])
+	for l := p.h - 1; ; l-- {
+		in := p.inner(p.node[l])
+		e := p.pos[l]
+		m := in.max[e]
+		p.closeIn(in, e)
+		if in.n > 0 {
+			p.fix(l, m, 0)
+			break
+		}
+		// A root of one child, which the functions never leave.
+		if l == 0 {
+			p.corrupt()
+		}
+		p.dropNode(p.node[l])
+	}
+	for p.hd.height > 0 {
+		r := p.hd.root
+		if p.badNum(r) {
+			p.corrupt()
+		}
+		if p.inner(r).n != 1 {
+			break
+		}
+		p.hd.root = p.inner(r).child[0]
+		p.hd.height--
+		p.dropNode(r)
+	}
+}
+
+func (p *gsSpcPath) take(k, cnt int64) {
+	lf := p.leaf(p.node[p.h])
+	c := lf.cnt[k]
+	if c <= cnt {
+		p.delete(k)
+		return
+	}
+	lf.idx[k] += cnt
+	lf.cnt[k] = c - cnt
+	p.fix(p.h, c, c-cnt)
+}
+
+// GsSlicePoolPlace is GsSpansAlloc of a slice pool's tree
+// (gs_slice_pool_place): where a run of cnt elements goes in a pool of
+// length elements, first fit, else the end.
+func GsSlicePoolPlace(gs *GsStackBlock, nodes GsRref, tree unsafe.Pointer, length, cnt int64, at *GsLoc) int64 {
+	if cnt == 0 || nodes.Hdr.Len == 0 {
+		return length
+	}
+	p := gsSpcStart(gs, nodes, tree, at)
+	var before [gsSpanDepth]int64
+	var lf *gsSpLeaf
+	var l, k, m int64
+	p.h = p.hd.height
+	if gsSpcBadH(p.h) {
+		p.corrupt()
+	}
+	i := p.hd.root
+	for l = 0; l < p.h; l++ {
+		if p.badIn(i) {
+			p.corrupt()
+		}
+		in := p.inner(i)
+		for k, m = 0, 0; k < in.n && in.max[k] < cnt; k++ {
+			if in.max[k] > m {
+				m = in.max[k]
+			}
+		}
+		if k == in.n {
+			break
+		}
+		p.node[l] = i
+		p.pos[l] = k
+		before[l] = m
+		i = in.child[k]
+	}
+	if l == p.h {
+		if p.badLeaf(i) {
+			p.corrupt()
+		}
+		lf = p.leaf(i)
+		for k, m = 0, 0; k < lf.n && lf.cnt[k] < cnt; k++ {
+			if lf.cnt[k] > m {
+				m = lf.cnt[k]
+			}
+		}
+		before[l] = m
+	}
+	if l < p.h || k == lf.n {
+		for l, i = 0, p.hd.root; l < p.h; l++ {
+			if p.badIn(i) {
+				p.corrupt()
+			}
+			in := p.inner(i)
+			p.node[l] = i
+			p.pos[l] = in.n - 1
+			i = in.child[in.n-1]
+		}
+		p.node[p.h] = i
+		if p.badLeaf(i) {
+			p.corrupt()
+		}
+		lf = p.leaf(i)
+		k = lf.n - 1
+		if k < 0 || lf.idx[k]+lf.cnt[k] != length {
+			return length
+		}
+		idx := lf.idx[k]
+		p.take(k, cnt)
+		return idx
+	}
+	p.node[p.h] = i
+	p.pos[p.h] = k
+	idx, c := lf.idx[k], lf.cnt[k]
+	var now, j int64
+	switch {
+	case c > cnt:
+		now = c - cnt
+		lf.idx[k] = idx + cnt
+		lf.cnt[k] = now
+		j = k + 1
+	case lf.n > 1 || p.h == 0:
+		p.close(lf, k)
+		now = 0
+		j = k
+	default:
+		p.delete(k)
+		return idx
+	}
+	for l = p.h; l > 0; l-- {
+		in := p.inner(p.node[l-1])
+		e := p.pos[l-1]
+		mx := in.max[e]
+		nm := mx
+		key := p.key(p.node[l], l == p.h)
+		if c == mx {
+			var v []int64
+			if l == p.h {
+				v = lf.cnt[:lf.n]
+			} else {
+				below := p.inner(p.node[l])
+				if uint64(below.n) > gsSpanFan {
+					p.corrupt()
+				}
+				v = below.max[:below.n]
+			}
+			nm = before[l]
+			if now > nm {
+				nm = now
+			}
+			for ; j < int64(len(v)) && nm < c; j++ {
+				if v[j] > nm {
+					nm = v[j]
+				}
+			}
+		}
+		if in.key[e] == key && nm == mx {
+			break
+		}
+		in.key[e] = key
+		in.max[e] = nm
+		c = mx
+		now = nm
+		j = e + 1
+	}
+	return idx
+}
+
+// gsSpcNear is gsSpNear in a slice pool's tree: np is the path to nl.
+type gsSpcNear struct {
+	lf, nl *gsSpLeaf
+	k, nk  int64
+	np     *gsSpcPath
+}
+
+func (p *gsSpcPath) near(q *gsSpcPath, idx, end int64) gsSpcNear {
+	var s gsSpcNear
+	s.k = p.find(idx)
+	s.lf = p.leaf(p.node[p.h])
+	s.nk = -1
+	s.np = p
+	if s.k+1 < s.lf.n {
+		s.nl = s.lf
+		s.nk = s.k + 1
+		return s
+	}
+	l := p.h - 1
+	for l >= 0 && p.pos[l]+1 >= p.inner(p.node[l]).n {
+		l--
+	}
+	if l < 0 {
+		return s
+	}
+	if p.pos[l]+1 >= gsSpanFan {
+		p.corrupt()
+	}
+	if p.inner(p.node[l]).key[p.pos[l]+1] != end {
+		return s
+	}
+	q.hd, q.base, q.n, q.top, q.at, q.h = p.hd, p.base, p.n, p.top, p.at, p.h
+	copy(q.node[:l+1], p.node[:l+1])
+	copy(q.pos[:l+1], p.pos[:l+1])
+	for q.pos[l]++; l < q.h; l++ {
+		c := q.inner(q.node[l]).child[q.pos[l]]
+		if l+1 < q.h && q.badIn(c) || l+1 == q.h && q.badLeaf(c) {
+			q.corrupt()
+		}
+		q.node[l+1] = c
+		q.pos[l+1] = 0
+	}
+	s.np = q
+	s.nl = q.leaf(q.node[q.h])
+	s.nk = 0
+	return s
+}
+
+func (p *gsSpcPath) release(s *gsSpcNear, idx, cnt int64) {
+	lf, nl := s.lf, s.nl
+	k, nk := s.k, s.nk
+	prev := k >= 0 && lf.idx[k]+lf.cnt[k] == idx
+	next := nl != nil && idx+cnt == nl.idx[nk]
+	switch {
+	case prev:
+		c := lf.cnt[k]
+		m := c + cnt
+		if next {
+			m += nl.cnt[nk]
+		}
+		lf.cnt[k] = m
+		if next && nl == lf {
+			p.close(lf, nk)
+		}
+		p.fix(p.h, c, m)
+		if next && nl != lf {
+			s.np.delete(nk)
+		}
+	case next:
+		c := nl.cnt[nk]
+		nl.idx[nk] = idx
+		nl.cnt[nk] = c + cnt
+		s.np.fix(s.np.h, c, nl.cnt[nk])
+	default:
+		p.insert(k+1, idx, cnt)
+	}
+}
+
+// GsSlicePoolFree is GsSpansFree of a slice pool's tree
+// (gs_slice_pool_free): [idx, idx + cnt) back among the free spans. The
+// first span freed makes node 0, zero, and the root's leaf.
+func GsSlicePoolFree(gs *GsStackBlock, nodes GsRref, tree unsafe.Pointer, idx, cnt int64, at *GsLoc) {
+	if cnt <= 0 {
+		return
+	}
+	p := gsSpcStart(gs, nodes, tree, at)
+	if *p.n == 0 {
+		*p.leaf(0) = gsSpLeaf{}
+		*p.n = 1
+		*p.top = unsafe.Add(p.base, GsSpanNode)
+		p.hd.chain = 0
+		p.hd.height = 0
+		p.hd.root = p.newNode()
+	}
+	var q gsSpcPath
+	s := p.near(&q, idx, idx+cnt)
+	p.release(&s, idx, cnt)
+}
+
+// GsSlicePoolRegrow is GsSpansRegrow of a slice pool's tree
+// (gs_slice_pool_regrow): where the slice [idx, idx + ol) starts once grown
+// to cnt elements.
+func GsSlicePoolRegrow(gs *GsStackBlock, nodes GsRref, tree unsafe.Pointer, length, idx, ol, cnt int64,
+	at *GsLoc) int64 {
+	end := idx + ol
+	if nodes.Hdr.Len == 0 {
+		GsSlicePoolFree(gs, nodes, tree, idx, ol, at)
+		return GsSlicePoolPlace(gs, nodes, tree, length, cnt, at)
+	}
+	p := gsSpcStart(gs, nodes, tree, at)
+	var q gsSpcPath
+	s := p.near(&q, idx, end)
+	if s.nl != nil && s.nl.idx[s.nk] == end && (s.nl.cnt[s.nk] >= cnt-ol || end+s.nl.cnt[s.nk] == length) {
+		s.np.take(s.nk, cnt-ol)
+		return idx
+	}
+	p.release(&s, idx, ol)
+	return GsSlicePoolPlace(gs, nodes, tree, length, cnt, at)
+}

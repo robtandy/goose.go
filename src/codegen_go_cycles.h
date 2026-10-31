@@ -103,7 +103,8 @@ inline bool GoBuiltinTakesNoStack(int b) {
     switch (b) {
         case B_ASSERT: case B_ABORT: case B_EXIT: case B_LEN: case B_CAP: case B_INDEX_OF:
         case B_PUSH: case B_APPEND: case B_POP: case B_POP_N: case B_RESIZE: case B_CLEAR:
-        case B_DEFAULT: case B_COPY: case B_BYTES_OF:
+        case B_DEFAULT: case B_COPY: case B_BYTES_OF: case B_MOVE_FROM: case B_RANGE_INDEX:
+        case B_CHECK_LENGTH:
             return true;
         default:
             return false;

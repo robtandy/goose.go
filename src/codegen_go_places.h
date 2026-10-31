@@ -85,6 +85,8 @@ inline string CodeGenGo::PtrOf(const GoLoc &l) {
 // (RefIsAddr, a bytes value's), a typed Go pointer otherwise.
 inline string CodeGenGo::RefOfLoc(const GoLoc &l) {
     if (IsBytesT(l.t) && !IsResz(l.t)) return l.addr;
+    // A root owner's reference is a typed pointer to its descriptor.
+    if (IsRoot(l.t)) return PtrOf(l);
     if (GoHasPtrs(l.t)) return AddrOf(l);
     return PtrOf(l);
 }
@@ -196,6 +198,20 @@ inline CodeGenGo::GoLoc CodeGenGo::FieldLocAt(const GoLoc &base, int fi, Line ln
         ft = ei->vftypes[vi][fi];
     } else {
         Fail(ln, cat("internal: a field of a value of type ", TypeText(base.t)));
+    }
+    // A field of a root owner (CodeGen::FieldLocAt): where the owner is named
+    // directly, its component's own place, as a variable of its type is;
+    // through a reference, where its descriptor's reference to it leads.
+    if (base.t->kind == TY_STRUCT && IsRoot(base.t)) {
+        if (base.rootowner) {
+            auto c = base.rootowner->components.size() > (size_t)fi ? base.rootowner->components[fi] : nullptr;
+            if (!c) Fail(ln, cat("internal: the root owner ", base.rootowner->name, " without its component ", fi));
+            return VarLoc(c, ln);
+        }
+        auto r = AtVar(cat(base.lv, ".", Sanitize((*fields)[fi].name)), ast.RefTo(ft, ln));
+        r.viaref = base.viaref || ft->kind == TY_REF;
+        DerefLoc(r);
+        return r;
     }
     // A field of a frame object laid out as bytes (C.2).
     if (IsFrameObj(base.t) && IsFoBytesLoc(base)) return FoFieldLoc(base, fi, ln);
@@ -423,6 +439,14 @@ inline CodeGenGo::GoLoc CodeGenGo::VarLoc(const VarDef *vd, Line ln) {
         auto name = it != vnames.end() ? it->second : VarRef(vd, ln);
         return RzVarLoc(vd, name);
     }
+    if (IsRoot(vd->type)) {
+        // The descriptor; and but for a free variable, which arrives as a
+        // pointer to the caller's, the owner itself, whose components are
+        // this function's (or the program's) own variables.
+        auto l = AtVar(VarRef(vd, ln), vd->type);
+        if (!fvptr.count(vd)) l.rootowner = vd;
+        return l;
+    }
     if (IsBytesT(vd->type)) {
         GoLoc l;
         l.t = vd->type;
@@ -520,6 +544,8 @@ inline const CodeGenGo::GoLoc *CodeGenGo::RefPlace(const string &x, TypeExpr *rt
     auto it = refplaces.find(x);
     if (it == refplaces.end()) return nullptr;
     auto sub = rt->ref->sub;
+    // A root owner a reference names (BindLocal): the owner.
+    if (IsRoot(sub)) return TEq(sub, it->second.t) ? &it->second : nullptr;
     if (!IsFix(sub) || GoT(sub, Line {}) != GoT(it->second.t, Line {})) return nullptr;
     return &it->second;
 }
@@ -633,6 +659,7 @@ inline CodeGenGo::GoLoc CodeGenGo::GenLoc(Node *n) {
 inline string CodeGenGo::LoadLoc(GoLoc l, TypeExpr *et, Line ln) {
     if (!et || et->kind == TY_VOID) et = l.t;
     if (IsResz(l.t) && et->kind == TY_REF) return RefOfRz(l, ln);
+    if (IsRoot(l.t) && et->kind == TY_REF) return RefOfLoc(l);
     if (l.t->kind != TY_REF && IsBytesT(l.t) && !IsResz(l.t) && et->kind == TY_REF) return l.addr;
     if (l.t->kind == TY_REF && et->kind != TY_REF) {
         DerefLoc(l);
