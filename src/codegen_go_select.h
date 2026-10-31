@@ -268,4 +268,44 @@ inline bool CodeGenGo::GenSelectReturn(FnSpec *sp) {
     return true;
 }
 
+// std's choices of scalars -- min, max, clamp, abs and sign, each overload of
+// numbers or of type parameters, which only numbers order (§4.5) -- as a
+// `checkfree fn` may call them (§7.14, issue #62). Each is comparisons,
+// returns and literals and nothing else, which the Go backend writes as
+// Go's builtin min and max or as selects (issue #26), with no bounds check
+// in any specialization or inlined copy: checkfree holds of each as std
+// writes it, but std does not say so, and the checker refuses a call of one
+// in a checkfree fn. For --target=go the driver marks them checkfree before
+// the program is checked (src/main.cpp), those whose bodies are of that
+// shape and no other, which BCE verifies as it verifies any checkfree fn;
+// docs/upstream/checkfree-choices.md proposes the marks in std.goose.
+inline void GoCheckfreeChoices(Ast &ast) {
+    static const unordered_set<string_view> choices = { "min", "max", "clamp", "abs", "sign" };
+    // Comparisons, arithmetic, returns, ifs, literals and names alone.
+    function<bool(Node *)> plain = [&](Node *n) -> bool {
+        if (!n) return true;
+        switch (n->nkind) {
+            case NK_IntLit: case NK_FltLit: case NK_BoolLit: case NK_Ident: case NK_Unary: case NK_Binary:
+            case NK_Block: case NK_IfExpr:
+                break;
+            case NK_Return:
+                if (!((Return *)n)->from.empty()) return false;
+                break;
+            default: return false;
+        }
+        auto ok = true;
+        RunChildren(n, [&](Node *c) { ok = ok && plain(c); });
+        return ok;
+    };
+    for (auto sf : ast.functions) {
+        if (sf->checkfree || !sf->body || sf->isextern || sf->isnested || !sf->ns.empty() ||
+            !choices.count(sf->name) || !ast.StdlibFile(sf->line.fileidx))
+            continue;
+        auto scalars = all_of(sf->params.begin(), sf->params.end(), [](const Param &p) {
+            return p.type && (p.type->kind == TY_GENERIC || p.type->kind == TY_INT || p.type->kind == TY_FLT);
+        });
+        if (scalars && !sf->params.empty() && plain(sf->body)) sf->checkfree = true;
+    }
+}
+
 }  // namespace goose
