@@ -65,7 +65,8 @@ one -- with its arguments, its stdin, and its C header, which the Go
 backend takes a Go port of -- each run in a directory of its own: the runs
 must agree on stdout and the exit code, and on stderr, the sample's
 timings, once its numbers are masked, and print what samples/expected/
-holds (Runner.sample). A program with workers needs a C compiler for its
+holds, where it holds the sample's output (Runner.sample). A program with
+workers needs a C compiler for its
 reference, which a JIT run cannot build; without one it is counted, not
 run.
 
@@ -2173,7 +2174,10 @@ class Runner:
         The runs must agree on stdout and the exit code, and on stderr once
         each number in it is masked: a sample's stderr is its timings, which
         no two runs share. The Go's stdout at -O2 must be what
-        samples/expected/ holds, and the two report the same data stacks."""
+        samples/expected/ holds, where it holds the sample's output (one it
+        does not is judged by its parity with the C run alone, as
+        run_samples.py judges it), and the two report the same data
+        stacks."""
         out = []
         name = f"sample-{src.stem}"
         bare = re.sub(r"^\d+_", "", src.stem)
@@ -2237,12 +2241,15 @@ class Runner:
                                         f"--- go (exit {ig[0]}):\n{ig[1][-2000:]}{ig[2]}"))
                         else:
                             out.append(("ok", f"run {label} --go-runtime=import", None))
+                    # A sample samples/expected/ holds no output for is
+                    # judged by its parity with the C run alone, as
+                    # run_samples.py judges it.
                     exp = src.parent / "expected" / f"{bare}.out"
                     want = tc.decode(exp.read_bytes()) if exp.exists() else None
-                    if want is None or got[1].rstrip("\n") != want.rstrip("\n"):
+                    if want is not None and got[1].rstrip("\n") != want.rstrip("\n"):
                         out.append(("fail", f"expected samples/{src.name} (Go -O2)",
                                     f"--- got:\n{got[1]}\n--- want:\n{want}"))
-                    else:
+                    elif want is not None:
                         out.append(("ok", f"expected samples/{src.name}", None))
         self.stacks(src, name, [], out)
         return out
