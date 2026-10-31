@@ -135,8 +135,19 @@ inline void CodeGenGo::St(const GoLoc &l, const string &x) {
 }
 
 // The helpers that read and write a value of type t at an address that may
-// be unaligned: a copy of its bytes through a variable of its Go type,
-// which Go compiles to a few loads and stores.
+// be unaligned (issue #62). A load is Go's own where the address is aligned
+// as Go aligns the type, which is where a Go []string's strings and most
+// values lie, one load of each word into a register; elsewhere it copies
+// the bytes through a variable of the type. A store writes the bytes, never
+// the type: a typed store of a Go pointer is one Go's write barrier sees,
+// which reads the slot's old bytes as a pointer, and a data stack's bytes
+// may be anything. A slice's are its two words, as integers; any other
+// value's are copied from a variable of its type. The copies are of a
+// struct of the bytes (gsBytes<n>), whose alignment is 1, as checkptr
+// requires where an address may be unaligned, and no array: Go copies an
+// array between addresses that may overlap with a call of runtime.memmove
+// where it is longer than Go moves inline (8 bytes on arm64), and moves a
+// struct inline.
 inline string CodeGenGo::LdStFn(TypeExpr *t, bool store) {
     auto &ti = TI(t, t->line);
     auto it = ldstfns.find(ti.name);
@@ -144,13 +155,32 @@ inline string CodeGenGo::LdStFn(TypeExpr *t, bool store) {
         auto m = Mangle(t);
         auto ld = Unique(cat("gsLd_", m)), st = Unique(cat("gsSt_", m));
         it = ldstfns.emplace(ti.name, pair<string, string> { ld, st }).first;
-        Append(ldstcode, "// A ", ti.name, " where it may lie unaligned, byte for byte.\nfunc ", ld,
-               "(p unsafe.Pointer) (v ", ti.name, ") {\n\t*(*[", ti.size,
-               "]byte)(unsafe.Pointer(&v)) = *(*[", ti.size, "]byte)(p)\n\treturn\n}\n\nfunc ", st,
-               "(p unsafe.Pointer, v ", ti.name, ") {\n\t*(*[", ti.size, "]byte)(p) = *(*[", ti.size,
-               "]byte)(unsafe.Pointer(&v))\n}\n\n");
+        auto raw = BytesStruct(ti.size);
+        Append(ldstcode, "// A ", ti.name, " where it may lie unaligned: Go's own load where it lies where\n"
+               "// Go aligns one, a copy of its bytes elsewhere.\nfunc ", ld, "(p unsafe.Pointer) ", ti.name,
+               " {\n\tif uintptr(p)&", ti.align - 1, " == 0 {\n\t\treturn *(*", ti.name, ")(p)\n\t}\n\tvar v ",
+               ti.name, "\n\t*(*", raw, ")(unsafe.Pointer(&v)) = *(*", raw, ")(p)\n\treturn v\n}\n\n");
+        if (ti.name == "GsSlice")
+            Append(ldstcode, "// A GsSlice stored where it may lie unaligned: its words, as integers.\nfunc ", st,
+                   "(p unsafe.Pointer, v GsSlice) {\n\t*(*uintptr)(p) = uintptr(v.Data)\n"
+                   "\t*(*int64)(unsafe.Add(p, 8)) = v.Len\n}\n\n");
+        else
+            Append(ldstcode, "// A ", ti.name, " stored where it may lie unaligned: a copy of its bytes.\nfunc ", st,
+                   "(p unsafe.Pointer, v ", ti.name, ") {\n\t*(*", raw, ")(p) = *(*", raw,
+                   ")(unsafe.Pointer(&v))\n}\n\n");
     }
     return store ? it->second.second : it->second.first;
+}
+
+// The struct of n bytes the copies of LdStFn move a value's bytes as.
+inline string CodeGenGo::BytesStruct(int64_t n) {
+    auto it = bytestypes.find(n);
+    if (it != bytestypes.end()) return it->second;
+    auto name = Unique(cat("gsBytes", n));
+    bytestypes[n] = name;
+    Append(ldstcode, "// The bytes of a value of ", n, ", which Go copies as a struct, whatever their\n"
+           "// address.\ntype ", name, " struct {\n\tb [", n, "]byte\n}\n\n");
+    return name;
 }
 
 inline void CodeGenGo::CopyElemBytes(const string &dst, const string &src, const string &n,

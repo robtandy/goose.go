@@ -406,11 +406,15 @@ struct CodeGenGo {
     GoLoc AtRef(const string &x, TypeExpr *rt);
     GoLoc PinLoc(const GoLoc &l);
     // A place's value, and a store into it: where it holds Go pointers at
-    // an address (GoLoc::unal), byte for byte through gsLd_/gsSt_ helpers,
-    // which have alignment 1 and leave the collector nothing to see.
+    // an address (GoLoc::unal), through gsLd_/gsSt_ helpers, a load Go's
+    // own where the address is aligned, the rest byte for byte, at
+    // alignment 1, which leaves the collector and the write barrier nothing
+    // to see (issue #62).
     string Ld(const GoLoc &l);
     void St(const GoLoc &l, const string &x);
     string LdStFn(TypeExpr *t, bool store);
+    unordered_map<int64_t, string> bytestypes;   // Size -> its gsBytes<n> struct.
+    string BytesStruct(int64_t n);
     // n elements of esize bytes copied (memmove) or zeroed, byte for byte,
     // as elements holding Go pointers that may lie unaligned must be.
     void CopyElemBytes(const string &dst, const string &src, const string &n, int64_t esize);
