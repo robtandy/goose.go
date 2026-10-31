@@ -14,6 +14,12 @@
 // as they are into any other function (DESIGN.md §3.14). run_go_tests.py checks that
 // the Go function of each recursive fn an `// inlined:` line annotates calls
 // none of the Go functions of the helpers it names (Runner.cycles).
+//
+// Each string's header is read where the []string holds it with one typed
+// load of its words, which was a call of runtime.memmove (issue #62): the
+// code Go makes of each export fn an `// asm: no calls` line annotates calls
+// nothing, for arm64 and amd64, which run_go_tests.py checks
+// (Runner.call_asm).
 import std;
 
 // The tags equal to tag.
@@ -26,6 +32,7 @@ export fn count_tag(tags: const (const u8[:])[:], tag: const u8[:]) -> i64 {
 }
 
 // The bytes of all the tags.
+// asm: no calls
 export fn total_len(tags: const (const u8[:])[:]) -> i64 {
     var n = 0;
     for t in tags { n += t.len; }
@@ -34,6 +41,7 @@ export fn total_len(tags: const (const u8[:])[:]) -> i64 {
 
 // The longest tag, the first of those as long, viewed in place: empty where
 // there is none.
+// asm: no calls
 export fn longest(tags: const (const u8[:])[:]) -> const u8[:] {
     if tags.len == 0 { return ""; }
     var best = 0;

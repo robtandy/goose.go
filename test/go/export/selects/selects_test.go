@@ -124,6 +124,17 @@ func TestReductions(t *testing.T) {
 				if got := ClampSum(xs, b[0], b[1]); got != want {
 					t.Errorf("ClampSum(%v, %d, %d) = %d, want %d", xs, b[0], b[1], got, want)
 				}
+				// In a checkfree fn (issue #62).
+				want = fold(xs, 0, func(s, x int64) int64 { return s + stdClamp(x, b[0], b[1]) + stdAbs(x) + stdSign(x) })
+				if got := ChoicesSum(xs, b[0], b[1]); got != want {
+					t.Errorf("ChoicesSum(%v, %d, %d) = %d, want %d", xs, b[0], b[1], got, want)
+				}
+			}
+			for _, hi := range []int64{0, 7, math.MinInt64, math.MaxInt64} {
+				want := fold(xs, math.MinInt64, func(m, x int64) int64 { return stdMax(m, stdMin(x, hi)) })
+				if got := CappedMax(xs, hi); got != want {
+					t.Errorf("CappedMax(%v, %d) = %d, want %d", xs, hi, got, want)
+				}
 			}
 		}
 		u64 := ints[uint64](r, n)

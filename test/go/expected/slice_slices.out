@@ -1,0 +1,45 @@
+local: 3 slices, 5 bytes
+  0 [ab] 2
+  1 [cde] 3
+  2 [] 0
+local reversed: 3 slices, 5 bytes
+  0 [] 0
+  1 [cde] 3
+  2 [ab] 2
+field: 3 slices, 6 bytes
+  0 [xy] 2
+  1 [zzz] 3
+  2 [w] 1
+field written: 3 slices, 10 bytes
+  0 [xy] 2
+  1 [quux] 4
+  2 [quux] 4
+longest quux
+pick cde 3
+field reversed: 3 slices, 10 bytes
+  0 [quux] 4
+  1 [quux] 4
+  2 [xy] 2
+tag 7, equal true false true true
+variable: 4 slices, 17 bytes
+  0 [one] 3
+  1 [three] 5
+  2 [five] 4
+  3 [seven] 5
+longest at 1: three
+kept: 4 slices, 10 bytes
+  0 [quux] 4
+  1 [quux] 4
+  2 [xy] 2
+  3 [] 0
+kept reversed: 4 slices, 10 bytes
+  0 [] 0
+  1 [xy] 2
+  2 [quux] 4
+  3 [quux] 4
+copies: 4 slices, 10 bytes
+  0 [] 0
+  1 [xy] 2
+  2 [quux] 4
+  3 [quux] 4
+bytes 1 true false
