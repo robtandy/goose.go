@@ -35,16 +35,19 @@ Targeting Go's runtime (moving goroutine stacks, M:N thread scheduling, garbage 
 
 ### Key Design Highlights
 
-1. **Goroutine-Safe Pooled `*GsStackBlock` (No TLS):**
-   Because Go multiplexes goroutines onto OS threads and preempts/migrates them across calls, global or OS-thread-local Data Stack pointers cannot be used safely by concurrent Go callers. Each `export fn` either leases a `*GsStackBlock` from an internal pool for the duration of the call (`FuncName`) or accepts a caller-owned `*GsStackBlock` (`FuncNameWithStack(gs, ...)`), rewinding the stacks on return with zero heap allocations.
+1. **Goroutine-Safe Pooled `*GsStackBlock` (No OS Thread-Local Storage):**
+   In `goose-c`, Data Stack pointers live in C globals or OS thread-local storage (`__thread`). Because Go's M:N scheduler multiplexes thousands of goroutines onto OS threads and migrates them at preemption points, OS thread-local storage cannot be used safely. Instead, each `export fn` either leases a `*GsStackBlock` from an on-demand pool for the duration of the call (`FuncName`) or accepts a caller-owned `*GsStackBlock` (`FuncNameWithStack(gs, ...)`). Only goroutines *actively executing* a non-leaf Goose call hold a block—if 10,000 goroutines exist in a Go server but at most 16 run a Goose function concurrently, at most 16 `*GsStackBlock`s are ever mapped.
 
 2. **Two-Tier Local Allocation (`gs.Frame` vs. Register Locals):**
-   Go grows a goroutine's stack by allocating a new stack segment and moving existing frames, which invalidates raw `unsafe.Pointer` references to Go stack variables (`-gcflags=all=-d=checkptr`). `goose.go` keeps pure scalar and slice variables in native Go locals (CPU registers), including inlined by-ref scalar parameters, while placing any local whose address escapes into a Goose reference (`&local`, fixed arrays `T[N]`, or composite structs with pointer-bearing fields) onto `gs.Frame`, an `mmap`-backed fixed-frame stack inside `*GsStackBlock`.
+   Go grows a goroutine's stack by allocating a new stack segment and moving existing frames, which invalidates raw `unsafe.Pointer` references to Go stack variables (`-gcflags=all=-d=checkptr`). `goose.go` keeps pure scalar and slice variables in native Go locals (CPU registers), including inlined by-ref scalar parameters, while placing any local whose address escapes into a Goose reference (`&local`, fixed arrays `T[N]`, or composite structs with pointer-bearing fields) onto `gs.Frame`—a single contiguous `mmap` call-frame stack inside `*GsStackBlock` (64 MB virtual reservation by default in libraries, backed by physical RAM only for touched pages) that bumps on function entry (`gs_sp := gs.Frame; gs.Frame += frameBytes`) and rewinds in one instruction on return (`gs.Frame = gs_sp`).
 
-3. **Zero-Copy Go Slice & `[]string` Interop:**
+3. **Runtime Fork-Join Concurrency (`worker` / `spawn` / `join` → Go Goroutines):**
+   Goose's native concurrency primitives (`worker fn`, `spawn`, and `join`, including spawning a dynamic number of workers in a loop at runtime) compile to Go goroutines (`runtime/go/workers.go`). Each `spawn` allocates a child `*GsStackBlock`, deep-copies the worker's inputs onto the child's Data Stacks, and runs the worker in a new goroutine; `join` copies the result back onto the parent's Data Stack, releases the child block, and re-raises any worker `*GsError` panic in the joining goroutine. Goose's typechecker statically forbids sharing mutable references across `spawn`, guaranteeing data-race freedom (`go test -race`).
+
+4. **Zero-Copy Go Slice & `[]string` Interop:**
    A Goose `const u8[:]` (`GsSlice{Data unsafe.Pointer, Len int64}`) has the exact 16-byte `{ptr, len}` memory layout of a Go `string`. `goose.go` exploits this so `export fn` entry points view Go `string`, `[]byte`, `[]T`, and even `[]string` (`const (const u8[:])[:]`) directly in place without copying or allocating.
 
-4. **`gc`-Friendly Machine Code:**
+5. **`gc`-Friendly Machine Code:**
    Go's compiler (`gc`) uses a strict 80-node inlining budget (which drops to 20 inside functions over 5,000 AST nodes) and spills registers across non-inlined helper calls unless it sees an explicit `panic(...)` statement on the cold branch. `goose.go` emits inline syntactic `panic` checks, direct `*(*GsSlice)(p)` and `*(*uint64)(p)` loads/stores, `CSEL`/`CMOV`-friendly `min`/`max` selects, and static Go array literals for `const` tables.
 
 ---
