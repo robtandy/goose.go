@@ -14,7 +14,7 @@ When integrating Goose into Go services, compiling `.goose` to C and calling it 
 
 `--target=go` compiles typechecked, bounds-check-eliminated Goose directly to pure Go:
 - **Zero `cgo` overhead:** Generated functions are ordinary Go functions that inline directly into Go callers (`go build -gcflags=-m`), viewing Go `[]T`, `[]byte`, `string`, and `[]string` in place.
-- **Zero Go GC heap allocations or write barriers:** Dynamic Data Stacks live in `syscall.Mmap` virtual memory outside the Go heap and use `noscan` representations (`int64` offsets and raw bytes).
+- **Zero Go GC heap allocations in steady state (`0 B/op, 0 allocs/op`):** All Goose dynamic data structures (`T[>..]`, strings, builders, pools) and address-taken locals (`gs.Frame`) live in `syscall.Mmap` virtual memory outside the Go heap using `noscan` representations (`int64` offsets and raw bytes), with the Go heap used only for cold-path runtime bookkeeping (initial `*GsStackBlock` pool headers, `spawn` goroutine handles, and `*GsError` panics—much as `goose-c` uses `malloc` for `spawn` task packets).
 - **Compile-time memory safety:** Goose's typechecker proves all reference roots, aliasing, lifetimes, and slice bounds before Go code is emitted.
 
 ---
