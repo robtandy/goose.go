@@ -8,7 +8,8 @@ import are in programs/modules/), is
    first line names (`// goose-flags: --debug`), at -O2 and at -O0, where
    nothing is inlined;
 2. checked with `go vet`, which must find nothing;
-3. built with `go build` and run;
+3. built with `go build` and run, reading <name>.stdin as its standard
+   input where that is beside it, as every run of it below does;
 4. compiled with the C backend as well, with the same flags and at the same
    level (`goose -o <name>.c --standalone` and the C compiler
    scripts/toolchain.py finds, or TinyCC in the compiler's own process where
@@ -71,7 +72,9 @@ reference, which a JIT run cannot build; without one it is counted, not
 run.
 
 A few checks of the command line follow: the target -o out.go implies, `goose
-run --target=go` and `goose build --target=go`, --go-package and --library.
+run --target=go` and `goose build --target=go`, --go-package and --library;
+and README.md must name the commit of aardappel/goose that vendor/goose is
+at, whole and with its date, upstream tagging no versions yet (issue #1).
 
 The code Go makes of the wide loads and stores of test/go/export/wide/
 (issue #23) is read for arm64 and for amd64, which Go cross-compiles to with
@@ -1818,6 +1821,10 @@ class Runner:
         name = src.stem
         flags = goose_flags(src)
         out = []
+        # A program that reads its standard input has it beside it,
+        # <name>.stdin, which every run of it reads, the C's and the Go's.
+        stdin = src.with_suffix(".stdin")
+        stdin = stdin if stdin.exists() else None
         # At -O2 and at -O0, where nothing is inlined, each against the C
         # backend's build at the same level: --debug checks the operations as
         # the optimizations leave them, so a tail loop's accumulator can
@@ -1826,7 +1833,7 @@ class Runner:
         for level in ("2", "0"):
             label = f"{name} -O{level}"
             lflags = flags + [f"-O{level}"]
-            ref = refs[level] = self.c_run(src, f"{name}-O{level}", lflags, out)
+            ref = refs[level] = self.c_run(src, f"{name}-O{level}", lflags, out, stdin=stdin)
             # At -O2, the build with Go's unsafe.Pointer checks runs too.
             exes = self.go_program(src, f"{name}-O{level}", lflags, out, checkptr=level == "2")
             if exes is None or ref is None:
@@ -1834,7 +1841,7 @@ class Runner:
             if not isinstance(exes, tuple):
                 exes = (exes,)
             for exe, kind in zip(exes, ("", " -d=checkptr")):
-                got = tc.run_capture([exe])
+                got = tc.run_capture([exe], stdin_path=stdin)
                 same = True
                 for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
                                    ("stderr", got[2], ref[2])):
@@ -1859,7 +1866,7 @@ class Runner:
                 exe = self.go_program(src, f"{name}-O{level}-unexported", lflags + [how], out)
             if exe is None:
                 continue
-            got = tc.run_capture([exe])
+            got = tc.run_capture([exe], stdin_path=stdin)
             bad = [what for what, g, c in (("exit code", got[0], ref[0]), ("stdout", got[1], ref[1]),
                                            ("stderr", got[2], ref[2])) if g != c]
             if bad:
@@ -3742,6 +3749,20 @@ class Runner:
 
     # --- the command line ----------------------------------------------------
 
+    def upstream_commit(self):
+        """The commit of aardappel/goose that vendor/goose is at, which the
+        README names, whole and with its date, since upstream tags no
+        versions yet (issue #1): vendor/goose moved without the README is a
+        failure."""
+        code, o, e = run_capture(["git", "-C", UPSTREAM, "log", "-1", "--format=%H %cs"])
+        if code != 0 or len(o.split()) != 2:
+            return [("fail", "the commit vendor/goose is at", o + e)]
+        sha, date = o.split()
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        named = f"https://github.com/aardappel/goose/commit/{sha}" in readme and date in readme
+        return [("ok" if named else "fail", f"README.md names vendor/goose's commit {sha[:8]} ({date})",
+                 None if named else f"README.md does not name {sha} and its date, {date}")]
+
     def cli(self):
         out = []
         progs = HERE / "go" / "programs"
@@ -4169,6 +4190,7 @@ class Runner:
         for args, why in ((["--target=go", "--go-runtime=static", hello], "--go-runtime takes embed, import or full"),
                           (["--go-runtime=import", "-o", self.work / "cli-c.c", hello], "are for --target=go"),
                           (["--go-unexported", "-o", self.work / "cli-c.c", hello], "are for --target=go"),
+                          (["build", "--target=go", "--shared", hello], "--shared builds a C shared library"),
                           (["run", "--target=go", "--go-runtime=import", hello], "--go-runtime=import and"),
                           (["build", "--target=go", "--go-runtime-file", self.work / "rt.go", hello],
                            "--go-runtime-file are for the Go that -o writes"),
@@ -4334,6 +4356,7 @@ def main():
     # The command line.
     if not args.names and not args.bless:
         r.report(r.cli())
+        r.report(r.upstream_commit())
     print(f"{r.oks} ok, {len(r.failures)} failed" +
           (f", {len(r.skips)} not supported by --target=go yet" if r.skips else "") +
           (f", {len(r.known)} known differences" if r.known else ""))

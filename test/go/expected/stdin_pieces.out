@@ -1,0 +1,15 @@
+true [the first line]
+false false 0
+1: 7 [115]
+2: 14 [100]
+3: 21 [101]
+4: 28 [32]
+5: 35 [98]
+6: 42 [48]
+7: 49 [55]
+8: 56 [100]
+9: 63 [10]
+[the rest, read in pieces of seven bytes:
+0123456789 abcdefghij
+]
+false 63 false
