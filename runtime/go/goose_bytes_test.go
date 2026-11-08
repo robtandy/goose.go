@@ -650,6 +650,60 @@ func TestFloatText(t *testing.T) {
 	}
 }
 
+// float_text::shortest_digits (gs_f64_digits): the digits print writes, by
+// magnitude, and the power of ten they are a fraction of, truncated to the
+// slice they go into; nothing for zero, NaN and the infinities.
+func TestF64Digits(t *testing.T) {
+	digits := func(x float64, room int) (string, int64, int64) {
+		dig := make([]byte, room)
+		point := int64(-12345)
+		n := GsF64Digits(x, GsSlice{Data: unsafe.Pointer(unsafe.SliceData(dig)), Len: int64(room)}, &point)
+		return string(dig[:n]), n, point
+	}
+	cases := []struct {
+		v     float64
+		dig   string
+		point int64
+	}{
+		{0.1, "1", 0}, {1.5, "15", 1}, {-1.5, "15", 1}, {123.45, "12345", 3}, {100.0, "1", 3},
+		{0.30000000000000004, "30000000000000004", 0}, {5e-324, "5", -323}, {1e-310, "1", -309},
+		{1.7976931348623157e308, "17976931348623157", 309}, {2.2250738585072014e-308, "22250738585072014", -307},
+		{1e20, "1", 21}, {math.Ldexp(1, 49) + 0.25, "5629499534213122", 15}, {-0.000125, "125", -3},
+	}
+	for _, c := range cases {
+		if d, n, point := digits(c.v, 17); d != c.dig || n != int64(len(c.dig)) || point != c.point {
+			t.Errorf("%v: %q (%d) point %d, want %q point %d", c.v, d, n, point, c.dig, c.point)
+		}
+	}
+	for _, v := range []float64{0, math.Copysign(0, -1), math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if d, n, point := digits(v, 17); n != 0 || d != "" || point != -12345 {
+			t.Errorf("%v: %q (%d) point %d, want no digits and point untouched", v, d, n, point)
+		}
+	}
+	// A slice shorter than the digits takes their first ones; the point is
+	// the value's still.
+	if d, n, point := digits(0.30000000000000004, 5); d != "30000" || n != 5 || point != 0 {
+		t.Errorf("into 5 bytes: %q (%d) point %d", d, n, point)
+	}
+	// The digits are print's, and read back as the value.
+	seed := lcg(11)
+	for i := 0; i < 20000; i++ {
+		x := math.Float64frombits(seed.rand64())
+		if math.IsNaN(x) || math.IsInf(x, 0) || x == 0 {
+			continue
+		}
+		d, n, point := digits(x, 17)
+		back, err := strconv.ParseFloat("0."+d+"e"+strconv.FormatInt(point, 10), 64)
+		if err != nil || back != math.Abs(x) || n < 1 || n > 17 || d[0] == '0' || d[n-1] == '0' {
+			t.Fatalf("%v: digits %q point %d", x, d, point)
+		}
+		text := string(gsAppendFloat(nil, math.Abs(x), false))
+		if strings.Trim(strings.ReplaceAll(strings.SplitN(text, "e", 2)[0], ".", ""), "0") != d {
+			t.Fatalf("%v: digits %q, print's %q", x, d, text)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Wide loads and stores (issue #62): each the integer encoding/binary reads
 // at every offset of a buffer on a data stack, in both orders, and each

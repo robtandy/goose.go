@@ -1,6 +1,7 @@
 package goose
 
 import (
+	"syscall"
 	"testing"
 	"unsafe"
 )
@@ -981,6 +982,158 @@ func TestSlicePoolTreeCorrupt(t *testing.T) {
 		c.edit(p)
 		if got := abortText(func() { c.action(p) }); got != want {
 			t.Errorf("%s edited: %q, want %q", c.what, got, want)
+		}
+		gs.Close()
+	}
+}
+
+// trim is slice_pool's trim of a pool of bytes (slice_pool.goose): the pool's
+// array viewed as bytes, of elements of esz bytes.
+func (p *checkedPool) trim() bool {
+	items := GsSlice{Data: p.elems.Base, Len: p.elems.Len * p.esz}
+	return GsSlicePoolTrim(p.gs, p.ref(), p.tp(), items, p.esz, &p.at)
+}
+
+// A slice pool's trim gives back the complete pages inside every free span,
+// which read back as zeros, and keeps every byte of every page that holds a
+// live element: the pages a free span shares with a live run at either end,
+// and the edge two freed runs merged across, deep in their span, given back
+// as well. A tree of more than a leaf is walked whole.
+func TestSlicePoolTrim(t *testing.T) {
+	page := int64(syscall.Getpagesize())
+	gs := NewStackBlock(2, 64<<20, 64<<10)
+	defer gs.Close()
+	p := newCheckedPool(gs, 0, 1, 1)
+	if !p.trim() {
+		t.Fatal("trim of a pool with no tree failed")
+	}
+	bytes := func(at, n int64) []byte { return unsafe.Slice((*byte)(unsafe.Add(p.elems.Base, at)), n) }
+	fill := func(at, n int64, v byte) {
+		for i := range bytes(at, n) {
+			bytes(at, n)[i] = v
+		}
+	}
+	// What each byte must hold once the free spans are trimmed: the value it
+	// was filled with, or zero where its page lies inside a free span.
+	type run struct {
+		at, n int64
+		v     byte
+		freed bool
+	}
+	check := func(what string, runs []run) {
+		t.Helper()
+		base := int64(uintptr(p.elems.Base) % uintptr(page))
+		for _, r := range runs {
+			// The span a freed run is in: freed neighbours merge.
+			lo, hi := r.at, r.at+r.n
+			for _, o := range runs {
+				if r.freed && o.freed && o.at == hi {
+					hi += o.n
+				}
+				if r.freed && o.freed && o.at+o.n == lo {
+					lo = o.at
+				}
+			}
+			for i, b := range bytes(r.at, r.n) {
+				pg := (base+r.at+int64(i))/page*page - base
+				want := r.v
+				if r.freed && pg >= lo && pg+page <= hi {
+					want = 0
+				}
+				if b != want {
+					t.Fatalf("%s: byte %d of the run at %d holds %d, want %d", what, i, r.at, b, want)
+				}
+			}
+		}
+	}
+	sizes := []int64{10007, 300001, 300003, 10009}
+	var runs []run
+	for i, n := range sizes {
+		runs = append(runs, run{p.alloc(n), n, byte(i + 1), false})
+		fill(runs[i].at, n, byte(i+1))
+	}
+	if !p.trim() {
+		t.Fatal("trim with nothing free failed")
+	}
+	check("nothing free", runs)
+	for _, i := range []int{1, 2} {
+		p.free(runs[i].at, runs[i].n)
+		runs[i].freed = true
+	}
+	if !p.trim() || !p.trim() {
+		t.Fatal("trim failed")
+	}
+	check("two merged runs freed", runs)
+	if b := bytes(runs[2].at-1, 2); b[0] != 0 || b[1] != 0 {
+		t.Fatalf("the edge the freed runs merged across holds %v", b)
+	}
+	if at := p.alloc(600004); at != runs[1].at {
+		t.Fatalf("the merged span reused at %d, want %d", at, runs[1].at)
+	}
+
+	gs2 := NewStackBlock(2, 64<<20, 64<<10)
+	defer gs2.Close()
+	p = newCheckedPool(gs2, 0, 1, 1)
+	runs = runs[:0]
+	for i := 0; i < 100; i++ {
+		l, f := run{p.alloc(1000), 1000, 7, false}, run{p.alloc(140000), 140000, 8, false}
+		fill(l.at, l.n, 7)
+		fill(f.at, f.n, 8)
+		runs = append(runs, l, f)
+	}
+	for i := range runs {
+		if i%2 == 1 {
+			p.free(runs[i].at, runs[i].n)
+			runs[i].freed = true
+		}
+	}
+	if p.tree.height < 1 {
+		t.Fatalf("100 free spans in a tree of height %d", p.tree.height)
+	}
+	if !p.trim() {
+		t.Fatal("trim of a tree of height 1 failed")
+	}
+	check("100 spans", runs)
+}
+
+// A trim checks the tree as it walks it: a span past the pool's length, a
+// child leading back to a node already visited, and a height past any path
+// abort with GS_E_SPANTREE where the program called slice_pool, a span past
+// the length before anything is discarded.
+func TestSlicePoolTrimCorrupt(t *testing.T) {
+	const want = "goose runtime error: slice pool span tree is corrupt (pool.goose:3)"
+	cases := []struct {
+		what string
+		edit func(p *checkedPool)
+	}{
+		{"a span's count", func(p *checkedPool) {
+			(*gsSpLeaf)(unsafe.Add(p.nodes.Base, p.tree.root*GsSpanNode)).cnt[0] = p.elems.Len * 2
+		}},
+		{"a span's index", func(p *checkedPool) {
+			(*gsSpLeaf)(unsafe.Add(p.nodes.Base, p.tree.root*GsSpanNode)).idx[0] = -1
+		}},
+		{"a cycle", func(p *checkedPool) {
+			p.tree.height = 1
+			(*gsSpInner)(unsafe.Add(p.nodes.Base, p.tree.root*GsSpanNode)).child[0] = p.tree.root
+		}},
+		{"a height", func(p *checkedPool) { p.tree.height = 1000 }},
+	}
+	for _, c := range cases {
+		gs := NewStackBlock(2, 64<<20, 64<<10)
+		p := newCheckedPool(gs, 0, 1, 1)
+		at := p.alloc(1 << 20)
+		p.alloc(4)
+		ones := unsafe.Slice((*byte)(p.elems.Base), 1<<20)
+		for i := range ones {
+			ones[i] = 1
+		}
+		p.free(at, 1<<20)
+		c.edit(p)
+		if got := abortText(func() { p.trim() }); got != want {
+			t.Errorf("%s edited: %q, want %q", c.what, got, want)
+		}
+		if c.what == "a span's count" && ones[len(ones)/2] != 1 {
+			t.Errorf("%s edited: a page discarded before the abort", c.what)
 		}
 		gs.Close()
 	}
