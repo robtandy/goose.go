@@ -1,10 +1,14 @@
 # Proposal: mark std's choices of scalars `checkfree`
 
-Status: a draft for upstream Goose ([aardappel/goose](https://github.com/aardappel/goose)),
-**not filed**: goose.go's maintainer files it. It comes from goose.go's issue #62,
-and is written against upstream at `2ed1a63d`, the `vendor/goose` this
-repository builds with. Until upstream has it, goose.go's `--target=go` makes
-the change for itself (§4).
+Status: **adopted upstream.** A draft for upstream Goose
+([aardappel/goose](https://github.com/aardappel/goose)) from goose.go's issue #62,
+written against upstream at `2ed1a63d`. Upstream marks these functions
+`checkfree` itself since
+[`d2de07bf`](https://github.com/aardappel/goose/commit/d2de07bf2569835c9ce1554e800814e6cb39ac34) ("Mark std's,
+math's and vec's small helpers checkfree"), with std's `abs` of a float now
+libm's `fabs`, an `extern fn`, which a `checkfree fn` may call; `vendor/goose`
+has it since goose.go's issue #1 (`f4637bfb`), which deleted goose.go's interim
+(§4), as planned there. The rest is kept as it was written.
 
 ## 1. The problem
 

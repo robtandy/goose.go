@@ -1894,9 +1894,6 @@ int Main(int argc, char **argv) {
         // nothing does to C (issue #42): the checker's check of an export's
         // boundary, C's, refuses them, so they are checked as Go's instead.
         auto goexports = gotarget ? HideGoExports(ast) : vector<SFunction *>();
-        // std's choices of scalars, min and max among them, which a checkfree
-        // fn may call under --target=go (issue #62).
-        if (gotarget) GoCheckfreeChoices(ast);
         try {
             TypeCheckProgram(ast, library, (nocgen && !gocheck) || golib);
         } catch (...) {
