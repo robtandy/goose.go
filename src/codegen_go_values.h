@@ -989,6 +989,8 @@ inline void CodeGenGo::GenAny(Node *n, const GoDst &d) {
         case NK_StructDecl: case NK_EnumDecl: case NK_AliasDecl: return;
         case NK_FunVal: Fail(n->line, "internal: function value emitted");
         case NK_ConstFor: Fail(n->line, "internal: unexpanded const for");
+        case NK_ConstIf: Fail(n->line, "internal: unexpanded const if");
+        case NK_ConstQuery: Fail(n->line, "internal: unexpanded const if query");
         default: LeafAny(n, d); return;
     }
 }

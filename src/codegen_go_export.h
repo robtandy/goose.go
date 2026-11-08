@@ -4,9 +4,10 @@
 // program's extern fns call into.
 //
 // * An extern fn calls the Go its C symbol names. The C runtime's functions
-//   std, math and os bind (gs_sqrt, gs_find_any, gs_os_read_file, ...) and
-//   the C library's that Go's math package has (floor, sinf, ...) are the Go
-//   runtime's and Go's own; any other symbol is a Go function of the
+//   std, math, binary and os bind (gs_sqrt, gs_rotl32, gs_find_any,
+//   gs_os_read_file, ...) and the C library's that Go's math package has
+//   (floor, sinf, ...) are the Go runtime's and Go's own, math's and
+//   math/bits'; any other symbol is a Go function of the
 //   generated file's package, which an --include file (or a file beside the
 //   generated one) defines, called directly: scalars as Go's own types, a
 //   fixed-size value as its Go type, a plain reference as a pointer to it, a
@@ -136,6 +137,14 @@ static const GoLibmFn go_libm[] = {
     { "gs_log2", "math.Log2", 1, false },   { "gs_log2f", "math.Log2", 1, true },
     { "gs_log10", "math.Log10", 1, false }, { "gs_log10f", "math.Log10", 1, true },
     { "gs_pow", "math.Pow", 2, false },     { "gs_powf", "math.Pow", 2, true },
+    { "gs_hypot", "math.Hypot", 2, false }, { "gs_hypotf", "math.Hypot", 2, true },
+    { "gs_cbrt", "math.Cbrt", 1, false },   { "gs_cbrtf", "math.Cbrt", 1, true },
+    { "gs_exp2", "math.Exp2", 1, false },   { "gs_exp2f", "math.Exp2", 1, true },
+    { "gs_expm1", "math.Expm1", 1, false }, { "gs_expm1f", "math.Expm1", 1, true },
+    { "gs_log1p", "math.Log1p", 1, false }, { "gs_log1pf", "math.Log1p", 1, true },
+    { "gs_sinh", "math.Sinh", 1, false },   { "gs_sinhf", "math.Sinh", 1, true },
+    { "gs_cosh", "math.Cosh", 1, false },   { "gs_coshf", "math.Cosh", 1, true },
+    { "gs_tanh", "math.Tanh", 1, false },   { "gs_tanhf", "math.Tanh", 1, true },
     // x * y + z rounded once, as C's is on arm64 (and x86-64 built for FMA):
     // Go has FMA everywhere (§7.12 leaves it to the implementation).
     { "gs_mul_add", "math.FMA", 3, false }, { "gs_mul_addf", "GsMulAddF32", 3, true },
@@ -152,6 +161,8 @@ static const GoLibmFn go_libm[] = {
     { "tanh", "math.Tanh", 1, false },      { "tanhf", "math.Tanh", 1, true },
     { "exp", "math.Exp", 1, false },        { "expf", "math.Exp", 1, true },
     { "exp2", "math.Exp2", 1, false },      { "exp2f", "math.Exp2", 1, true },
+    { "expm1", "math.Expm1", 1, false },    { "expm1f", "math.Expm1", 1, true },
+    { "log1p", "math.Log1p", 1, false },    { "log1pf", "math.Log1p", 1, true },
     { "log", "math.Log", 1, false },        { "logf", "math.Log", 1, true },
     { "log2", "math.Log2", 1, false },      { "log2f", "math.Log2", 1, true },
     { "log10", "math.Log10", 1, false },    { "log10f", "math.Log10", 1, true },
@@ -177,7 +188,8 @@ static bool GoOsFn(string_view c) {
         "gs_os_read_file", "gs_os_write_file", "gs_os_write_file_atomic", "gs_os_append_file",
         "gs_os_file_exists", "gs_os_remove_file", "gs_os_rename_file", "gs_os_make_dir",
         "gs_os_is_dir", "gs_os_remove_dir", "gs_os_list_dir", "gs_os_read_line",
-        "gs_os_read_stdin", "gs_os_write_stdout", "gs_os_write_stderr", "gs_os_flush_stdout",
+        "gs_os_read_stdin", "gs_os_read_stdin_max", "gs_os_write_stdout", "gs_os_write_stderr",
+        "gs_os_flush_stdout",
         "gs_os_arg_count", "gs_os_arg", "gs_os_getenv", "gs_os_resource_dir", "gs_os_time_ns",
         "gs_os_clock_ns", "gs_os_sleep_ms", "gs_os_random_u64", "gs_trim_memory",
     };
@@ -231,6 +243,33 @@ inline bool CodeGenGo::GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a,
         x = cat("int64(bits.", fn, "(", a[0], "))");
         return true;
     }
+    // binary's floats from their bits and back, which Go's math keeps
+    // exactly, NaN payloads included, and std's byte swaps, math/bits'.
+    static const pair<const char *, const char *> onearg[] = {
+        { "gs_f32_from_bits", "math.Float32frombits" }, { "gs_f64_from_bits", "math.Float64frombits" },
+        { "gs_f32_to_bits", "math.Float32bits" },       { "gs_f64_to_bits", "math.Float64bits" },
+        { "gs_byte_swap16", "bits.ReverseBytes16" },    { "gs_byte_swap32", "bits.ReverseBytes32" },
+        { "gs_byte_swap64", "bits.ReverseBytes64" },
+    };
+    for (auto &[cn, gn] : onearg) {
+        if (name != cn) continue;
+        if (a.size() != 1) Fail(c->line, cat("internal: ", name, " bound with another signature"));
+        x = cat(gn, "(", a[0], ")");
+        return true;
+    }
+    // std's rotations, by a count taken modulo the width, as C's gs_rotl32
+    // and Go's RotateLeft32 take it: a right one is a left one by the
+    // count's negation.
+    if (name == "gs_rotl32" || name == "gs_rotl64" || name == "gs_rotr32" || name == "gs_rotr64") {
+        if (a.size() != 2) Fail(c->line, cat("internal: ", name, " bound with another signature"));
+        x = cat("bits.RotateLeft", name.substr(7), "(", a[0], ", ", name[6] == 'r' ? "-" : "", "int(", a[1], "))");
+        return true;
+    }
+    // std's float_text::shortest_digits, the digits print writes.
+    if (name == "gs_f64_digits" && a.size() == 3) {
+        x = cat("GsF64Digits(", a[0], ", ", a[1], ", ", a[2], ")");
+        return true;
+    }
     if (name == "gs_find_any") {
         x = cat("GsFindAny(", a[0], ", ", AddrOfRef(sp->argtypes[1], a[1]), ")");
         return true;
@@ -263,7 +302,8 @@ inline bool CodeGenGo::GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a,
     // the nodes as the GsRref they are, the tree's header by its address,
     // and where the program called slice_pool, which a corrupt tree aborts
     // at (SFunction::takesloc).
-    if (name == "gs_slice_pool_place" || name == "gs_slice_pool_free" || name == "gs_slice_pool_regrow") {
+    if (name == "gs_slice_pool_place" || name == "gs_slice_pool_free" || name == "gs_slice_pool_regrow" ||
+        name == "gs_slice_pool_trim") {
         if (a.size() < 2 || sp->argtypes.size() != a.size())
             Fail(c->line, cat("internal: ", name, " bound with another signature"));
         auto list = cat("gs, ", a[0], ", ", AddrOfRef(sp->argtypes[1], a[1]));
@@ -660,8 +700,8 @@ inline bool CodeGenGo::HoldsAddr(TypeExpr *t, bool relative) {
 //   reference to one;
 // * none names a global var that can hold one;
 // * none hands one to an extern fn, but to the runtime's own that only
-//   read it (std's find_any and its pair, frexp, os's files): the Go of
-//   another may keep it anywhere;
+//   read it (std's find_any and its pair, frexp, shortest_digits, os's
+//   files): the Go of another may keep it anywhere;
 // * none takes free variables, a caller's own locals, or returns from
 //   another function (§7.9), whose values wait in globals.
 // Anything else is taken to put it where Go does not see it, and the entry
@@ -709,7 +749,8 @@ inline bool CodeGenGo::ArgsStayInGo(FnSpec *sp) {
                 for (auto v : c->fvparams) var(v);
                 if (c->builtin < 0 && c->spec && c->spec->sf->isextern && !ExportOfExtern(c->spec)) {
                     auto &name = c->spec->sf->cname;
-                    auto reads = name == "gs_find_any" || name == "gs_find_pair" || name == "frexp" || GoOsFn(name);
+                    auto reads = name == "gs_find_any" || name == "gs_find_pair" || name == "frexp" ||
+                                 name == "gs_f64_digits" || GoOsFn(name);
                     for (auto t : c->spec->argtypes) stays = stays && (reads || !HoldsAddr(t));
                 }
             }
