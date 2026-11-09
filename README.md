@@ -2,6 +2,8 @@
 
 A Go compiler backend (`--target=go`) and pure-Go `mmap` Data Stack runtime for Wouter van Oortmerssen's [Goose programming language](https://github.com/aardappel/goose).
 
+> **Upstream Goose version:** upstream Goose does not tag versions yet, so `vendor/goose` is pinned to a commit of [`aardappel/goose`](https://github.com/aardappel/goose)'s `master`. It is synced to [`f4637bfb`](https://github.com/aardappel/goose/commit/f4637bfb342fb70d42bea0474eab9e62a3c99d68) (`f4637bfb342fb70d42bea0474eab9e62a3c99d68`, committed 2026-11-08): the language, frontend and standard library this repository builds with.
+
 `goose.go` shares the entire upstream Goose frontend (`vendor/goose`: parser, typechecker, reference root & lifetime analysis, monomorphizer, inliner, bounds-check elimination, and static Data Stack slot assignment) and emits dependency-free, `gofmt`-clean Go (`CGO_ENABLED=0`) instead of C.
 
 ---
