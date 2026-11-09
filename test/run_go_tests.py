@@ -253,11 +253,12 @@ UNSUPPORTED = "is not supported by --target=go yet"
 
 # What the Go backend warns of where the C backend does not yet: a shift by a
 # constant count outside its type's width (issue #27, src/codegen_go_shifts.h),
-# which the C suite's fixtures of the masking do on purpose. The one line of
-# each is left out of the two backends' --stacks reports, which must agree on
-# the rest (Runner.stacks); test/go/warnings/ checks the warnings.
-GO_WARNING = re.compile(r"^\S.*?: warning: shift of [iu]\d+ by -?\d+ is a shift by \d+: .*\n",
-                        re.MULTILINE)
+# which the C suite's fixtures of the masking do on purpose. Each, its line
+# and the source line and caret under it that warnings show since upstream's
+# 97aa1d2c, is left out of the two backends' --stacks reports, which must
+# agree on the rest (Runner.stacks); test/go/warnings/ checks the warnings.
+GO_WARNING = re.compile(r"^\S.*?: warning: shift of [iu]\d+ by -?\d+ is a shift by \d+: .*\n"
+                        r"(?:.*\n[ \t]*\^~*\n)?", re.MULTILINE)
 
 # C suite fixtures --sweep counts as differing by design, with the reason: a
 # recursion that exhausts the native stack, which the C runtime reports as a
