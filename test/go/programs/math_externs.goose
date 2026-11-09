@@ -5,7 +5,8 @@
 // and the rest within a tolerance. math has hypot, cbrt, exp2, expm1,
 // log1p, sinh, cosh, tanh and copysign of its own since upstream's 13712d6a
 // (issue #1), which a program binding the C library's binds under names of
-// its own.
+// its own; and the rest of C99's <math.h> by C's names, which a run
+// in-process resolves since upstream's e4a73fb9.
 import math;
 
 extern fn fabs(x: f64) -> f64;
@@ -17,6 +18,18 @@ extern fn c_cbrt(x: f64) -> f64 = "cbrt";
 extern fn c_copysign(x: f64, y: f64) -> f64 = "copysign";
 extern fn c_expm1(x: f64) -> f64 = "expm1";
 extern fn c_log1pf(x: f32) -> f32 = "log1pf";
+// The rest of C99's <math.h>, which Go's math has otherwise or not at all.
+extern fn fmin(x: f64, y: f64) -> f64;
+extern fn fmaxf(x: f32, y: f32) -> f32;
+extern fn fdim(x: f64, y: f64) -> f64;
+extern fn nextafter(x: f64, y: f64) -> f64;
+extern fn lgamma(x: f64) -> f64;
+extern fn modf(x: f64, ip: f64&) -> f64;
+extern fn remquo(x: f64, y: f64, q: i32&) -> f64;
+extern fn remquof(x: f32, y: f32, q: i32&) -> f32;
+extern fn rint(x: f64) -> f64;
+extern fn scalbnf(x: f32, n: i32) -> f32;
+extern fn ilogb(x: f64) -> i32;
 
 fn main() {
     // Read from arrays, so that no value is known to the optimizer.
@@ -59,4 +72,22 @@ fn main() {
           fabs(sinh(-sp[2]) - (E - 1.0 / E) / 2.0) < 1e-12, " ", fabs(cosh(-sp[2]) - (E + 1.0 / E) / 2.0) < 1e-12, " ",
           fabsf(tanh(sf[3]) - sinh(sf[3]) / cosh(sf[3])) < 1e-6, " ", fabsf(expm1(sf[3]) - (exp(sf[3]) - 1.0)) < 1e-4, " ",
           fabs(log1p(sp[4]) - log(5.0)) < 1e-12);
+    // C99's: fmin and fmax of a quiet NaN are the number, fdim of equal
+    // infinities +0.0, nextafter of equal operands y, lgamma of -inf +inf,
+    // modf of an infinity a zero and the infinity, and remquo's quotient
+    // bits glibc's.
+    let nan = NAN;
+    let fnan: f32 = NAN;
+    print(fmin(nan, sp[3]), " ", fmin(sp[3], -sp[4]), " ", fmaxf(fnan, sf[3]), " ", fdim(inf, inf), " ",
+          fdim(sp[5], sp[3]), " ", nextafter(sp[0], sp[1]), " ", nextafter(1.0, 2.0) - 1.0 == 1.0 / 4503599627370496.0,
+          " ", lgamma(-inf), " ", lgamma(-sp[2]), " ", rint(2.5), " ", rint(-0.5), " ", scalbnf(sf[3], 4), " ",
+          ilogb(1000.0));
+    var ip = 0.0;
+    let frac = modf(-inf, ip);
+    let frac2 = modf(-3.25, ip);
+    var q: i32 = 0;
+    var qf: i32 = 0;
+    let r = remquo(29.0, sp[4], q);
+    let rf = remquof(-10.0, sf[3], qf);
+    print(frac, " ", frac2, " ", ip, " ", r, " ", q, " ", rf, " ", qf);
 }
