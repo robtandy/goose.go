@@ -1098,6 +1098,225 @@ func GsFrexp(x float64, e *int32) float64 {
 	return f
 }
 
+// The rest of C99's <math.h> that an extern fn may bind by its C name, which
+// a run in-process resolves too (upstream's e4a73fb9), where Go's math has
+// it otherwise or not at all. Each is C's at f64; an f32's is computed at
+// f64 and rounded, which is exact for these, but for GsModfF32 and
+// GsRemquoF32.
+
+// GsFmin and GsFmax, and their f32 forms, are C's fmin and fmax, IEEE 754's
+// minNum and maxNum as glibc's are: of a quiet NaN and a number, the number,
+// where math.Min and math.Max give the NaN; of two NaNs, or of a signaling
+// one, a quiet NaN, the sum's; of two zeros, -0.0 is the lesser, as math's
+// have it, and arm64's FMINNM and FMAXNM. An f32's signaling NaN is quiet
+// once it is an f64, so the f32 forms take f32s.
+func GsFmin(x, y float64) float64 {
+	if x != x || y != y {
+		return gsNumOf(x, y, math.Float64bits(x)>>51&1 != 0, math.Float64bits(y)>>51&1 != 0)
+	}
+	return math.Min(x, y)
+}
+
+func GsFmax(x, y float64) float64 {
+	if x != x || y != y {
+		return gsNumOf(x, y, math.Float64bits(x)>>51&1 != 0, math.Float64bits(y)>>51&1 != 0)
+	}
+	return math.Max(x, y)
+}
+
+func GsFminF32(x, y float32) float32 {
+	if x != x || y != y {
+		return gsNumOf(x, y, math.Float32bits(x)>>22&1 != 0, math.Float32bits(y)>>22&1 != 0)
+	}
+	return float32(math.Min(float64(x), float64(y)))
+}
+
+func GsFmaxF32(x, y float32) float32 {
+	if x != x || y != y {
+		return gsNumOf(x, y, math.Float32bits(x)>>22&1 != 0, math.Float32bits(y)>>22&1 != 0)
+	}
+	return float32(math.Max(float64(x), float64(y)))
+}
+
+// gsNumOf is minNum's and maxNum's choice where x or y is a NaN, and xq and
+// yq whether each is a quiet one where it is.
+func gsNumOf[F float32 | float64](x, y F, xq, yq bool) F {
+	switch {
+	case x != x && y == y && xq:
+		return y
+	case y != y && x == x && yq:
+		return x
+	}
+	return x + y
+}
+
+// GsFdim is C's fdim, as glibc's is: +0.0 where x <= y, two infinities of
+// one sign included, whose math.Dim is a NaN, and x - y elsewhere, a NaN's
+// included.
+func GsFdim(x, y float64) float64 {
+	if x <= y {
+		return 0
+	}
+	return x - y
+}
+
+// GsNextafter and GsNextafterF32 are C's nextafter and nextafterf: y where
+// x == y, a zero's sign included, where math.Nextafter and math.Nextafter32
+// give x.
+func GsNextafter(x, y float64) float64 {
+	if x == y {
+		return y
+	}
+	return math.Nextafter(x, y)
+}
+
+func GsNextafterF32(x, y float32) float32 {
+	if x == y {
+		return y
+	}
+	return math.Nextafter32(x, y)
+}
+
+// GsLgamma is C's lgamma: math.Lgamma's value without its sign, +Inf at
+// -Inf as at every pole, where math.Lgamma's is -Inf.
+func GsLgamma(x float64) float64 {
+	if math.IsInf(x, -1) {
+		return math.Inf(1)
+	}
+	v, _ := math.Lgamma(x)
+	return v
+}
+
+// GsModf and GsModfF32 are C's modf and modff: x's fraction, and its
+// integral part through ip, both of x's sign; an infinity's fraction is a
+// zero, where math.Modf's is a NaN.
+func GsModf(x float64, ip *float64) float64 {
+	if math.IsInf(x, 0) {
+		*ip = x
+		return math.Copysign(0, x)
+	}
+	i, f := math.Modf(x)
+	*ip = i
+	return f
+}
+
+func GsModfF32(x float32, ip *float32) float32 {
+	var i float64
+	f := GsModf(float64(x), &i)
+	*ip = float32(i)
+	return float32(f)
+}
+
+// GsRemquo and GsRemquoF32 are C's remquo and remquof: the remainder of x
+// by y, math.Remainder's, and through q the sign of x / y and the last 3
+// bits of the quotient's magnitude, the 3 C asks for, as glibc's have them
+// (s_remquo.c): x is taken modulo 8y first, then the quotient's bits off it
+// a subtraction at a time, each exact. Where y is zero, or x is no finite
+// number or y a NaN, the remainder is a NaN and q is left as it was.
+func GsRemquo(x, y float64, q *int32) float64 {
+	hx, hy := math.Float64bits(x), math.Float64bits(y)
+	sx, qs := hx>>63, (hx^hy)>>63
+	hx &^= 1 << 63
+	hy &^= 1 << 63
+	if hy == 0 || hx >= 0x7ff0000000000000 || hy > 0x7ff0000000000000 {
+		return (x * y) / (x * y)
+	}
+	if hy <= 0x7fbfffffffffffff {
+		x = math.Mod(x, 8*y)
+	}
+	if hx == hy {
+		*q = 1 - 2*int32(qs)
+		return 0 * x
+	}
+	x, y = math.Abs(x), math.Float64frombits(hy)
+	quo := int32(0)
+	if hy <= 0x7fcfffffffffffff && x >= 4*y {
+		x -= 4 * y
+		quo += 4
+	}
+	if hy <= 0x7fdfffffffffffff && x >= 2*y {
+		x -= 2 * y
+		quo += 2
+	}
+	if hy < 0x0020000000000000 {
+		if x+x > y {
+			x -= y
+			quo++
+			if x+x >= y {
+				x -= y
+				quo++
+			}
+		}
+	} else if half := 0.5 * y; x > half {
+		x -= y
+		quo++
+		if x >= half {
+			x -= y
+			quo++
+		}
+	}
+	*q = quo * (1 - 2*int32(qs))
+	if x == 0 {
+		x = 0
+	}
+	if sx != 0 {
+		x = -x
+	}
+	return x
+}
+
+func GsRemquoF32(x, y float32, q *int32) float32 {
+	hx, hy := math.Float32bits(x), math.Float32bits(y)
+	sx, qs := hx>>31, (hx^hy)>>31
+	hx &^= 1 << 31
+	hy &^= 1 << 31
+	if hy == 0 || hx >= 0x7f800000 || hy > 0x7f800000 {
+		return (x * y) / (x * y)
+	}
+	if hy <= 0x7dffffff {
+		x = float32(math.Mod(float64(x), float64(8*y)))
+	}
+	if hx == hy {
+		*q = 1 - 2*int32(qs)
+		return 0 * x
+	}
+	x, y = float32(math.Abs(float64(x))), math.Float32frombits(hy)
+	quo := int32(0)
+	if hy <= 0x7e7fffff && x >= 4*y {
+		x -= 4 * y
+		quo += 4
+	}
+	if hy <= 0x7effffff && x >= 2*y {
+		x -= 2 * y
+		quo += 2
+	}
+	if hy < 0x01000000 {
+		if x+x > y {
+			x -= y
+			quo++
+			if x+x >= y {
+				x -= y
+				quo++
+			}
+		}
+	} else if half := 0.5 * y; x > half {
+		x -= y
+		quo++
+		if x >= half {
+			x -= y
+			quo++
+		}
+	}
+	*q = quo * (1 - 2*int32(qs))
+	if x == 0 {
+		x = 0
+	}
+	if sx != 0 {
+		x = -x
+	}
+	return x
+}
+
 // GsMulAddF32 is math's mul_add at f32 (gs_mul_addf), x * y + z rounded
 // once, as math.FMA is at f64 (gs_mul_add): Go has FMA wherever it runs,
 // as C has it on arm64. The f32 product is exact in an f64, and so is the

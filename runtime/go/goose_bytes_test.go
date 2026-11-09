@@ -650,6 +650,94 @@ func TestFloatText(t *testing.T) {
 	}
 }
 
+// The rest of C99's <math.h> where Go's math differs or has none, against
+// glibc's values: fmin and fmax are IEEE 754's minNum and maxNum, fdim is
+// +0.0 of two equal infinities, nextafter of equal operands is y, lgamma is
+// +Inf at -Inf, modf's fraction of an infinity is a zero, and remquo's
+// quotient bits are glibc's.
+func TestC99Math(t *testing.T) {
+	negz, inf, qnan := math.Copysign(0, -1), math.Inf(1), math.NaN()
+	snan := math.Float64frombits(0x7ff4000000000001)
+	same := func(a, b float64) bool { return math.Float64bits(a) == math.Float64bits(b) || a != a && b != b }
+	for _, c := range []struct{ x, y, min, max float64 }{
+		{2, -1, -1, 2}, {qnan, 3, 3, 3}, {3, qnan, 3, 3}, {negz, 0, negz, 0}, {0, negz, negz, 0},
+		{-inf, inf, -inf, inf}, {qnan, qnan, qnan, qnan}, {snan, 3, qnan, qnan}, {3, snan, qnan, qnan},
+	} {
+		if m := GsFmin(c.x, c.y); !same(m, c.min) {
+			t.Errorf("fmin(%v, %v) = %v, want %v", c.x, c.y, m, c.min)
+		}
+		if m := GsFmax(c.x, c.y); !same(m, c.max) {
+			t.Errorf("fmax(%v, %v) = %v, want %v", c.x, c.y, m, c.max)
+		}
+		// An f32 of the f64's signaling NaN is a quiet one.
+		if math.Float64bits(c.x) == math.Float64bits(snan) || math.Float64bits(c.y) == math.Float64bits(snan) {
+			continue
+		}
+		x, y := float32(c.x), float32(c.y)
+		if m := GsFminF32(x, y); !same(float64(m), c.min) {
+			t.Errorf("fminf(%v, %v) = %v, want %v", x, y, m, c.min)
+		}
+		if m := GsFmaxF32(x, y); !same(float64(m), c.max) {
+			t.Errorf("fmaxf(%v, %v) = %v, want %v", x, y, m, c.max)
+		}
+	}
+	// An f32's signaling NaN, which no f64 of it is.
+	if s32 := math.Float32frombits(0x7fa00001); GsFminF32(s32, 3) == GsFminF32(s32, 3) ||
+		GsFmaxF32(3, s32) == GsFmaxF32(3, s32) || GsFminF32(math.Float32frombits(0x7fc00001), 3) != 3 {
+		t.Error("fminf and fmaxf of an f32's signaling NaN are not a quiet NaN")
+	}
+	for _, c := range []struct{ x, y, want float64 }{
+		{5, 3, 2}, {3, 5, 0}, {inf, inf, 0}, {-inf, -inf, 0}, {inf, -inf, inf}, {qnan, 1, qnan}, {1, qnan, qnan},
+	} {
+		if d := GsFdim(c.x, c.y); !same(d, c.want) {
+			t.Errorf("fdim(%v, %v) = %v, want %v", c.x, c.y, d, c.want)
+		}
+	}
+	if n := GsNextafter(0, negz); !same(n, negz) || !same(GsNextafter(1, 2)-1, math.Ldexp(1, -52)) {
+		t.Errorf("nextafter(0, -0.0) = %v", n)
+	}
+	if n := GsNextafterF32(float32(negz), 0); math.Float32bits(n) != 0 || GsNextafterF32(1, 2)-1 != 1.0/8388608 {
+		t.Errorf("nextafterf(-0.0, 0) = %v", n)
+	}
+	if l := GsLgamma(-inf); l != inf || GsLgamma(1) != 0 || GsLgamma(negz) != inf || GsLgamma(-3) != inf {
+		t.Errorf("lgamma(-inf) = %v", l)
+	}
+	for _, c := range []struct{ x, frac, ip float64 }{
+		{-3.25, -0.25, -3}, {2.5, 0.5, 2}, {-0.5, -0.5, negz}, {-4, negz, -4}, {inf, 0, inf}, {-inf, negz, -inf},
+		{qnan, qnan, qnan}, {1e300, 0, 1e300},
+	} {
+		var ip float64
+		if f := GsModf(c.x, &ip); !same(f, c.frac) || !same(ip, c.ip) {
+			t.Errorf("modf(%v) = %v, %v, want %v, %v", c.x, f, ip, c.frac, c.ip)
+		}
+		var ipf float32
+		if f := GsModfF32(float32(c.x), &ipf); c.x != 1e300 && (!same(float64(f), c.frac) || !same(float64(ipf), c.ip)) {
+			t.Errorf("modff(%v) = %v, %v, want %v, %v", c.x, f, ipf, c.frac, c.ip)
+		}
+	}
+	// glibc's remquo and remquof (q 99 where it is left as it was).
+	for _, c := range []struct {
+		x, y, r float64
+		q       int32
+		rf      float64
+		qf      int32
+	}{
+		{10, 3, 1, 3, 1, 3}, {-10, 3, -1, -3, -1, -3}, {10, -3, 1, -3, 1, -3}, {7, 2, -1, 4, -1, 4},
+		{5, 2, 1, 2, 1, 2}, {1e10, 3, 1, 5, 1, 5}, {-1e10, 3.5, -0.5, -1, -0.5, -1}, {29, 4, 1, 7, 1, 7},
+		{3, 3, 0, 1, 0, 1}, {-3, 3, negz, -1, negz, -1}, {0.75, 0.5, -0.25, 2, -0.25, 2},
+		{1e300, 1e-300, 0x1.4f722a6f79f9cp-998, 2, qnan, 99}, {5e-324, 1e-323, 5e-324, 0, qnan, 99},
+		{1, 0, qnan, 99, qnan, 99}, {inf, 1, qnan, 99, qnan, 99}, {1, qnan, qnan, 99, qnan, 99}, {1, inf, 1, 0, 1, 0},
+	} {
+		q, qf := int32(99), int32(99)
+		if r := GsRemquo(c.x, c.y, &q); !same(r, c.r) || q != c.q {
+			t.Errorf("remquo(%v, %v) = %v, %d, want %v, %d", c.x, c.y, r, q, c.r, c.q)
+		}
+		if r := GsRemquoF32(float32(c.x), float32(c.y), &qf); !same(float64(r), c.rf) || qf != c.qf {
+			t.Errorf("remquof(%v, %v) = %v, %d, want %v, %d", c.x, c.y, r, qf, c.rf, c.qf)
+		}
+	}
+}
+
 // float_text::shortest_digits (gs_f64_digits): the digits print writes, by
 // magnitude, and the power of ten they are a fraction of, truncated to the
 // slice they go into; nothing for zero, NaN and the infinities.
