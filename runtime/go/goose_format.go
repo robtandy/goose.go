@@ -142,6 +142,40 @@ func GsOut(base, end unsafe.Pointer) {
 
 func gsFloatText(d float64, f32 bool) string { return string(gsAppendFloat(nil, d, f32)) }
 
+// GsF64Digits is std's float_text::shortest_digits (gs_f64_digits): the
+// shortest digits of a finite double, by magnitude, the ones print writes
+// (gsAppendFloat), into dig, which holds at least 17. Their count, and in
+// *point the power of ten they are a fraction of: they spell
+// 0.d1 d2 ... dn * 10^*point. 0 for zero, NaN and the infinities, *point
+// left as it was.
+func GsF64Digits(x float64, dig GsSlice, point *int64) int64 {
+	if x != x || math.IsInf(x, 0) || x == 0 {
+		return 0
+	}
+	// d.ddde±xx, the first digit's exponent after the e.
+	var buf [32]byte
+	e := strconv.AppendFloat(buf[:0], math.Abs(x), 'e', -1, 64)
+	var d [24]byte
+	n, i := int64(0), 0
+	for ; e[i] != 'e'; i++ {
+		if e[i] != '.' {
+			d[n] = e[i]
+			n++
+		}
+	}
+	k := int64(0)
+	for _, c := range e[i+2:] {
+		k = k*10 + int64(c-'0')
+	}
+	if e[i+1] == '-' {
+		k = -k
+	}
+	n = min(n, dig.Len)
+	copy(unsafe.Slice((*byte)(dig.Data), n), d[:n])
+	*point = k + 1
+	return n
+}
+
 // gsAppendFloat appends a float's text: the fewest significant digits that
 // read back as the value, of its own type (an f32's where f32 is set), and
 // of those the nearest, laid out as C's %g lays them out at a precision of

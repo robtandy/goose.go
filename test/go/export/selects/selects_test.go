@@ -351,7 +351,9 @@ func TestFloats(t *testing.T) {
 				t.Errorf("MinF32(%v, %v) = %v, want %v", a32, b32, got, want)
 			}
 		}
-		if got, want := AbsF64(a), stdAbs(a); !sameF64(got, want) {
+		// std's abs of a float is libm's fabs (upstream's c1ddfe1c), which
+		// clears the sign bit: abs(-0.0) is 0.0, and a NaN's sign goes too.
+		if got, want := AbsF64(a), math.Abs(a); !sameF64(got, want) {
 			t.Errorf("AbsF64(%v) = %v, want %v", a, got, want)
 		}
 	}

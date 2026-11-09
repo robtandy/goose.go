@@ -106,7 +106,8 @@ set(goose_main_stack 67108864)
 if(MSVC)
     target_link_options(goose PRIVATE "/STACK:${goose_main_stack}")
 elseif(MINGW)
-    target_link_options(goose PRIVATE "LINKER:--stack,${goose_main_stack}")
+    # Statically link the runtime to avoid shipping libgcc, libstdc++, and libwinpthread DLLs.
+    target_link_options(goose PRIVATE "LINKER:--stack,${goose_main_stack}" -static -static-libgcc -static-libstdc++)
 elseif(APPLE)
     math(EXPR goose_main_stack_hex "${goose_main_stack}" OUTPUT_FORMAT HEXADECIMAL)
     target_link_options(goose PRIVATE "LINKER:-stack_size,${goose_main_stack_hex}")
@@ -144,6 +145,11 @@ target_link_libraries(goose PRIVATE libtcc)
 add_dependencies(goose tcc_runtime)
 set(GOOSE_TCC_LIB_PATH "${TCC_STAGE}" CACHE PATH "TinyCC's runtime directory")
 target_compile_definitions(goose PRIVATE GOOSE_TCC_LIB_PATH="${GOOSE_TCC_LIB_PATH}")
+# Likewise where it installs stdlib/, as upstream's CMakeLists.txt sets it up:
+# the compiler looks there after the directories around its executable
+# (StdlibDirs in src/main.cpp); empty, it names no such directory.
+set(GOOSE_STDLIB_PATH "${GOOSE_UPSTREAM}/stdlib" CACHE PATH "The standard library's directory")
+target_compile_definitions(goose PRIVATE GOOSE_STDLIB_PATH="${GOOSE_STDLIB_PATH}")
 
 # The JIT's hosted runtime, as upstream's CMakeLists.txt sets it up: C
 # headers included explicitly by a program see the same small host interface

@@ -2,6 +2,7 @@ package goose
 
 import (
 	"math"
+	"syscall"
 	"unsafe"
 )
 
@@ -1208,4 +1209,79 @@ func GsSlicePoolRegrow(gs *GsStackBlock, nodes GsRref, tree unsafe.Pointer, leng
 	}
 	p.release(&s, idx, ol)
 	return GsSlicePoolPlace(gs, nodes, tree, length, cnt, at)
+}
+
+// GsSlicePoolTrim is slice_pool's trim (gs_slice_pool_trim): the complete
+// pages inside every free span of items, the pool's array viewed as bytes
+// of elements of elem bytes, given back to the OS, which reads them back as
+// zeros, as GsTrimMemory gives back a stack's. The span (idx, cnt) covers the
+// bytes [idx * elem, (idx + cnt) * elem): free spans never touch, a free
+// merging with its neighbours, so each is whole, and a page is kept only
+// where it holds a live element too, at either end. The walk visits each
+// node once, so a tree whose children lead back to nodes it has seen is
+// corrupt, as is a span outside the array: both abort before anything past
+// them is discarded. Only pages below the array's stack top are discarded.
+// False where the OS refused.
+func GsSlicePoolTrim(gs *GsStackBlock, nodes GsRref, tree unsafe.Pointer, items GsSlice, elem int64, at *GsLoc) bool {
+	page := int64(syscall.Getpagesize())
+	if nodes.Hdr.Len == 0 || items.Len <= 0 || elem <= 0 || page <= 0 {
+		return true
+	}
+	count := items.Len / elem
+	p := gsSpcStart(gs, nodes, tree, at)
+	p.h = p.hd.height
+	if gsSpcBadH(p.h) {
+		p.corrupt()
+	}
+	p.node[0] = p.hd.root
+	p.pos[0] = 0
+	if p.h > 0 && p.badIn(p.node[0]) || p.h == 0 && p.badLeaf(p.node[0]) {
+		p.corrupt()
+	}
+	// The pages from the first boundary at or above the span's first byte to
+	// the last one at or below its end, as offsets from the array's start.
+	base := int64(uintptr(items.Data) % uintptr(page))
+	ok := true
+	visits := int64(0)
+	for l := int64(0); l >= 0; {
+		if l == p.h {
+			lf := p.leaf(p.node[l])
+			if visits++; visits >= *p.n {
+				p.corrupt()
+			}
+			for k := int64(0); k < lf.n; k++ {
+				idx, cnt := lf.idx[k], lf.cnt[k]
+				if idx < 0 || cnt <= 0 || idx > count || cnt > count-idx {
+					p.corrupt()
+				}
+				start := (base+idx*elem+page-1)/page*page - base
+				end := (base+(idx+cnt)*elem)/page*page - base
+				if start < end && syscall.Madvise(unsafe.Slice((*byte)(unsafe.Add(items.Data, start)), end-start),
+					syscall.MADV_DONTNEED) != nil {
+					ok = false
+				}
+			}
+			l--
+			continue
+		}
+		in := p.inner(p.node[l])
+		if p.pos[l] == 0 {
+			if visits++; visits >= *p.n {
+				p.corrupt()
+			}
+		}
+		if p.pos[l] >= in.n {
+			l--
+			continue
+		}
+		c := in.child[p.pos[l]]
+		p.pos[l]++
+		if l+1 < p.h && p.badIn(c) || l+1 == p.h && p.badLeaf(c) {
+			p.corrupt()
+		}
+		l++
+		p.node[l] = c
+		p.pos[l] = 0
+	}
+	return ok
 }

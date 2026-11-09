@@ -306,6 +306,23 @@ func GsOsReadStdin(gs *GsStackBlock, out GsRref) {
 	}
 }
 
+// GsOsReadStdinMax appends up to limit bytes of the input, waiting until it
+// has them or the input ends, so that a large input can be read in pieces:
+// false, having appended nothing, where none were left or limit is 0 or
+// less (gs_os_read_stdin_max).
+func GsOsReadStdinMax(gs *GsStackBlock, out GsRref, limit int64) bool {
+	gsStdin.mu.Lock()
+	defer gsStdin.mu.Unlock()
+	got := int64(0)
+	for got < limit && (gsStdin.pos < gsStdin.end || gsStdinFill()) {
+		n := min(int64(gsStdin.end-gsStdin.pos), limit-got)
+		GsBldAppend(gs, out, gsStdin.buf[gsStdin.pos:gsStdin.pos+int(n)])
+		gsStdin.pos += int(n)
+		got += n
+	}
+	return got > 0
+}
+
 // The program's arguments, the program itself first, and its environment.
 func GsOsArgCount() int64 { return int64(len(os.Args)) }
 

@@ -1221,6 +1221,7 @@ struct CodeGenGo {
     FnSpec *ExportOfExtern(FnSpec *sp);
     bool ExternTakesGs(FnSpec *sp);
     bool GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a, string &x);
+    bool GoLibmMixed(Call *c, FnSpec *sp, const vector<string> &a, string &x);
     // Whether a value of a type holds an address, and whether every address
     // an export fn's entry points hand its function stays in Go's own
     // variables while the call runs, which lets them hand it on as it is
