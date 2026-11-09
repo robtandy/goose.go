@@ -112,16 +112,25 @@ static string GoExportName(string_view cname) {
     return s;
 }
 
-// The C library's functions of floats that Go's math package has, and
+// The C library's functions of floats that Go's math package has, C99's
+// <math.h> (which a run in-process resolves since upstream's e4a73fb9), and
 // math's under the runtime's names (stdlib/math.goose), by C symbol: the Go
 // function, how many operands, and whether it is the f32 form, which Go
 // computes at f64 and rounds (a correctly rounded root stays one, and
-// floor, ceil, round, trunc, fabs and copysign of an f32 are f32s).
-// GsMulAddF32 takes f32s itself.
+// floor, ceil, round, trunc, fabs and copysign of an f32 are f32s, as are
+// rint's and remainder's, and fdim's, a subtraction rounded twice where f64
+// holds twice an f32's bits and more) but where the Go function takes f32s
+// itself (narrow: GsMulAddF32, GsNextafterF32, and GsFminF32 and
+// GsFmaxF32, which tell a signaling NaN, which an f64 of it is not). The
+// runtime's GsFmin, GsFmax, GsFdim and GsNextafter are C's, whose NaNs,
+// infinities and equal operands Go's math.Min, math.Max, math.Dim and
+// math.Nextafter take otherwise, and GsLgamma is math.Lgamma's value
+// without its sign, +Inf at -Inf.
 struct GoLibmFn {
     const char *c, *go;
     int n;
     bool f32;
+    bool narrow = false;
 };
 static const GoLibmFn go_libm[] = {
     { "gs_sqrt", "math.Sqrt", 1, false },   { "gs_sqrtf", "math.Sqrt", 1, true },
@@ -147,7 +156,7 @@ static const GoLibmFn go_libm[] = {
     { "gs_tanh", "math.Tanh", 1, false },   { "gs_tanhf", "math.Tanh", 1, true },
     // x * y + z rounded once, as C's is on arm64 (and x86-64 built for FMA):
     // Go has FMA everywhere (§7.12 leaves it to the implementation).
-    { "gs_mul_add", "math.FMA", 3, false }, { "gs_mul_addf", "GsMulAddF32", 3, true },
+    { "gs_mul_add", "math.FMA", 3, false }, { "gs_mul_addf", "GsMulAddF32", 3, true, true },
     { "sqrt", "math.Sqrt", 1, false },      { "sqrtf", "math.Sqrt", 1, true },
     { "sin", "math.Sin", 1, false },        { "sinf", "math.Sin", 1, true },
     { "cos", "math.Cos", 1, false },        { "cosf", "math.Cos", 1, true },
@@ -177,7 +186,25 @@ static const GoLibmFn go_libm[] = {
     // C's round is half away from zero, as Go's is.
     { "round", "math.Round", 1, false },    { "roundf", "math.Round", 1, true },
     { "trunc", "math.Trunc", 1, false },    { "truncf", "math.Trunc", 1, true },
-    { "fma", "math.FMA", 3, false },        { "fmaf", "GsMulAddF32", 3, true },
+    { "fma", "math.FMA", 3, false },        { "fmaf", "GsMulAddF32", 3, true, true },
+    { "acosh", "math.Acosh", 1, false },    { "acoshf", "math.Acosh", 1, true },
+    { "asinh", "math.Asinh", 1, false },    { "asinhf", "math.Asinh", 1, true },
+    { "atanh", "math.Atanh", 1, false },    { "atanhf", "math.Atanh", 1, true },
+    { "erf", "math.Erf", 1, false },        { "erff", "math.Erf", 1, true },
+    { "erfc", "math.Erfc", 1, false },      { "erfcf", "math.Erfc", 1, true },
+    { "tgamma", "math.Gamma", 1, false },   { "tgammaf", "math.Gamma", 1, true },
+    { "lgamma", "GsLgamma", 1, false },     { "lgammaf", "GsLgamma", 1, true },
+    { "logb", "math.Logb", 1, false },      { "logbf", "math.Logb", 1, true },
+    // Rounded to even, the default rounding mode's, which is the only one.
+    { "rint", "math.RoundToEven", 1, false }, { "rintf", "math.RoundToEven", 1, true },
+    { "nearbyint", "math.RoundToEven", 1, false }, { "nearbyintf", "math.RoundToEven", 1, true },
+    { "fmin", "GsFmin", 2, false },         { "fminf", "GsFminF32", 2, true, true },
+    { "fmax", "GsFmax", 2, false },         { "fmaxf", "GsFmaxF32", 2, true, true },
+    { "fdim", "GsFdim", 2, false },         { "fdimf", "GsFdim", 2, true },
+    { "nextafter", "GsNextafter", 2, false }, { "nextafterf", "GsNextafterF32", 2, true, true },
+    // IEEE 754's, whose zero has x's sign, as glibc's has it but by a
+    // subnormal y, where it rescales y and can give the other one.
+    { "remainder", "math.Remainder", 2, false }, { "remainderf", "math.Remainder", 2, true },
 };
 
 // The OS primitives of stdlib/os.goose the Go runtime has (go_runtime_os),
@@ -231,12 +258,14 @@ inline bool CodeGenGo::GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a,
         for (auto pt : sp->argtypes) fits = fits && isf(pt, m.f32);
         // Bound with a signature of its own: a Go function of the name.
         if (!fits) return false;
+        auto widen = m.f32 && !m.narrow;
         string list;
-        for (auto &v : a) Append(list, list.empty() ? "" : ", ", m.f32 && m.go[0] != 'G' ? cat("float64(", v, ")") : v);
+        for (auto &v : a) Append(list, list.empty() ? "" : ", ", widen ? cat("float64(", v, ")") : v);
         x = cat(m.go, "(", list, ")");
-        if (m.f32 && m.go[0] != 'G') x = cat("float32(", x, ")");
+        if (widen) x = cat("float32(", x, ")");
         return true;
     }
+    if (GoLibmMixed(c, sp, a, x)) return true;
     // popcount, clz and ctz count 64 for zero, as Go's math/bits does.
     if (name == "gs_popcount" || name == "gs_clz" || name == "gs_ctz") {
         auto fn = name == "gs_popcount" ? "OnesCount64" : name == "gs_clz" ? "LeadingZeros64" : "TrailingZeros64";
@@ -311,6 +340,51 @@ inline bool CodeGenGo::GoLibExtern(Call *c, FnSpec *sp, const vector<string> &a,
         Append(list, ", ", CallerLoc(c->line));
         x = cat(GoExportName(name), "(", list, ")");
         return true;
+    }
+    return false;
+}
+
+// The Go of a call of one of C99 <math.h>'s functions of a float and an
+// integer or a pointer, into x, where the extern fn binds it as C declares
+// it, at the width its name says (GoLibExtern): scalbn, scalbln and
+// ldexpf are math.Ldexp, ilogb is math.Ilogb as the integer the extern
+// returns, and modf and remquo, which store a part of their result through
+// a pointer, the runtime's GsModf and GsRemquo (glibc's quotient bits);
+// false for any other.
+inline bool CodeGenGo::GoLibmMixed(Call *c, FnSpec *sp, const vector<string> &a, string &x) {
+    auto &name = sp->sf->cname;
+    auto &at = sp->argtypes;
+    if (sp->rets.size() != 1 || at.size() != a.size()) return false;
+    auto ret = sp->rets[0];
+    auto integer = [](TypeExpr *t) { return t && t->kind == TY_INT && !IsVarintT(t); };
+    auto refto = [&](TypeExpr *t, const function<bool(TypeExpr *)> &sub) {
+        return t && t->kind == TY_REF && !t->ref->optional && !IsRelRef(t) && !IsFatRef(t) && sub(t->ref->sub);
+    };
+    for (auto f32 : { false, true }) {
+        auto form = [&](const char *c64) { return name == (f32 ? cat(c64, "f") : string(c64)); };
+        auto isf = [&](TypeExpr *t) { return t && t->kind == TY_FLT && (t->fltstorage == FS_F32) == f32; };
+        auto wide = [&](const string &v) { return f32 ? cat("float64(", v, ")") : v; };
+        // x * 2^n, exact but where it overflows or underflows, which an
+        // f32's computed at f64 then does where it rounds to f32.
+        if ((form("scalbn") || form("scalbln") || (f32 && form("ldexp"))) && at.size() == 2 && isf(at[0]) &&
+            integer(at[1]) && isf(ret)) {
+            x = cat("math.Ldexp(", wide(a[0]), ", int(", a[1], "))");
+            if (f32) x = cat("float32(", x, ")");
+            return true;
+        }
+        if (form("ilogb") && at.size() == 1 && isf(at[0]) && integer(ret)) {
+            x = cat(GoT(ret, c->line), "(math.Ilogb(", wide(a[0]), "))");
+            return true;
+        }
+        if (form("modf") && at.size() == 2 && isf(at[0]) && refto(at[1], isf) && isf(ret)) {
+            x = cat(f32 ? "GsModfF32(" : "GsModf(", a[0], ", ", a[1], ")");
+            return true;
+        }
+        auto i32 = [](TypeExpr *t) { return t->kind == TY_INT && t->intstorage == IS_I32; };
+        if (form("remquo") && at.size() == 3 && isf(at[0]) && isf(at[1]) && refto(at[2], i32) && isf(ret)) {
+            x = cat(f32 ? "GsRemquoF32(" : "GsRemquo(", a[0], ", ", a[1], ", ", a[2], ")");
+            return true;
+        }
     }
     return false;
 }
